@@ -1,0 +1,31 @@
+# jolt / Clojure
+.jolt/
+.cpcache/
+.lsp/
+.nrepl-port
+**/.clj-kondo/.cache/
+
+# dirge agent state
+.dirge/
+
+# build output
+.target/
+
+# macOS
+.DS_Store
+
+# editors / backups
+*.swp
+*.swo
+*~
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+
+# local tooling
+.beads/
+.claude/
+AGENTS.md
+CLAUDE.md
