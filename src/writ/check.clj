@@ -261,11 +261,13 @@
 ;; proven.  Branch tests prove facts about columns along the path.
 
 (def ^:private shrink-needs
-  "A shrinking projection -> what its column must be proven to be:
-  :num (dec: positive, or a nonzero Nat), :empty (rest-like: non-empty,
-  since (rest ()) is ()), :nil (next-like and element reads: non-nil)."
-  '{dec :num, rest :empty, pop :empty, next :nil, nnext :nil, butlast :nil,
-    first :nil, second :nil, last :nil, peek :nil, ffirst :nil})
+  "A shrinking projection -> what its column must be proven to be: rest-like
+  steps need it non-empty ((rest ()) is ()), next-like steps non-nil, and
+  both need it finite ((rest (range)) never runs out); element reads need
+  it non-nil.  dec is tracked separately, per depth."
+  '{rest #{:empty :finite}, pop #{:empty :finite}, next #{:nil :finite},
+    nnext #{:nil :finite}, butlast #{:nil :finite},
+    first #{:nil}, second #{:nil}, last #{:nil}, peek #{:nil}, ffirst #{:nil}})
 
 (defn- lit-val [a] (when (and (map? a) (= :lit (:op a))) (:val a)))
 
@@ -282,36 +284,46 @@
         (symbol (name s))))))
 
 (defn- shrink-step
-  "[need operand] when `t` is a shrinking projection of one operand.  A
-  lookup with a default is not: the default can hand the value back."
+  "[step operand]: step is :dec, :inc or a set of structural needs.  A
+  lookup with a default is not a step: the default can hand the value back."
   [t info]
   (let [h (core-head t info)
         args (:args t)
-        n (count args)]
+        n (count args)
+        [a b] args]
     (case h
-      dec (when (= n 1) [:num (first args)])
-      - (when (and (= n 2) (= 1 (lit-val (second args)))) [:num (first args)])
+      dec (when (= n 1) [:dec a])
+      inc (when (= n 1) [:inc a])
+      - (when (and (= n 2) (= 1 (lit-val b))) [:dec a])
+      + (cond (and (= n 2) (= 1 (lit-val b))) [:inc a]
+              (and (= n 2) (= 1 (lit-val a))) [:inc b]
+              :else nil)
       (rest pop next nnext butlast first second last peek ffirst)
-      (when (= n 1) [(get shrink-needs h) (first args)])
-      (nth get) (when (= n 2) [:nil (first args)])
-      drop (when (and (= n 2) (pos-int-lit? (first args))) [:empty (second args)])
-      nthrest (when (and (= n 2) (pos-int-lit? (second args))) [:empty (first args)])
-      nthnext (when (and (= n 2) (pos-int-lit? (second args))) [:nil (first args)])
-      subvec (when (and (<= 2 n 3) (pos-int-lit? (second args))) [:empty (first args)])
+      (when (= n 1) [(get shrink-needs h) a])
+      (nth get) (when (= n 2) [#{:nil} a])
+      drop (when (and (= n 2) (pos-int-lit? a)) [#{:empty :finite} b])
+      nthrest (when (and (= n 2) (pos-int-lit? b)) [#{:empty :finite} a])
+      nthnext (when (and (= n 2) (pos-int-lit? b)) [#{:nil :finite} a])
+      subvec (when (and (<= 2 n 3) (pos-int-lit? b)) [#{:empty :finite} a])
       nil)))
+
+(defn- numeric-only? [o] (every? vector? (:needs o)))
 
 (defn- origin
   "Where `t` comes from, relative to the column names in `stop`:
-  {:col c :strict? false} for an unchanged copy of column c, {:col c
-  :strict? true :needs #{..}} for a strict subterm.  Copies, (seq x), let
-  chains, destructure and match temporaries are followed; a loop binder
-  outside `stop` is opaque (recur rebinds it)."
+  {:col c :net 0 :strict? false} for an unchanged copy of column c;
+  {:col c :strict? true :needs #{..}} for a strict subterm, where needs
+  are what each step requires of the column; for a dec/inc chain, :net is
+  how far below c the value sits and each dec at depth k needs [:num k]
+  (c minus k proven positive).  Copies, (seq x), let chains, destructure
+  and match temporaries are followed; a loop binder outside `stop` is
+  opaque (recur rebinds it)."
   [t info stop]
   (cond
     (ref? t)
     (let [n (:name t)]
       (cond
-        (contains? stop n) {:col n :strict? false :needs #{}}
+        (contains? stop n) {:col n :net 0 :strict? false :needs #{}}
         (contains? (:loops info) n) nil
         (contains? (:binds info) n) (origin (get (:binds info) n) info stop)
         :else nil))
@@ -323,20 +335,28 @@
           b (origin (:else t) info stop)
           coercion? (contains? '#{seq? vector? map?} (core-head (:test t) info))]
       (cond
-        (and a b (= (:col a) (:col b)))
-        {:col (:col a) :strict? (and (:strict? a) (:strict? b))
+        (and a b (= (:col a) (:col b)) (= (:net a 0) (:net b 0)))
+        {:col (:col a) :net (:net a 0) :strict? (and (:strict? a) (:strict? b))
          :needs (into (:needs a) (:needs b))}
-        (and coercion? (or a b) (not (and a b))) (assoc (or a b) :strict? false :needs #{})
+        (and coercion? (or a b) (not (and a b)))
+        (assoc (or a b) :strict? false :needs #{} :net 0)
         :else nil))
 
     (= :invoke (:op t))
-    (if-let [[need x] (shrink-step t info)]
+    (if-let [[step x] (shrink-step t info)]
       (when-let [o (origin x info stop)]
-        ;; dec shrinks the column itself, once; structure steps compose
-        (when (if (= need :num)
-                (not (:strict? o))
-                (not (contains? (:needs o) :num)))
-          {:col (:col o) :strict? true :needs (conj (:needs o) need)}))
+        (case step
+          :dec (when (numeric-only? o)
+                 (let [k (:net o 0)]
+                   {:col (:col o) :net (inc k) :strict? true
+                    :needs (conj (:needs o) [:num k])}))
+          ;; inc undoes a dec; back at (or past) the column is not smaller
+          :inc (when (and (numeric-only? o) (pos? (:net o 0)))
+                 (let [k (dec (:net o 0))]
+                   (assoc o :net k :strict? (pos? k))))
+          (when (and (numeric-only? o) (zero? (:net o 0)) (empty? (:needs o)))
+            {:col (:col o) :net 0 :strict? true :needs (into (:needs o) step)})
+          ))
       (when (and (= 'seq (core-head t info)) (= 1 (count (:args t))))
         (origin (first (:args t)) info stop)))
 
@@ -344,36 +364,41 @@
 
 (defn- test-facts
   "[then else]: the facts a branch test proves about columns, as sets of
-  [fact col] (fact: :pos :nonzero :nonempty :nonnil) and [:eq col v]."
+  [:pos c k] / [:nonzero c k] (c minus k is positive / nonzero),
+  [:nonempty c], [:nonnil c] and [:eq c v]."
   [test info stop]
   (let [col (fn [e] (:col (origin e info stop)))
-        copy (fn [e] (let [o (origin e info stop)] (when (and o (not (:strict? o))) (:col o))))
+        num (fn [e] (let [o (origin e info stop)]
+                      (when (and o (numeric-only? o)) [(:col o) (:net o 0)])))
+        num-fact (fn [f e] (if-let [[c k] (num e)] #{[f c k]} #{}))
+        one (fn [f c] (if c #{[f c]} #{}))
         h (core-head test info)
         [a b] (:args test)
-        one (fn [f c] (if c #{[f c]} #{}))
         none [#{} #{}]]
     (case h
-      zero? [#{} (one :nonzero (copy a))]
-      pos? [(one :pos (copy a)) #{}]
+      zero? [#{} (num-fact :nonzero a)]
+      pos? [(num-fact :pos a) #{}]
       (= ==) (let [[e v] (cond (lit-val b) [a (lit-val b)]
                                (lit-val a) [b (lit-val a)]
                                :else [nil nil])]
                (cond
                  (nil? e) none
-                 (= 0 v) [(one :eq-zero (copy e)) (one :nonzero (copy e))]
+                 (= 0 v) [#{} (num-fact :nonzero e)]
                  (integer? v) [(into (one :nonnil (col e))
-                                     (if (copy e) #{[:eq (copy e) v]} #{}))
+                                     (if-let [[c k] (num e)]
+                                       (if (zero? k) #{[:eq c v]} #{})
+                                       #{}))
                                #{}]
                  (some? v) [(one :nonnil (col e)) #{}]
                  :else none))
-      < (cond (= 0 (lit-val a)) [(one :pos (copy b)) #{}]
-              (= 1 (lit-val b)) [#{} (one :pos (copy a))]
+      < (cond (= 0 (lit-val a)) [(num-fact :pos b) #{}]
+              (= 1 (lit-val b)) [#{} (num-fact :pos a)]
               :else none)
-      > (cond (= 0 (lit-val b)) [(one :pos (copy a)) #{}]
-              (= 1 (lit-val a)) [#{} (one :pos (copy b))]
+      > (cond (= 0 (lit-val b)) [(num-fact :pos a) #{}]
+              (= 1 (lit-val a)) [#{} (num-fact :pos b)]
               :else none)
-      <= (cond (= 0 (lit-val b)) [#{} (one :pos (copy a))] :else none)
-      >= (cond (= 0 (lit-val a)) [#{} (one :pos (copy b))] :else none)
+      <= (cond (= 0 (lit-val b)) [#{} (num-fact :pos a)] :else none)
+      >= (cond (= 0 (lit-val a)) [#{} (num-fact :pos b)] :else none)
       (seq not-empty) [(one :nonempty (col a)) #{}]
       empty? [#{} (one :nonempty (col a))]
       nil? [#{} (one :nonnil (col a))]
@@ -385,12 +410,15 @@
         [(one :nonnil (col test)) #{}]
         none))))
 
-(defn- proven? [need c facts nat?]
-  (case need
-    :num (or (contains? facts [:pos c])
-             (and nat? (contains? facts [:nonzero c])))
-    :empty (contains? facts [:nonempty c])
-    :nil (or (contains? facts [:nonnil c]) (contains? facts [:nonempty c]))))
+(defn- proven? [need c facts info]
+  (if (vector? need)
+    (let [k (second need)]
+      (or (contains? facts [:pos c k])
+          (and (contains? (:nat info) c) (contains? facts [:nonzero c k]))))
+    (case need
+      :empty (contains? facts [:nonempty c])
+      :nil (or (contains? facts [:nonnil c]) (contains? facts [:nonempty c]))
+      :finite (contains? (:finite info) c))))
 
 (defn- literal-smaller? [a c facts]
   (let [v (lit-val a)]
@@ -399,11 +427,18 @@
                facts))))
 
 (defn- need-text [need c]
-  (case need
-    :num (str "positive (a `pos?` test), or nonzero (a `zero?` test) when `"
-              (display c) "` is a Nat")
-    :empty (str "non-empty (a `seq` or `empty?` test)")
-    :nil (str "non-nil (a truthiness, `some?` or `seq` test)")))
+  (let [c (display c)]
+    (if (vector? need)
+      (let [k (second need)
+            v (if (zero? k) (str "`" c "`") (str "`" c "` minus " k))]
+        (str "`" c "` must first be tested so that " v " is positive (a `pos?` "
+             "test), or nonzero (a `zero?` test) when `" c "` is a Nat"))
+      (case need
+        :empty (str "`" c "` must first be tested non-empty (a `seq` or `empty?` test)")
+        :nil (str "`" c "` must first be tested non-nil (a truthiness, `some?` or `seq` test)")
+        :finite (str "`" c "` must be a finite collection: annotate it (List T), "
+                     "(Vec T), (Set T), (Map K V) or a datatype -- a lazy seq may "
+                     "never run out")))))
 
 (defn- check-descent!
   "Bend's descent law at one self-call or recur: the arguments before the
@@ -425,39 +460,59 @@
         (fail! "recursive call to `" nm "` does not descend: argument " (inc i)
                " before the shrinking one must be passed unchanged")))
     (when-not (literal-smaller? (nth args idx) (nth names idx) facts)
-      (let [c (nth names idx)
-            nat? (contains? (:nat info) c)]
-        (doseq [need (sort (:needs (nth os idx)))]
-          (when-not (proven? need c facts nat?)
+      (let [c (nth names idx)]
+        (doseq [need (sort-by pr-str (:needs (nth os idx)))]
+          (when-not (proven? need c facts info)
             (fail! "recursive call to `" nm "` does not descend: argument "
-                   (inc idx) " shrinks `" (display c) "` without a guard; `"
-                   (display c) "` must first be tested " (need-text need c))))))))
+                   (inc idx) " shrinks `" (display c) "` without a guard; "
+                   (need-text need c))))))))
 
 (defn- term-info
   "What origin tracing needs about a body: let binders -> init, loop binder
-  names (opaque), every name a projection could be shadowed by, and the
-  columns known to be Nat."
-  [params ast shadow]
-  (let [binds (atom {})
+  names (opaque), every name a projection could be shadowed by, the
+  columns known to be Nat, and those known to be finite collections."
+  [params ast shadow tenv]
+  (let [tenv (or tenv {})
+        finite-type? (fn [t]
+                       (and (some? t)
+                            (or (= 'String t)
+                                (and (seq? t) (contains? '#{List Vec Set Map} (first t)))
+                                (and (symbol? t) (contains? tenv t) (not (:tvar (get tenv t))))
+                                (and (seq? t) (contains? tenv (first t))))))
+        binds (atom {})
         loops (atom #{})
-        nat (atom (into #{} (comp (filter #(= 'Nat (ty/binder-type % {})))
+        nat (atom (into #{} (comp (filter #(= 'Nat (ty/binder-type % tenv)))
                                   (map qname-of))
-                        params))]
+                        params))
+        finite (atom (into #{} (comp (filter #(finite-type? (ty/binder-type % tenv)))
+                                     (map qname-of))
+                           params))
+        copy-of (fn [init s]
+                  (let [x (if (and (= :invoke (:op init))
+                                   (contains? '#{seq vec} (core-head init {:bound #{}}))
+                                   (= 1 (count (:args init))))
+                            (first (:args init))
+                            init)]
+                    (and (ref? x) (contains? s (qname-of (:name x))))))]
     (walk-ast ast
       (fn [n]
         (case (:op n)
           :let (doseq [[b init] (:bindings n)] (swap! binds assoc b init))
           :loop (doseq [[b init] (:bindings n)]
                   (swap! loops conj b)
-                  (when (or (= 'Nat (ty/binder-type b {}))
+                  (when (or (= 'Nat (ty/binder-type b tenv))
                             (let [v (lit-val init)] (and (integer? v) (>= v 0)))
                             (and (ref? init) (contains? @nat (qname-of (:name init))))
                             (= 'count (core-head init {:bound #{}})))
-                    (swap! nat conj b)))
+                    (swap! nat conj b))
+                  (when (or (finite-type? (ty/binder-type b tenv))
+                            (copy-of init @finite))
+                    (swap! finite conj b)))
           nil)))
     {:binds @binds
      :loops @loops
      :nat @nat
+     :finite @finite
      :bound (into (set shadow) (comp (remove nil?) (map qname-of)) params)}))
 
 (defn- self-escape! [nm]
@@ -575,8 +630,8 @@
           (doseq [c (distinct (remove nil? t))]
             (go c loops-t (if (= :fn (:op ast)) true tail?) facts)))))))
 
-(defn- check-termination [nm params body-ast marked? shadow]
-  (let [info (term-info params body-ast shadow)]
+(defn- check-termination [nm params body-ast marked? shadow tenv]
+  (let [info (term-info params body-ast shadow tenv)]
     ;; the defn body is itself an implicit loop: a tail recur there rebinds
     ;; the defn's own params, so the loop stack is seeded with them
     (walk-term body-ast [(assoc (frame (filter some? params)) :tries 0)]
@@ -586,7 +641,7 @@
     ;; descent test at every self-reference, and an fn carries no marker to
     ;; opt out, so its self-calls must descend unconditionally
     (doseq [f (named-fns body-ast)]
-      (let [finfo (term-info (:params f) (:body f) shadow)]
+      (let [finfo (term-info (:params f) (:body f) shadow tenv)]
         (walk-term (:body f) [(assoc (frame (filter some? (:params f))) :tries 0)]
                    {:nm (qname-of (:name f)) :self (:name f) :self-params (:params f)
                     :marked? true :info finfo}
@@ -1161,7 +1216,7 @@
      (check-case-constants nm raw-ast)
      (check-lookup-calls nm raw-ast)
      (check-local-cycles nm raw-ast)
-     (check-termination nm params body-ast marked? shadow)
+     (check-termination nm params body-ast marked? shadow (:tenv ctx))
      (check-local-arities nm raw-ast)
      (check-fn-reuse nm params body-ast)
      (check-names nm params body-ast ok shadow arities)

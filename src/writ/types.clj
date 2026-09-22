@@ -24,6 +24,19 @@
   collection of Data, a quoted form)."
   :writ/data)
 
+(def infinite
+  "An inferred lazy seq with no end: (range), (repeat x), (iterate f x),
+  (cycle xs), (repeatedly f), and lazy transforms of one.  Data, but never
+  a finite collection."
+  :writ/infinite)
+
+(defn- finite-coll? [t tenv]
+  (and (some? t)
+       (or (= 'String t)
+           (and (seq? t) (contains? '#{List Vec Set Map} (first t)))
+           (and (symbol? t) (contains? tenv t) (not (:tvar (get tenv t))))
+           (and (seq? t) (contains? tenv (first t))))))
+
 (defn plain-type
   "A type with namespaces dropped from its names: writ.kind/Nat is Nat."
   [t]
@@ -53,9 +66,12 @@
       (when (and t (known? t tenv)) t))))
 
 (defn- data? [t tenv]
-  (or (= data t) (and (some? t) (= kind/kind-Data (kind/type-kind t tenv)))))
+  (or (= data t) (= infinite t) (and (some? t) (= kind/kind-Data (kind/type-kind t tenv)))))
 
-(defn- show [t] (if (= data t) "data" (pr-str t)))
+(defn- show [t]
+  (cond (= data t) "data"
+        (= infinite t) "an infinite seq"
+        :else (pr-str t)))
 
 (defn compat?
   "May a value of type `act` stand where `exp` is expected?  Unknowns
@@ -63,6 +79,8 @@
   [exp act tenv]
   (cond
     (or (nil? exp) (nil? act)) true
+    ;; a lazy seq with no end is not a finite collection
+    (= infinite act) (not (finite-coll? exp tenv))
     ;; a type variable stands for any type
     (or (:tvar (get tenv exp)) (:tvar (get tenv act))) true
     (or (= data exp) (= data act)) true
@@ -70,6 +88,8 @@
     (not (known? exp tenv)) true
     (= 'Any exp) true
     (and (= 'Int exp) (= 'Nat act)) true
+    ;; a String is a finite seq of chars
+    (and (= '(List Char) exp) (= 'String act)) true
     (and (contains? '#{Float Double} exp) (contains? '#{Nat Int Float Double} act)) true
     (and (kind/function-type? exp) (kind/function-type? act)) true
     (and (seq? exp) (seq? act) (= (first exp) (first act))
@@ -102,12 +122,27 @@
 (def ^:private collection-builders
   '#{vector list hash-map hash-set array-map sorted-map conj assoc dissoc
      disj cons concat into merge vec set reverse sort take drop keys vals
-     seq rest next butlast subvec distinct list*})
+     butlast subvec distinct list*})
 
 (def ^:private element-readers '#{first second last peek nth get})
 
+(def ^:private lazy-transforms
+  "Core fns whose result is infinite when a collection argument is."
+  '#{map mapcat filter remove keep map-indexed keep-indexed rest next drop
+     drop-while take-while take-nth seq concat interleave distinct dedupe
+     partition partition-all reductions})
+
 (defn- core-ret [f args tenv]
   (cond
+    (or (and (= 'range f) (empty? args))
+        (and (= 'repeat f) (= 1 (count args)))
+        (and (= 'repeatedly f) (= 1 (count args)))
+        (contains? '#{iterate cycle} f))
+    infinite
+    (and (contains? lazy-transforms f) (some #(= infinite %) args))
+    infinite
+    (and (= 'take f) (some #(= infinite %) args))
+    data
     (contains? numeric f)
     (cond
       (some #(contains? '#{Float Double} %) args) 'Double
@@ -124,8 +159,10 @@
     (when (every? #(data? % tenv) args) data)
     (contains? '#{seq rest next} f)
     (let [c (first args)]
-      (if (and (seq? c) (contains? '#{List Vec} (first c)))
-        (list 'List (second c))
+      (cond
+        (and (seq? c) (contains? '#{List Vec} (first c))) (list 'List (second c))
+        (= 'String c) '(List Char)
+        :else
         (when (every? #(data? % tenv) args) data)))
     (contains? element-readers f)
     (let [c (first args)]

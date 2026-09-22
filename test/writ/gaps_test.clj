@@ -2391,3 +2391,128 @@
   (let [m (err-msg '(defn f [x] (let [y (inc x)] (+ y y))))]
     (is (re-find #"`y` in `f`" m))
     (is (not (re-find #"y__\d" m)))))
+
+;; --- G114: dead match arms are rejected (deliberate non-port) --------------
+;;
+;; Bend's flattener keeps the first row and drops later ones unchecked
+;; (bend.ts match_flatten, "first row wins"): a repeated constructor arm or
+;; an arm after a catch-all is accepted even when its body names an
+;; undefined fn or spends an affine binder twice.  Bend never runs those
+;; rows.  writ's match expands to a plain if-chain, so a dead arm would
+;; still be emitted and compiled -- unchecked -- and Clojure's own `case`
+;; rejects a duplicate test constant at compile time.  writ rejects both.
+
+(deftest dead-match-arms-are-rejected
+  (is (re-find #"repeats a constructor"
+               (book-err [mb '(writ.defn/defn g [m :- Mb] :- writ.kind/Nat
+                                (writ.defn/match m :- Mb
+                                  (Nth 0) ((Jst v) v) (Nth (undefined-name 3))))])))
+  (is (re-find #"must be last"
+               (book-err [mb '(writ.defn/defn g [m :- Mb] :- writ.kind/Nat
+                                (writ.defn/match m :- Mb
+                                  (other 0) (Nth 1)))]))))
+
+;; --- G115: descent through dec/inc chains -----------------------------------
+;;
+;; Each dec in a chain must be guarded at its own depth (n nonzero, then
+;; n-1 nonzero, ...), and an inc undoes a dec: (inc (dec (dec n))) is n-1,
+;; still strictly smaller (Bend: nested_literal_rebuild).
+
+(deftest descent-through-dec-chains
+  (is (nil? (err-msg '(defn parity {:writ/descend true} [^:many ^Nat n]
+                        (if (zero? n) 0
+                            (let [^:many m (dec n)]
+                              (if (zero? m) 1
+                                  (let [p (dec m)] (parity (inc p))))))))))
+  (is (nil? (err-msg '(defn half {:writ/descend true} [^:many ^Nat n]
+                        (if (zero? n) 0
+                            (let [^:many m (dec n)]
+                              (if (zero? m) 0 (inc (half (dec m))))))))))
+  (testing "every dec in the chain needs its own guard"
+    (is (re-find #"guard"
+                 (err-msg '(defn f {:writ/descend true} [^:many ^Nat n]
+                             (if (zero? n) 0 (f (dec (dec n)))))))))
+  (testing "inc back to the column is not smaller"
+    (is (re-find #"does not descend"
+                 (err-msg '(defn f {:writ/descend true} [^:many ^Nat n]
+                             (if (zero? n) 0 (f (inc (dec n))))))))))
+
+;; --- G116: seq descent needs a finite collection ------------------------------
+;;
+;; (rest (range)) never runs out: a seq shrink descends only on a column
+;; typed as a finite collection (List, Vec, Set, Map, or a datatype), and
+;; the type checker keeps infinite seqs out of such slots.
+
+(deftest seq-descent-needs-finite-data
+  (is (re-find #"finite"
+               (err-msg '(defn f {:writ/descend true} [^:many xs]
+                           (if (seq xs) (f (rest xs)) 0)))))
+  (is (nil? (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                        (if (seq xs) (f (rest xs)) 0)))))
+  (testing "element reads need no finiteness"
+    (is (nil? (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (Vec Nat)} t]
+                          (if (vector? t) (f (nth t 1)) 0))))))
+  (testing "an infinite seq is not a finite collection"
+    (doseq [arg ['(range) '(repeat 1) '(iterate inc 0) '(cycle [1 2])
+                 '(map inc (range)) '(rest (range))]]
+      (is (re-find #"infinite"
+                   (book-err [(list 'writ.defn/defn 'len '[xs :- (List writ.kind/Nat)] ':- 'writ.kind/Nat 0)
+                              (list 'writ.defn/defn 'g [] ':- 'writ.kind/Nat (list 'len arg))]))))
+    (is (nil? (book-err '[(writ.defn/defn len [xs :- (List writ.kind/Nat)] :- writ.kind/Nat 0)
+                          (writ.defn/defn g [] :- writ.kind/Nat (len (take 3 (range))))])))))
+
+;; --- G117: match on Nat, Bool and (List T) ----------------------------------
+;;
+;; Bend matches its built-in types: 0n / 1n+p, True / False, [] / h <> t.
+;; writ spells them (0 ..) ((inc p) ..), (true ..) (false ..), ([] ..)
+;; ([h & t] ..).  Coverage, provenance, quantities and descent apply as for
+;; declared types.
+
+(deftest match-on-builtin-types
+  (testing "Nat"
+    (is (nil? (book-err '[(writ.defn/defn ^{:writ/descend true} add
+                            [a :- writ.kind/Nat, ^:many b :- writ.kind/Nat] :- writ.kind/Nat
+                            (writ.defn/match a :- Nat (0 b) ((inc p) (inc (add p b)))))])))
+    (is (nil? (book-err '[(writ.defn/defn ^{:writ/descend true} half [n :- writ.kind/Nat] :- writ.kind/Nat
+                            (writ.defn/match n :- Nat
+                              (0 0)
+                              ((inc m) (writ.defn/match m :- Nat (0 0) ((inc p) (inc (half p)))))))])))
+    (is (re-find #"not exhaustive"
+                 (book-err '[(writ.defn/defn f [n :- writ.kind/Nat] :- writ.kind/Nat
+                               (writ.defn/match n :- Nat (0 1)))])))
+    (is (re-find #"has type Int"
+                 (book-err '[(writ.defn/defn f [n :- writ.kind/Int] :- writ.kind/Nat
+                               (writ.defn/match n :- Nat (0 1) ((inc p) p)))]))))
+  (testing "Bool"
+    (is (nil? (book-err '[(writ.defn/defn f [b :- writ.kind/Bool] :- writ.kind/Nat
+                            (writ.defn/match b :- Bool (true 1) (false 0)))])))
+    (is (re-find #"not exhaustive"
+                 (book-err '[(writ.defn/defn f [b :- writ.kind/Bool] :- writ.kind/Nat
+                               (writ.defn/match b :- Bool (true 1)))]))))
+  (testing "List"
+    (is (nil? (book-err '[(writ.defn/defn ^{:writ/descend true} sum
+                            [xs :- (List writ.kind/Nat)] :- writ.kind/Nat
+                            (writ.defn/match xs :- (List Nat) ([] 0) ([h & t] (+ h (sum t)))))])))
+    (is (re-find #"more than once"
+                 (book-err '[(writ.defn/defn f [xs :- (List writ.kind/Nat)] :- writ.kind/Nat
+                               (writ.defn/match xs :- (List Nat) ([] 0) ([h & t] (+ h h))))])))
+    (is (re-find #"not Data|cannot be reusable"
+                 (book-err '[(writ.defn/defn f [^:many xs :- (List (-> writ.kind/Nat writ.kind/Nat))]
+                               :- writ.kind/Nat
+                               (writ.defn/match xs :- (List (-> Nat Nat)) ([] 0) ([h & t] 1)))])))
+    (is (re-find #"must be a parameter or a pattern binder"
+                 (book-err '[(writ.defn/defn f [xs :- (List writ.kind/Nat)] :- writ.kind/Nat
+                               (let [ys (rest xs)]
+                                 (writ.defn/match ys :- (List Nat) ([] 0) ([h & t] h))))])))))
+
+;; --- G118: a String's rest is a seq of chars, not a String ------------------
+
+(deftest string-seqs-are-char-lists
+  (is (re-find #"expects String.*\(List Char\)"
+               (book-err '[(writ.defn/defn ^{:writ/descend true} opens [^:many s :- writ.kind/String]
+                             :- writ.kind/Nat
+                             (if (empty? s) 0 (opens (rest s))))])))
+  (is (nil? (book-err '[(writ.defn/defn ^{:writ/descend true} opens
+                          [^:many s :- (List writ.kind/Char)] :- writ.kind/Nat
+                          (if (empty? s) 0 (+ (if (= (first s) \{) 1 0) (opens (rest s)))))
+                        (writ.defn/defn g [] :- writ.kind/Nat (opens "a{b{"))]))))

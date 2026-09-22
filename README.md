@@ -91,7 +91,9 @@ where writ can (literals, arithmetic, predicates, typed calls); an unknown
 type never fails a check on its own. `Nat` widens to `Int`, and under a
 guard like `(zero? n)` or `(pos? n)`, `(dec n)` of a `Nat` stays `Nat`.
 `List`, `Vec`, `Set` and `Map` are built-in collection types; a book type of
-the same name shadows them. As in Bend, a collection is as reusable as its
+the same name shadows them. A `String` is a finite `(List Char)`: it fits a
+`(List Char)` parameter, and its `seq`, `rest` and `next` are `(List Char)`,
+not `String`. As in Bend, a collection is as reusable as its
 element: `(List Nat)` is Data, `(List (-> Nat Nat))` is not.
 
 ## Data and match
@@ -120,6 +122,14 @@ match a field again to look inside it. A field may declare its quantity,
 value is only taken apart by `match`: `first`, `nth` or vector
 destructuring on it reads its encoding, and is rejected.
 
+The built-in types match too, as in Bend:
+
+```clojure
+(w/match n :- Nat (0 a) ((inc p) b))          ; p is n minus 1
+(w/match b :- Bool (true a) (false c))
+(w/match xs :- (List Nat) ([] a) ([h & t] b))
+```
+
 ```clojure
 (w/defn f [m :- MaybeInt]
   (w/match m :- MaybeInt (Nothing 0)))   ; rejected: missing Just
@@ -133,8 +143,12 @@ unchanged until one is a strict part of its own parameter (`dec`, `rest`,
 `next`, `first`, `nth`, a destructured or matched field). That shrink only
 counts under a test that proves it: `dec` needs `pos?`, or `zero?` on a
 `Nat`; `rest` needs `seq` or `empty?`; `next` and element reads need the
-value non-nil. A function's own name may appear only as a call head.
-Sequences are assumed finite.
+value non-nil. A chain of `dec`s needs a test at each depth, and an `inc`
+undoes a `dec`. `rest`/`next` descend only on a finite collection (a
+`String`, `(List T)`, `(Vec T)`, `(Set T)`, `(Map K V)` or a datatype), and
+the type checker keeps infinite seqs (`(range)`, `(repeat x)`, `(iterate f
+x)`, ...) out of those types. A function's own name may appear only as a
+call head.
 
 ```clojure
 (defn add {:writ/descend true} [^:many ^Nat a b]

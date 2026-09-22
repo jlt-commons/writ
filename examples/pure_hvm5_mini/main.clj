@@ -32,14 +32,14 @@
   (apply str (concat w u)))
 
 ;; how many "{" a string holds.
-(w/defn ^{:writ/descend true} opens [^:many s :- String] :- Nat
+(w/defn ^{:writ/descend true} opens [^:many s :- (List Char)] :- Nat
   (if (empty? s)
     0
     (+ (if (= (first s) \{) 1 0)
        (opens (rest s)))))
 
 ;; the index of c in s, or the length of s when c is absent.
-(w/defn ^{:writ/descend true} alpha [^:many s :- String ^:many c :- Char ^:many i :- Nat] :- Nat
+(w/defn ^{:writ/descend true} alpha [^:many s :- (List Char) ^:many c :- Char ^:many i :- Nat] :- Nat
   (if (empty? s)
     i
     (if (= (first s) c)
@@ -47,7 +47,7 @@
       (alpha (rest s) c (inc i)))))
 
 ;; a name's code: six bits per character, first character highest.
-(w/defn ^{:writ/descend true} name-code [^:many s :- String ^:many acc :- Nat] :- Nat
+(w/defn ^{:writ/descend true} name-code [^:many s :- (List Char) ^:many acc :- Nat] :- Nat
   (if (empty? s)
     acc
     (name-code (rest s)

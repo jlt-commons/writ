@@ -209,6 +209,129 @@
 
 (declare rewrite)
 
+;; --- built-in types -------------------------------------------------------
+;;
+;; Bend matches its own Nat (0n / 1n+p), Bool (True / False) and List
+;; ([] / h <> t).  writ spells the cases (0 ..) ((inc p) ..), (true ..)
+;; (false ..), ([] ..) ([h & t] ..), and expands each to the guarded
+;; Clojure test that is its eliminator, so descent and typing see the same
+;; code a hand-written version would.
+
+(defn- builtin-kind
+  "The built-in type a match type names, unless the book declares one of
+  that name: :nat, :bool or :list."
+  [ty tenv]
+  (let [p (fn [s] (and (symbol? s) (not (contains? tenv (plain s)))))]
+    (cond
+      (and (p ty) (= 'Nat (plain ty))) :nat
+      (and (p ty) (= 'Bool (plain ty))) :bool
+      (and (seq? ty) (= 2 (count ty)) (p (first ty))
+           (contains? '#{List Vec} (plain (first ty)))) :list
+      :else nil)))
+
+(defn- builtin-arm
+  "{:case k :binders [..] :body b}, or {:catch name :body b}."
+  [kind af ty]
+  (when-not (and (seq? af) (= 2 (count af)))
+    (fail! "a match arm must be `(pattern result)`, had: `" (pr-str af) "`"))
+  (let [[pat body] af
+        sym? (fn [s] (and (symbol? s) (l/valid-binding-symbol? s)))
+        bad (fn [] (fail! "`" (pr-str pat) "` is not a case of `" ty "`; "
+                          (case kind
+                            :nat "a Nat is matched by `0` and `(inc p)`"
+                            :bool "a Bool is matched by `true` and `false`"
+                            :list "a list is matched by `[]` and `[h & t]`")))]
+    (cond
+      (and (symbol? pat) (sym? pat))
+      {:catch pat :body body}
+
+      (= kind :nat)
+      (cond
+        (= 0 pat) {:case :zero :binders [] :body body}
+        (and (seq? pat) (= 2 (count pat)) (symbol? (first pat))
+             (= 'inc (plain (first pat))) (sym? (second pat)))
+        {:case :succ :binders [(second pat)] :body body}
+        :else (bad))
+
+      (= kind :bool)
+      (cond (true? pat) {:case :true :binders [] :body body}
+            (false? pat) {:case :false :binders [] :body body}
+            :else (bad))
+
+      :else
+      (cond
+        (and (vector? pat) (empty? pat)) {:case :empty :binders [] :body body}
+        (and (vector? pat) (= 3 (count pat)) (= '& (second pat))
+             (sym? (first pat)) (sym? (nth pat 2)))
+        {:case :cons :binders [(first pat) (nth pat 2)] :body body}
+        :else (bad)))))
+
+(def ^:private builtin-cases
+  {:nat [:zero :succ] :bool [:true :false] :list [:empty :cons]})
+
+(defn- expand-builtin
+  [kind tenv scope types s ty afs scr-q]
+  (let [elem (when (= kind :list) (second ty))
+        field-types (case kind
+                      :nat {:succ ['Nat]}
+                      :bool {}
+                      :list {:cons [elem (list 'List elem)]})
+        arms (mapv (fn [af] (builtin-arm kind af ty)) afs)
+        _ (doseq [[i a] (map-indexed vector arms)]
+            (when (and (:catch a) (< i (dec (count arms))))
+              (fail! "a catch-all arm `" (:catch a) "` in a match on `" ty "` must be "
+                     "last; the arms after it can never run")))
+        have (keep :case arms)
+        _ (when (not= (count have) (count (distinct have)))
+            (fail! "a match on `" ty "` repeats a case"))
+        missing (remove (set have) (get builtin-cases kind))
+        _ (when (and (seq missing) (not (some :catch arms)))
+            (fail! "a match on `" ty "` is not exhaustive; missing "
+                   (apply str (interpose ", " (map name missing)))))
+        arms (mapv
+               (fn [a]
+                 (if (:catch a)
+                   (let [c (:catch a)
+                         c* (if (= '_ c) c (vary-meta c assoc :writ/q scr-q :writ/type ty))]
+                     (assoc a :catch c*
+                            :body (rewrite tenv (if (= '_ c) scope (assoc scope (plain c) scr-q))
+                                           (:body a)
+                                           (if (= '_ c) types (assoc types (plain c) ty)))))
+                   (let [fts (get field-types (:case a))
+                         mbs (mapv (fn [b t]
+                                     (let [q (effective-qty b nil scr-q)]
+                                       (when (and (= :w q) (not= '_ b)
+                                                  (not= kind/kind-Data (kind/type-kind t tenv)))
+                                         (fail! "`" b "` cannot be reusable (^:many): its type "
+                                                (pr-str t) " in a match on `" ty "` is not Data"))
+                                       (vary-meta b assoc :writ/q q :writ/type t)))
+                                   (:binders a) fts)
+                         named (remove #(= '_ %) mbs)]
+                     (assoc a :binders mbs
+                            :body (rewrite tenv
+                                           (into scope (map (fn [b] [(plain b) (ann/quantity-of b)])) named)
+                                           (:body a)
+                                           (into types (map (fn [b t] [(plain b) t]) mbs fts)))))))
+               arms)
+        by-case (into {} (keep (fn [a] (when (:case a) [(:case a) a]))) arms)
+        catch (first (filter :catch arms))
+        g (vary-meta (many (gensym "m")) assoc :writ/temp true)
+        body-of (fn [k inits]
+                  (if-let [a (get by-case k)]
+                    (let [ps (remove (fn [[b _]] (= '_ b)) (map vector (:binders a) inits))]
+                      (if (empty? ps) (:body a) (list 'let (vec (mapcat identity ps)) (:body a))))
+                    (if (= '_ (:catch catch))
+                      (:body catch)
+                      (list 'let [(:catch catch) g] (:body catch)))))]
+    (list 'let [g s]
+          (case kind
+            :nat (list 'if (list 'zero? g) (body-of :zero [])
+                       (body-of :succ [(list 'dec g)]))
+            :bool (list 'if g (body-of :true []) (body-of :false []))
+            :list (list 'if (list 'seq g)
+                        (body-of :cons [(list 'first g) (list 'rest g)])
+                        (body-of :empty []))))))
+
 (defn expand
   "Check a match form against `tenv`, `scope` (name -> quantity, the names
   legal to match on) and `types` (name -> known type) and return the code
@@ -230,12 +353,19 @@
        (when (nil? scr-q)
          (fail! "the scrutinee of a `match` must be a parameter or a pattern "
                 "binder, not a computed value"))
+       (let [st (get types (plain s))
+             _ (when (and st (not (ty/compat? (ty/plain-type ty) (ty/plain-type st) tenv)))
+                 (fail! "`" s "` has type " (pr-str (ty/plain-type st)) ", but the match is on "
+                        (pr-str (ty/plain-type ty))))
+             bk (builtin-kind ty tenv)]
+        (if bk
+         (do (when (empty? afs)
+               (fail! "a `match` needs a scrutinee, a type and at least one arm: "
+                      "(match s :- Type arm ...)"))
+             (when (= bk :list) (kind/check-type (second ty) tenv scope))
+             (expand-builtin bk tenv scope types s (ty/plain-type ty) afs scr-q))
        (let [{:keys [entry]} (resolve-type tenv scope ty)
-             ctors (:ctors entry)
-             st (get types (plain s))]
-         (when (and st (not (ty/compat? (ty/plain-type ty) (ty/plain-type st) tenv)))
-           (fail! "`" s "` has type " (pr-str (ty/plain-type st)) ", but the match is on "
-                  (pr-str (ty/plain-type ty))))
+             ctors (:ctors entry)]
          (when (and (empty? afs) (seq ctors))
            (fail! "a `match` needs a scrutinee, a type and at least one arm: "
                   "(match s :- Type arm ...)"))
@@ -270,7 +400,7 @@
              ;; is whatever the context wants
              (list 'let [(vary-meta (many (gensym "m")) assoc :writ/temp true) s]
                    '(clojure.core/identity nil))
-             (build-code s arms))))))))
+             (build-code s arms))))))))))
 
 (def ^:private binding-heads
   "Forms whose second element is a binding vector: the names they bind are

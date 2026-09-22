@@ -61,7 +61,12 @@ column (destructured, matched, or `dec`/`rest`/`next`/`first`/`nth`/2-arg
 `some?`, a `w/match` arm). A lookup with a default is not a shrink, and a
 book fn named `dec` is not `dec`. The fn's own name may appear only as a
 call head. `recur` is judged against its own loop frame. Accumulators ride
-after the shrinking argument. `recur` must be in tail position,
+after the shrinking argument. A `dec` chain needs a guard at each depth
+(`(inc (dec (dec n)))` is n-1 under guards on n and n-1). `rest`/`next`
+shrink only a column typed as a finite collection (String, List, Vec, Set,
+Map, a datatype); infinite seqs are their own type and never fit one.
+`w/match` also takes Nat `(0 ..) ((inc p) ..)`, Bool `(true ..) (false ..)`
+and `(List T)` `([] ..) ([h & t] ..)`. `recur` must be in tail position,
 and a defn body is an implicit loop: a tail `recur` there rebinds the
 parameters, so a parameter that both feeds a test and rides into the `recur`
 carries `^:many`, like a loop local.
