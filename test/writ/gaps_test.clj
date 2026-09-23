@@ -675,6 +675,30 @@
       (is (some? m))
       (is (re-find #"does not descend" m)))))
 
+;; A loop opens its own recur frame, so its body's tail position is its own and
+;; does not depend on where the loop sits in the fn.  jolt compiles each of
+;; these, and `doseq` expands to the `do` shape, so rejecting them rejected
+;; every doseq with a message naming a recur the user never wrote.
+(deftest loop-in-non-tail-position-owns-its-tail
+  (testing "a loop that is not the fn's last form still has a tail"
+    (doseq [form ['(defn f {:writ/descend true} [^:many ^Nat a]
+                     (let [n (loop [^:many x a] (if (zero? x) 0 (recur (dec x))))] n))
+                  '(defn f {:writ/descend true} [^:many ^Nat a]
+                     (do (loop [^:many x a] (if (zero? x) 0 (recur (dec x)))) 0))
+                  '(defn f {:writ/descend true} [^:many ^Nat a]
+                     (inc (loop [^:many x a] (if (zero? x) 0 (recur (dec x))))))]]
+      (testing (pr-str (last form))
+        (is (nil? (err-msg form))))))
+  (testing "a non-tail recur inside such a loop is still rejected"
+    (let [m (err-msg '(defn f {:writ/descend true} [^:many ^Nat a]
+                        (let [n (loop [^:many x a] (inc (recur (dec x))))] n)))]
+      (is (some? m))
+      (is (re-find #"must be in tail position" m)))
+    (let [m (err-msg '(defn f {:writ/descend true} [^:many ^Nat a]
+                        (do (loop [^:many x a] (do (recur (dec x)) 0)) 0)))]
+      (is (some? m))
+      (is (re-find #"must be in tail position" m)))))
+
 ;; --- G29: the ordering rule covers value references, not just calls ---------
 
 (deftest value-references-respect-book-order

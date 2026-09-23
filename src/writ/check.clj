@@ -664,8 +664,10 @@
                     (doseq [a (:args ast)] (go a loops false facts)))
         (let [[nt t] (ast-tail-bags ast)]
           (doseq [c (distinct (remove nil? nt))] (go c loops false facts))
+          ;; an fn and a loop each open their own recur frame, so their body
+          ;; is in tail position whatever position the fn or loop is in
           (doseq [c (distinct (remove nil? t))]
-            (go c loops-t (if (= :fn (:op ast)) true tail?) facts)))))))
+            (go c loops-t (if (#{:fn :loop} (:op ast)) true tail?) facts)))))))
 
 (defn- check-termination [nm params body-ast marked? shadow tenv]
   (let [info (term-info params body-ast shadow tenv)]
