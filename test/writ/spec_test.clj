@@ -10,7 +10,8 @@
             [writ.core :as wc]
             [writ.spec :as spec]
             [writ.book]
-            [writ.types]))
+            [writ.types]
+            [writ.lower]))
 
 (def ^:private spec-ns 'writ.spec-demo.sort-spec)
 
@@ -486,3 +487,9 @@
   ;; an unknown, so the signed return type still holds
   (is (writ.types/compat? '(Tuple Keyword String) 'Any {}))
   (is (:ok (:static (calls-run 'writ.spec-demo.pipeline-shadow)))))
+
+(deftest a-false-or-nil-case-default-is-a-default
+  (doseq [d [false nil]]
+    (is (= {:op :lit :val d}
+           (:default (writ.lower/lower (list 'case '(first t) :Leaf true d))))))
+  (is (nil? (:default (writ.lower/lower '(case (first t) :Leaf true :Node false))))))

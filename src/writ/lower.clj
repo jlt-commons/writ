@@ -343,7 +343,8 @@
     {:op :case
      :scrut (lower scrut)
      :clauses (mapv (fn [[c b]] {:test c :body (lower b)}) pairs)
-     :default (when default (lower default))}))
+     ;; a false or nil default is still a default
+     :default (when default? (lower default))}))
 
 (defn lower [form]
   (cond
