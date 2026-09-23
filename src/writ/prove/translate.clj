@@ -121,7 +121,12 @@
                   :recursive? (boolean (some #(and (= :app (t/head %)) (= q (second %)))
                                              (t/subterms b)))})
                (catch clojure.lang.ExceptionInfo e
-                 (if (outside-reason e) {:outside (outside-reason e)} (throw e))))])))
+                 (cond
+                   (outside-reason e) {:outside (outside-reason e)}
+                   ;; a form writ.lower rejects, such as a destructuring fn
+                   ;; literal, is outside the prover too
+                   (:writ/error (ex-data e)) {:outside (str "`" name "`: " (ex-message e))}
+                   :else (throw e))))])))
 
 (defn own-names
   "name -> qualified name for the defns of each [ns-sym forms] pair, under

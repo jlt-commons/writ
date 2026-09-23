@@ -506,3 +506,7 @@
     (is (not (:ok r)))
     (is (= 1 (count d)) (pr-str d))
     (is (not (str/includes? (:message r) "Unable to resolve")))))
+
+(deftest a-helper-the-prover-cannot-read-leaves-laws-tested
+  (let [r (spec/check 'writ.spec-demo.sort-pairs-spec {:seed 42 :adequacy false})]
+    (is (= :tested (:status (law-result r 'sorted))) (:message r))))

@@ -1083,9 +1083,9 @@
       (mapv (fn [r]
               (if-not (and (:prop r) (contains? #{:tested :failed} (:status r)))
                 r
-                (let [[ds own] @defs
-                      pr (try (prover/prove-law {:prop (:prop r) :defs ds :tenv tenv
-                                                 :target target :own own})
+                (let [pr (try (let [[ds own] @defs]
+                                (prover/prove-law {:prop (:prop r) :defs ds :tenv tenv
+                                                   :target target :own own}))
                               (catch Throwable e
                                 {:proved false :reason (str "the prover failed: " (ex-message e))}))]
                   (cond
