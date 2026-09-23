@@ -1,6 +1,12 @@
 ---
 name: writ
-description: Use when writing or fixing Clojure checked by writ -- a spec namespace (writ.spec: spec/ann/data/law) and the plain implementation it constrains -- or when reading a writ.spec report or any "Writ:" error (purity, termination, ordering, arity, types, tagged data, failing laws). Also for the annotated writ.defn surface (w/defn, ^:many, w/match, w/law, w/proof) used by the example books.
+description: >-
+  Use when writing or fixing Clojure checked by writ -- a spec namespace
+  (writ.spec: spec/ann/data/law) and the plain implementation it constrains --
+  or when reading a writ.spec report or any "Writ:" error (purity,
+  termination, ordering, arity, types, tagged data, failing laws). Also for
+  the annotated writ.defn surface (w/defn, ^:many, w/match, w/law, w/proof)
+  used by the example books.
 ---
 
 # writ
