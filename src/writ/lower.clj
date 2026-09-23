@@ -53,6 +53,17 @@
   typed.clj.analyzer's reify*/deftype* specials they expand to."
   '#{reify proxy proxy-super gen-class gen-interface})
 
+(defn host-member?
+  "A static member of a host class, written `Class/member`: `System/getenv`,
+  `Math/abs`, `java.lang.Math/PI`.  It lowers to a qualified ref, the same
+  shape as a call into another namespace, so it is told apart by its
+  qualifier: a class name's last segment starts with a capital letter, and a
+  Clojure namespace's does not."
+  [s]
+  (and (symbol? s)
+       (some? (namespace s))
+       (boolean (re-find #"(?:^|\.)[A-Z][^.]*$" (namespace s)))))
+
 (defn effect-head?
   "An effect or interop name as written in call position:
   clojure.core-qualified, or unqualified and not shadowed by a book name
