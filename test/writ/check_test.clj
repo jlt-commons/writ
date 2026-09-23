@@ -149,3 +149,17 @@
   (is (= {:ok true} (ck/check-defn '(defn f [xs] ()))))
   (is (= {:ok true} (ck/check-defn '(defn f [] ()))))
   (is (= {:ok true} (ck/check-defn '(defn f [x] (if x 1 ()))))))
+
+(deftest a-guard-inside-and-or-proves-descent
+  (testing "each conjunct of an `and` holds in its then branch"
+    (is (ck/check-defn
+          '(defn digits {:writ/descend true} [^:many ^Nat fuel ^:many ^Nat n]
+             (if (and (pos? fuel) (pos? n)) (digits (dec fuel) (quot n 10)) n)))))
+  (testing "each disjunct of an `or` fails in its else branch"
+    (is (ck/check-defn
+          '(defn digits {:writ/descend true} [^:many ^Nat fuel ^:many ^Nat n]
+             (if (or (zero? n) (not (pos? fuel))) n (digits (dec fuel) (quot n 10)))))))
+  (testing "an `or` proves nothing in its then branch"
+    (is (re-find #"does not descend"
+                 (check-err '(defn f {:writ/descend true} [^:many ^Nat a ^:many ^Bool b]
+                               (if (or (pos? a) b) (f (dec a) b) b)))))))

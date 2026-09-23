@@ -230,7 +230,20 @@
         zero-lit? (fn [a] (and (map? a) (= :lit (:op a)) (= 0 (:val a))))
         head (when (and (= :invoke (:op test)) (= :ref (:op (:fn test))))
                (symbol (name (:name (:fn test)))))
-        [a b] (:args test)]
+        [a b] (:args test)
+        ;; `and` and `or` expand to (let [g x] (if g more g)) and
+        ;; (let [g x] (if g g more))
+        [g x body] (when (and (= :let (:op test)) (= 1 (count (:bindings test))))
+                     (let [[[g x]] (:bindings test)] [g x (:body test)]))
+        g-ref? (fn [e] (= g (ref-name e)))]
+    (cond
+      (and g (= :if (:op body)) (g-ref? (:test body)) (g-ref? (:else body)))
+      [(into (first (guard-refs x)) (first (guard-refs (:then body)))) #{}]
+
+      (and g (= :if (:op body)) (g-ref? (:test body)) (g-ref? (:then body)))
+      [#{} (into (second (guard-refs x)) (second (guard-refs (:else body))))]
+
+      :else
     (case head
       zero? (if-let [x (ref-name a)] [#{} #{x}] [#{} #{}])
       pos? (if-let [x (ref-name a)] [#{x} #{}] [#{} #{}])
@@ -240,7 +253,7 @@
       < (if (and (zero-lit? a) (ref-name b)) [#{(ref-name b)} #{}] [#{} #{}])
       > (if (and (ref-name a) (zero-lit? b)) [#{(ref-name a)} #{}] [#{} #{}])
       not (let [[t e] (guard-refs a)] [e t])
-      [#{} #{}])))
+      [#{} #{}]))))
 
 ;; --- tagged data (*tagged*) --------------------------------------------------
 

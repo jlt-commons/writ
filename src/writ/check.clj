@@ -395,7 +395,24 @@
         one (fn [f c] (if c #{[f c]} #{}))
         h (core-head test info)
         [a b] (:args test)
-        none [#{} #{}]]
+        none [#{} #{}]
+        ;; `and` and `or` expand to (let [g x] (if g more g)) and
+        ;; (let [g x] (if g g more))
+        [g x body] (when (and (= :let (:op test)) (= 1 (count (:bindings test))))
+                     (let [[[g x]] (:bindings test)] [g x (:body test)]))
+        g-ref? (fn [e] (and (ref? e) (= g (:name e))))]
+    (cond
+      (and g (= :if (:op body)) (g-ref? (:test body)) (g-ref? (:else body)))
+      (let [[t1 _] (test-facts x info stop)
+            [t2 _] (test-facts (:then body) info stop)]
+        [(into t1 t2) #{}])
+
+      (and g (= :if (:op body)) (g-ref? (:test body)) (g-ref? (:then body)))
+      (let [[_ e1] (test-facts x info stop)
+            [_ e2] (test-facts (:else body) info stop)]
+        [#{} (into e1 e2)])
+
+      :else
     (case h
       zero? [#{} (num-fact :nonzero a)]
       pos? [(num-fact :pos a) #{}]
@@ -429,7 +446,7 @@
       ;; any other test: a truthy value is non-nil
       (if (or (ref? test) (origin test info stop))
         [(one :nonnil (col test)) #{}]
-        none))))
+        none)))))
 
 (defn- case-clause-facts
   "Facts a `case` clause proves: when its test constants are all non-nil,
