@@ -493,3 +493,16 @@
     (is (= {:op :lit :val d}
            (:default (writ.lower/lower (list 'case '(first t) :Leaf true d))))))
   (is (nil? (:default (writ.lower/lower '(case (first t) :Leaf true :Node false))))))
+
+(deftest a-case-on-a-field-of-a-tuple-must-cover-every-constructor
+  (let [r (spec/check 'writ.spec-demo.light-spec {:seed 42})]
+    (is (not (:ok (:static r))))
+    (is (str/includes? (:message r) "the `case` on `light` (Light) does not handle :Amber"))))
+
+(deftest a-failing-let-is-reported-whole
+  (let [r (spec/check 'writ.spec-demo.sort-let-spec
+                      {:target 'writ.spec-demo.sort-desc :seed 42 :adequacy false :prove false})
+        d (:detail (law-result r 'smallest-first))]
+    (is (not (:ok r)))
+    (is (= 1 (count d)) (pr-str d))
+    (is (not (str/includes? (:message r) "Unable to resolve")))))

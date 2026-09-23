@@ -362,6 +362,20 @@
     (reduce (fn [acc b] (join acc b tenv))
             (cond-> (vec ts) (:default ast) (conj (walk ctx env (:default ast)))))))
 
+(defn- tuple-element
+  "The type of a positional read of a tuple: `(Tuple A B)` read by first,
+  second, or nth at a literal index, which is how destructuring reads it."
+  [f t args]
+  (when (and (seq? t) (= 'Tuple (first t)))
+    (let [i (case f
+              first 0
+              second 1
+              nth (let [a (second args)]
+                    (when (and (= :lit (:op a)) (int? (:val a))) (:val a))))
+          ts (vec (rest t))]
+      (when (and i (< -1 i (count ts)))
+        (nth ts i)))))
+
 (defn- tagged-read
   "A positional read of a tagged data value.  Inside a case clause that
   fixed its constructor, (nth x i) reads field i (0 is the tag); anywhere
@@ -508,6 +522,12 @@
               (fail! "`" (display (:name (first (:args ast)))) "` has data type "
                      (show (first ats)) "; take it apart with `match`, not `"
                      (symbol (name s)) "` (its encoding is not its interface)")
+
+              (and (contains? '#{first second nth} (symbol (name s)))
+                   (or (nil? (namespace s)) (= "clojure.core" (namespace s)))
+                   (not (contains? (:shadow ctx) s))
+                   (tuple-element (symbol (name s)) (first ats) (:args ast)))
+              (tuple-element (symbol (name s)) (first ats) (:args ast))
 
               (and (nil? (namespace s)) (not (contains? (:shadow ctx) s)))
               (core-ret s ats tenv)

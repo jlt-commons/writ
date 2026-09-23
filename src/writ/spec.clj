@@ -410,6 +410,17 @@
       (or (first (filter #(= :pass (:result %)) rs))
           {:result :fail :detail [[(list q [x t] '...) "no witness among 20 samples"]]}))))
 
+(defn- binding-form?
+  "A form whose arguments are not all expressions: a special form or a
+  macro, such as `let`, whose binding vector cannot be evaluated alone.
+  The connectives are kept, since each of their arguments is one."
+  [p]
+  (let [h (first p)]
+    (and (symbol? h)
+         (not (contains? '#{or and when if not} (symbol (name h))))
+         (or (special-symbol? h)
+             (boolean (some-> (ns-resolve (the-ns 'clojure.core) h) meta :macro))))))
+
 (defn holds
   "Evaluate proposition `p` under env: {:result :pass|:fail|:discard
   :detail [[term value-or-note]]}."
@@ -444,7 +455,7 @@
         :else
         {:result :fail
          :detail (into [[p (pr-str (:ok r))]]
-                       (when (seq? p)
+                       (when (and (seq? p) (not (binding-form? p)))
                          (keep (fn [a]
                                  (when-not (or (literal? a) (symbol? a))
                                    (let [ra (run-term ctx a env)]
