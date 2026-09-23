@@ -457,7 +457,9 @@
          :detail (into [[p (pr-str (:ok r))]]
                        (when (and (seq? p) (not (binding-form? p)))
                          (keep (fn [a]
-                                 (when-not (or (literal? a) (symbol? a))
+                                 ;; a fn literal's value prints as an object
+                                 (when-not (or (literal? a) (symbol? a)
+                                               (and (seq? a) (contains? '#{fn fn*} (first a))))
                                    (let [ra (run-term ctx a env)]
                                      [a (if (contains? ra :ok) (pr-str (:ok ra))
                                             (str "threw: " (:thrown ra)))])))

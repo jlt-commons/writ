@@ -518,3 +518,10 @@
                         {:target 'writ.spec-demo.sort-pairs :seed 42 :adequacy false})]
       (is (:ok (:static r)) (:message r))
       (is (:ok r) (:message r)))))
+
+(deftest a-fn-literal-argument-is-not-shown-as-a-value
+  (let [r (spec/check 'writ.spec-demo.sort-every-spec
+                      {:target 'writ.spec-demo.sort-desc :seed 42 :adequacy false :prove false})
+        d (:detail (law-result r 'every-prefix-starts-low))]
+    (is (not (:ok r)))
+    (is (not-any? #(str/includes? (second %) "#object") d) (pr-str d))))
