@@ -3,7 +3,7 @@ name: writ
 description: >-
   Use when writing a writ spec -- the problem statement as checkable laws
   about what code means and how it calls (writ.spec:
-  spec/ann/data/law/calls) -- or the plain Clojure implementation it
+  spec/ann/data/law/calls/machine) -- or the plain Clojure implementation it
   constrains, or when reading a writ.spec report or any
   "Writ:" error (purity, termination, ordering, arity, types, tagged data,
   failing, vacuous or gapped laws, call graph mismatches). Also for the
@@ -82,6 +82,24 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
   namespace, through the spec's aliases. Called or passed as a value both
   count. clojure.core, host members, self-recursion and locals that
   shadow a fn do not. See [The call graph](#the-call-graph).
+
+## Machines
+
+`(machine name {:step f :start s :transitions {s {e s'}} :final [..]
+:never [[a b]] :before [[a b]]})` states that `f` steps a state machine by
+the table. Use it when the code's meaning is a table: screens, protocol
+states, lifecycles. `f` is run on every state x event (from its `ann` when
+those are data with field-less constructors, or `:states`/`:events`); an
+unlisted pair must keep the state. The table must reach every state from
+`:start`, reach a `:final` state from every state, never lead from `a` to
+`b` (`:never`), and reach `b` only through `a` (`:before`).
+
+- ``(f s e) is x, but the table says y`` - the code is wrong for that
+  pair; fix the code. If the table is what's wrong, say so.
+- ``from s no final state can be reached``, ``a must never lead to b, but
+  it does: ...``, ``b must be reached only through a, but ... avoids it``
+  - the table breaks its own rules; that is the spec's owner's to fix.
+- `(spec/mermaid 'my.spec {:machine 'name})` draws it.
 
 ## The call graph
 
@@ -208,6 +226,7 @@ value anywhere else is rejected.
 (spec/scan 'my.ns)                                ; which fns a spec could cover
 (spec/call-graph 'my.ns)                          ; {f #{g ...}}, read from source
 (spec/mermaid 'my.spec)                           ; the graph, with the spec's calls
+(spec/mermaid 'my.spec {:machine 'm})             ; a machine's table as a state diagram
 (spec/instrument 'my.sort-spec)                   ; runtime arg/return checks
 ```
 

@@ -18,4 +18,5 @@
   :pong      {:main-opts ["-m" "pong.main"]}
   :life      {:main-opts ["-m" "life.main"]}
   :shortener {:main-opts ["-m" "shortener.server"]}
-  :fetch     {:main-opts ["-m" "fetch.main"]}}}
+  :fetch     {:main-opts ["-m" "fetch.main"]}
+  :screens   {:main-opts ["-m" "screens.main"]}}}

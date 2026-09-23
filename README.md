@@ -211,7 +211,7 @@ sufficient.
 
 ## Writing a spec
 
-A spec namespace requires `writ.spec` and uses five forms.
+A spec namespace requires `writ.spec` and uses six forms.
 
 - `(spec target.ns)` names the namespace it constrains. It comes first.
 - `(ann f [A B -> R])` gives fn `f` its parameter and return types. Every
@@ -223,6 +223,8 @@ A spec namespace requires `writ.spec` and uses five forms.
 - `(law name proposition)` states a law.
 - `(calls f [g ...])` states exactly which fns `f` calls. See
   [The call graph](#the-call-graph).
+- `(machine name {...})` states that a fn steps a state machine by a
+  transition table. See [Machines](#machines).
 
 A spec may define its own helper fns, like `ascending?` above. They run
 only when laws run.
@@ -368,6 +370,64 @@ spec has `calls` forms:
   with "it uses `f`, which writ cannot check", so one effect deep in a
   call chain shows up at every caller above it.
 
+### Machines
+
+Some code is a state machine: a screen flow, a protocol, an order's
+lifecycle. Its meaning is a transition table, and a table can be checked
+exhaustively instead of sampled:
+
+```clojure
+(data Screen Logo Title Options Gameplay Paused Ending)
+(data Event Timeout Confirm Configure Back Pause Finish Quit)
+
+(ann next-screen [Screen Event -> Screen])
+
+(machine screens
+  {:step next-screen
+   :start [:Logo]
+   :transitions {[:Logo]     {[:Timeout] [:Title]}
+                 [:Title]    {[:Confirm] [:Gameplay], [:Configure] [:Options]}
+                 [:Options]  {[:Back] [:Title]}
+                 [:Gameplay] {[:Pause] [:Paused], [:Finish] [:Ending]}
+                 [:Paused]   {[:Pause] [:Gameplay], [:Back] [:Gameplay], [:Quit] [:Title]}
+                 [:Ending]   {[:Confirm] [:Title]}}
+   :final  [[:Title]]
+   :never  [[[:Title] [:Logo]]]
+   :before [[[:Gameplay] [:Ending]] [[:Title] [:Gameplay]]]})
+```
+
+writ checks two things. First, the code against the table: `:step` is run
+on every state and every event, and each answer must be the table's, or
+the same state where the table lists nothing. The states and events come
+from the step fn's `ann` when their types are data whose constructors
+have no fields; otherwise `:states` and `:events` list them. Here that is
+42 pairs, all of them:
+
+```
+machine `screens`: `next-screen` does not follow its table
+  (next-screen [:Title] [:Pause]) is [:Paused], but the table says [:Title] (no transition listed: the state stays)
+```
+
+Second, the table against its own rules:
+
+- every state is reachable from `:start`
+- `:final`: from every reachable state, some final state can be reached,
+  so nothing is a trap
+- `:never [a b]`: no path leads from `a` to `b`
+- `:before [a b]`: every path from `:start` to `b` passes through `a`
+
+A broken rule is reported with the path that breaks it:
+
+```
+machine `screens`: the table breaks its own constraints
+  from [:Options] no final state can be reached
+  [:Title] must never lead to [:Logo], but it does: [:Title] -[:Confirm]-> [:Gameplay] -[:Pause]-> [:Paused] -[:Quit]-> [:Logo]
+```
+
+The table also takes part in the adequacy check as a law would, so a
+machine alone pins its step fn down. `(spec/mermaid 'my.spec {:machine
+'screens})` draws the table as a mermaid `stateDiagram-v2`.
+
 ## Running the check
 
 `(writ.spec/check 'my.sort-spec)` returns a report map:
@@ -381,6 +441,7 @@ spec has `calls` forms:
  :gaps        []                ; fns the laws don't pin down
  :rejected    [{:fn isort ...}] ; per fn: its laws and the stand-ins they rejected
  :calls       [{:fn handle :calls [normalize respond] :status :ok} ...]
+ :machines    [{:machine screens :status :ok :states 6 :events 7} ...]
  :unspecified []                ; public fns with no ann
  :message     "writ.spec: my.sort-spec against my.sort: ok\n  `insert`: ..."}
 ```
@@ -422,7 +483,10 @@ It works in three stages, and each runs only if the one before passed.
 
 The `calls` forms are checked once the static stage passes, beside the
 laws, and each gets an entry in `:calls` with `:status` `:ok` or
-`:failed`, plus `:missing` and `:extra` when it failed.
+`:failed`, plus `:missing` and `:extra` when it failed. Each `machine`
+gets an entry in `:machines`; a failed one carries `:mismatches`, one
+`{:state :event :expected :actual}` per pair the code gets wrong, and
+`:errors` for the table's own rules.
 
 Options: `:target` checks a different implementation against the same spec,
 `:trials` is the number of test.check runs per law (default 100), `:seed`

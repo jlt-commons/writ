@@ -79,9 +79,10 @@
 (defn -register! [spec-ns k v]
   (swap! registry update spec-ns
          (fn [e] (case k
-                   :target {:target v :data [] :anns {} :laws [] :calls []}
+                   :target {:target v :data [] :anns {} :laws [] :calls [] :machines []}
                    :data (update e :data conj v)
                    :calls (update e :calls (fnil conj []) v)
+                   :machine (update e :machines (fnil conj []) v)
                    :ann (assoc-in e [:anns (first v)] (second v))
                    :law (update e :laws conj v))))
   nil)
@@ -126,6 +127,30 @@
   (when-not (and (vector? gs) (every? symbol? gs))
     (fail! "`calls " f "` needs a vector of fn names, had: " (pr-str gs)))
   `(-register! '~(ns-name *ns*) :calls '~[f (mapv resolve-callee gs)]))
+
+(defmacro machine
+  "State that a target fn steps a state machine by a transition table:
+
+    (machine turnstile
+      {:step step :start [:Locked]
+       :transitions {[:Locked] {[:Coin] [:Unlocked]} ...}
+       :final [[:Locked]] :never [[a b]] :before [[a b]]})
+
+  `step` is run on every state and event (from its `ann` when those are
+  data with field-less constructors, or :states and :events) and must give
+  the table's state, or keep the state where the table lists nothing.  The
+  table must reach every state from :start, and a :final state from every
+  state it reaches; `:never [a b]` says no path leads from a to b, and
+  `:before [a b]` that every path from :start to b passes through a."
+  [nm m]
+  (when-not (simple-sym? nm)
+    (fail! "a `machine` name must be a simple symbol: `" (pr-str nm) "`"))
+  (when-not (and (map? m) (simple-sym? (:step m)) (contains? m :start) (map? (:transitions m)))
+    (fail! "`machine " nm "` needs a map with :step (a fn name), :start and :transitions"))
+  (when-let [bad (seq (remove #{:step :start :transitions :final :never :before :states :events}
+                              (keys m)))]
+    (fail! "`machine " nm "` has unknown keys: " (pr-str bad)))
+  `(-register! '~(ns-name *ns*) :machine '~[nm m]))
 
 (defmacro law
   "State a law about the target's behaviour."
@@ -900,6 +925,133 @@
                    {:fn f :calls gs :status :ok}
                    {:fn f :calls gs :status :failed :missing missing :extra extra}))))))))
 
+;; --- machines ----------------------------------------------------------------------
+
+(defn- enum-values
+  "Every value of type `t`, when it has only field-less constructors (or
+  is Bool), in declaration order; nil otherwise."
+  [t data]
+  (cond
+    (= 'Bool t) [true false]
+    (symbol? t)
+    (when-let [f (first (filter #(= t (second %)) data))]
+      (let [ctors (remove vector? (drop 2 f))]
+        (when (every? symbol? ctors)
+          (mapv (fn [c] [(keyword (name c))]) ctors))))
+    :else nil))
+
+(defn- table-edges
+  "[from event to] for each transition the table lists."
+  [transitions]
+  (for [[s evs] transitions, [ev t] evs] [s ev t]))
+
+(defn- find-path
+  "The shortest path of edges from `from` to `to`, never passing through
+  `avoid`, as [[s ev t] ...]; nil when there is none.  A path has at least
+  one edge."
+  [edges from to avoid]
+  (loop [frontier (mapv (fn [e] [e]) (filter #(= from (first %)) edges))
+         seen #{from}]
+    (when (seq frontier)
+      (let [done (first (filter #(= to (nth (peek %) 2)) frontier))]
+        (or done
+            (let [nexts (for [path frontier
+                              :let [t (nth (peek path) 2)]
+                              :when (and (not (contains? seen t)) (not= t avoid))
+                              e edges :when (= t (first e))]
+                          (conj path e))]
+              (recur (vec nexts) (into seen (map #(nth (peek %) 2) frontier)))))))))
+
+(defn- reachable [edges from]
+  (loop [todo [from], seen #{from}]
+    (if-let [s (first todo)]
+      (let [ts (remove seen (map #(nth % 2) (filter #(= s (first %)) edges)))]
+        (recur (into (vec (rest todo)) ts) (into seen ts)))
+      seen)))
+
+(defn- show-path [path]
+  (apply str (pr-str (first (first path)))
+         (for [[_ ev t] path] (str " -" (pr-str ev) "-> " (pr-str t)))))
+
+(defn- machine-domain
+  "[states events] a machine's step is checked over."
+  [[_ {:keys [step start transitions final states events]}] {:keys [anns data]}]
+  (let [sig (get anns step)
+        listed (distinct (concat [start] (keys transitions)
+                                 (mapcat vals (vals transitions)) final))]
+    [(vec (or states (enum-values (first (:params sig)) data) listed))
+     (vec (or events (enum-values (second (:params sig)) data)
+              (distinct (mapcat keys (vals transitions)))))]))
+
+(defn- machine-prop
+  "The machine's table as one closed proposition, so the adequacy check
+  holds each stand-in for the step fn to it as it does to the laws."
+  [[_ {:keys [step transitions]} :as m] e]
+  (let [[states events] (machine-domain m e)]
+    (cons 'and (for [s states, ev events]
+                 (list '= (list step (list 'quote s) (list 'quote ev))
+                       (list 'quote (get-in transitions [s ev] s)))))))
+
+(defn- check-machine
+  "Run the target's step fn over every state and event, against the table,
+  then check the table against the machine's own constraints."
+  [[nm {:keys [step start transitions final never before]} :as m] e target]
+  (let [f (some-> (ns-resolve (the-ns target) step) deref)
+        [states events] (machine-domain m e)
+        mismatches (vec (for [s states, ev events
+                              :let [listed? (contains? (get transitions s) ev)
+                                    want (get-in transitions [s ev] s)
+                                    got (try (f s ev) (catch Throwable t {:threw (ex-message t)}))]
+                              :when (not= want got)]
+                          (cond-> {:state s :event ev :expected want :actual got}
+                            (not listed?) (assoc :unlisted true))))
+        edges (table-edges transitions)
+        from-start (reachable edges start)
+        errors (vec (concat
+                      (for [s states :when (not (contains? from-start s))]
+                        (str (pr-str s) " cannot be reached from the start " (pr-str start)))
+                      (when (seq final)
+                        (for [s states
+                              :when (and (contains? from-start s)
+                                         (not-any? (reachable edges s) final))]
+                          (str "from " (pr-str s) " no final state can be reached")))
+                      (for [[a b] never
+                            :let [p (find-path edges a b nil)]
+                            :when p]
+                        (str (pr-str a) " must never lead to " (pr-str b) ", but it does: "
+                             (show-path p)))
+                      (for [[a b] before
+                            :let [p (when (not= start a) (find-path edges start b a))]
+                            :when p]
+                        (str (pr-str b) " must be reached only through " (pr-str a) ", but "
+                             (show-path p) " avoids it"))))
+        base {:machine nm :step step :states (count states) :events (count events)}]
+    (if (and (empty? mismatches) (empty? errors))
+      (assoc base :status :ok)
+      (assoc base :status :failed
+                  :mismatches (mapv #(dissoc % :unlisted) mismatches)
+                  :shown (mapv (fn [{:keys [state event expected actual unlisted]}]
+                                 (str "(" step " " (pr-str state) " " (pr-str event) ") is "
+                                      (if (and (map? actual) (:threw actual))
+                                        (str "a throw: " (:threw actual))
+                                        (pr-str actual))
+                                      ", but the table says " (pr-str expected)
+                                      (when unlisted " (no transition listed: the state stays)")))
+                               mismatches)
+                  :errors errors))))
+
+(defn- state-id [s]
+  (let [id (-> (str/join "_" (map #(if (keyword? %) (name %) (str %)) (flatten [s])))
+               (str/replace #"[^A-Za-z0-9_]" "_"))]
+    (if (contains? #{"end" "state" "note"} id) (str id "_") id)))
+
+(defn- state-diagram [{:keys [start transitions final]}]
+  (str "stateDiagram-v2"
+       "\n  [*] --> " (state-id start)
+       (apply str (for [[s ev t] (table-edges transitions)]
+                    (str "\n  " (state-id s) " --> " (state-id t) " : " (state-id ev))))
+       (apply str (for [s final] (str "\n  " (state-id s) " --> [*]")))))
+
 (defn- mermaid-id [s]
   (let [id (-> (str s) (str/replace "?" "_Q") (str/replace "!" "_B")
                (str/replace #"[^A-Za-z0-9_]" "_"))]
@@ -914,6 +1066,10 @@
   ([ns-sym] (mermaid ns-sym {}))
   ([ns-sym opts]
    (require ns-sym)
+   (if-let [m (:machine opts)]
+     (let [[_ spec-m] (or (first (filter #(= m (first %)) (:machines (get @registry ns-sym))))
+                          (fail! "`" ns-sym "` has no machine `" m "`"))]
+       (state-diagram spec-m))
    (let [e (get @registry ns-sym)
          target (if e (or (:target opts) (:target e)) ns-sym)
          graph (call-graph target)
@@ -931,7 +1087,7 @@
      (str "flowchart LR"
           (apply str (for [n nodes] (str "\n  " (mermaid-id n) "[\"" n "\"]")))
           (apply str (for [[f arrow g] edges]
-                       (str "\n  " (mermaid-id f) " " arrow " " (mermaid-id g))))))))
+                       (str "\n  " (mermaid-id f) " " arrow " " (mermaid-id g)))))))))
 
 (defn- tenv-of [data]
   (into {} (map (fn [f] (let [d (dt/parse f)] [(:name d) (dt/env d)]))) data))
@@ -1023,7 +1179,7 @@
 
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
-  [{:keys [ok target spec static laws gaps unspecified rejected calls]}]
+  [{:keys [ok target spec static laws gaps unspecified rejected calls machines]}]
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
        (apply str (for [{l :law p :proof st :status} laws :when (= :proved st)]
                     (str "\n  law `" l "` proved " p)))
@@ -1040,7 +1196,18 @@
                            (if (seq gs)
                              (str "calls exactly " (str/join ", " gs))
                              "calls nothing outside clojure.core")))))
+       (when ok
+         (apply str (for [{m :machine n :states k :events} machines]
+                      (str "\n  machine `" m "`: " (* n k) " transitions checked"))))
        (when-not (:ok static) (str "\n\n" (:error static)))
+       (apply str (for [{m :machine st :status :keys [shown errors step]} machines
+                        :when (= :failed st)]
+                    (str (when (seq shown)
+                           (str "\n\nmachine `" m "`: `" step "` does not follow its table"
+                                (apply str (map #(str "\n  " %) shown))))
+                         (when (seq errors)
+                           (str "\n\nmachine `" m "`: the table breaks its own constraints"
+                                (apply str (map #(str "\n  " %) errors)))))))
        (apply str (for [{f :fn gs :calls :keys [error missing extra]} calls
                         :when (or error (seq missing) (seq extra))]
                     (if error
@@ -1120,7 +1287,7 @@
                                               :when (and (not private?) (not (contains? anns nm)))]
                                           nm)))}]
      (if-not (:ok static)
-       (let [r (assoc base :ok false :laws [] :gaps [] :calls [])]
+       (let [r (assoc base :ok false :laws [] :gaps [] :calls [] :machines [])]
          (assoc r :message (format-report r)))
        (let [tenv (tenv-of data)
              publics (set (keys (ns-publics (the-ns target))))
@@ -1176,17 +1343,24 @@
              per-fn (if (and sound? (not= false (:adequacy opts)))
                       (adequacy ctx target
                                 (sort (filter #(contains? publics %) (keys anns)))
-                                anns (keep :prop results) trials (or seed 42))
+                                anns (concat (keep :prop results)
+                                             (for [m (:machines e)]
+                                               (qualify (machine-prop m e) #{} publics interns
+                                                        target spec-ns)))
+                                trials (or seed 42))
                       [])
              gaps (vec (for [{f :fn s :survivors} per-fn :when (seq s)]
                          {:fn f :survivors s}))
              results (mapv #(dissoc % :prop) results)
              call-results (check-calls e (book/read-forms (source-url target)))
+             machine-results (mapv #(check-machine % e target) (:machines e))
              r (assoc base :laws results :gaps gaps :calls call-results
+                           :machines (mapv #(dissoc % :shown :step) machine-results)
                            :rejected (mapv #(select-keys % [:fn :laws :rejected]) per-fn)
                            :ok (and sound? (empty? gaps)
-                                    (every? #(= :ok (:status %)) call-results)))]
-         (assoc r :message (format-report r)))))))
+                                    (every? #(= :ok (:status %)) call-results)
+                                    (every? #(= :ok (:status %)) machine-results)))]
+         (assoc r :message (format-report (assoc r :machines machine-results))))))))
 
 (defn check!
   "`check`, throwing with the report's message when anything fails."

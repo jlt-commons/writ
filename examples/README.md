@@ -1,7 +1,7 @@
 # writ examples
 
-Four small programs that do real work: two raylib games, a URL shortener
-served over HTTP, and a fetcher that retries. Each one is split the way
+Five small programs that do real work: raylib pong, Life and a screen
+manager, a URL shortener served over HTTP, and a fetcher that retries. Each one is split the way
 writ expects code to be split:
 
 ```
@@ -18,6 +18,7 @@ Each example is built around a different kind of mistake writ catches:
 | --- | --- | --- |
 | [pong](#pong) | [raylib-jlt](https://github.com/jlt-commons/raylib-jlt) | tagged data and exhaustive `case`, invariants with `=>`, termination, gaps in a draft spec |
 | [life](#life) | [raylib-jlt](https://github.com/jlt-commons/raylib-jlt) | a model as the spec, one spec for two implementations (`:target`), shrinking to a minimal world |
+| [screens](#screens) | [raylib-jlt](https://github.com/jlt-commons/raylib-jlt) | a `machine`: the code checked on every state and event, the table checked for traps and forbidden paths |
 | [shortener](#shortener) | [ring-chez-adapter](https://github.com/jolt-lang/ring-chez-adapter), [http-client](https://github.com/jolt-lang/http-client) | the call graph: `calls`, `scan`, `call-graph`, `mermaid`; round trips; purity |
 | [fetch](#fetch) | [http-client](https://github.com/jolt-lang/http-client) | constraints as laws, values a generator never reaches, a spec made of examples |
 
@@ -31,6 +32,7 @@ cd examples
 jolt -M:test          # every spec, every broken variant, and the live server
 jolt -M:pong          # needs libraylib: brew install raylib
 jolt -M:life
+jolt -M:screens
 jolt -M:shortener     # then: curl -d https://clojure.org localhost:3000
 jolt -M:fetch         # or pass URLs: jolt -M:fetch https://httpbin.org/status/503
 ```
@@ -189,6 +191,76 @@ The first draft had `neighbours` returning a vector, and writ reported
 that the laws still held with the neighbours reversed. The order was
 never part of the meaning, so the fix was the signature: `neighbours`
 returns a `(Set (Tuple Int Int))`.
+
+## screens
+
+raylib's screen manager: a logo, a title, options, a game you can pause,
+and an ending. `screens.core/next-screen` is the whole flow, and its
+meaning is a transition table, so the spec is a `machine`:
+
+```clojure
+(machine screens
+  {:step next-screen
+   :start [:Logo]
+   :transitions {[:Logo]     {[:Timeout] [:Title]}
+                 [:Title]    {[:Confirm] [:Gameplay], [:Configure] [:Options]}
+                 [:Options]  {[:Back] [:Title]}
+                 [:Gameplay] {[:Pause] [:Paused], [:Finish] [:Ending]}
+                 [:Paused]   {[:Pause] [:Gameplay], [:Back] [:Gameplay], [:Quit] [:Title]}
+                 [:Ending]   {[:Confirm] [:Title]}}
+   :final  [[:Title]]                                     ; every screen leads back
+   :never  [[[:Title] [:Logo]]]                           ; the logo shows once
+   :before [[[:Gameplay] [:Ending]] [[:Title] [:Gameplay]]]})
+```
+
+There are six screens and seven events, so writ runs all 42 pairs. The
+window's key help comes from the same fn: for each event, it asks
+`next-screen` where the event leads, and lists the ones that go
+somewhere.
+
+What writ catches:
+
+- **Back that quits** (`broken/back_quits.clj`): Back on the pause screen
+  goes to the title and loses the game:
+
+  ```
+  (next-screen [:Paused] [:Back]) is [:Title], but the table says [:Gameplay]
+  ```
+
+- **A global pause** (`broken/pause_anywhere.clj`): P pauses from any
+  screen. Each pair the table never listed is named:
+
+  ```
+  (next-screen [:Logo] [:Pause]) is [:Paused], but the table says [:Logo] (no transition listed: the state stays)
+  (next-screen [:Title] [:Pause]) is [:Paused], but the table says [:Title] (no transition listed: the state stays)
+  ...
+  ```
+
+- **A draft table** (`draft_spec.clj`): the table itself breaks the rules
+  the spec gives it, and each broken rule comes with its path:
+
+  ```
+  from [:Options] no final state can be reached
+  [:Title] must never lead to [:Logo], but it does: [:Title] -[:Confirm]-> [:Gameplay] -[:Pause]-> [:Paused] -[:Quit]-> [:Logo]
+  ```
+
+`(spec/mermaid 'screens.core-spec {:machine 'screens})` draws it:
+
+```mermaid
+stateDiagram-v2
+  [*] --> Logo
+  Logo --> Title : Timeout
+  Title --> Gameplay : Confirm
+  Title --> Options : Configure
+  Options --> Title : Back
+  Gameplay --> Paused : Pause
+  Gameplay --> Ending : Finish
+  Paused --> Gameplay : Pause
+  Paused --> Gameplay : Back
+  Paused --> Title : Quit
+  Ending --> Title : Confirm
+  Title --> [*]
+```
 
 ## shortener
 

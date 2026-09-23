@@ -534,3 +534,41 @@
                         {:target 'writ.spec-demo.nat-chain-short :seed 42 :adequacy false})]
       (is (not (:ok (:static r))))
       (is (re-find #"thirds" (:message r)) (:message r)))))
+
+;; --- machine: a step fn against its transition table --------------------------
+
+(deftest a-step-that-follows-its-table-meets-its-machine
+  (let [r (spec/check 'writ.spec-demo.turnstile-spec {:seed 42})]
+    (is (:ok r) (:message r))
+    (is (= '[{:machine turnstile :status :ok :states 3 :events 4}] (:machines r)))
+    (is (str/includes? (:message r) "machine `turnstile`: 12 transitions checked"))))
+
+(deftest a-step-off-its-table-is-caught
+  (let [r (spec/check 'writ.spec-demo.turnstile-spec
+                      {:target 'writ.spec-demo.turnstile-free-ride :seed 42})
+        m (first (:machines r))]
+    (is (not (:ok r)))
+    (is (= :failed (:status m)))
+    (is (= '[{:state [:Broken] :event [:Coin] :expected [:Broken] :actual [:Unlocked]}]
+           (:mismatches m)))
+    (is (str/includes? (:message r)
+                       "(step [:Broken] [:Coin]) is [:Unlocked], but the table says [:Broken] (no transition listed: the state stays)"))))
+
+(deftest the-table-is-checked-against-its-own-constraints
+  (let [r (spec/check 'writ.spec-demo.turnstile-graph-spec {:seed 42})
+        m (first (:machines r))]
+    (is (not (:ok r)))
+    (is (= [] (:mismatches m)) "the code follows the table...")
+    (is (str/includes? (:message r) "from [:Broken] no final state can be reached")
+        "...but the table traps a broken turnstile")
+    (is (str/includes? (:message r)
+                       "[:Unlocked] must never lead to [:Broken], but it does: [:Unlocked] -[:Kick]-> [:Broken]"))
+    (is (str/includes? (:message r)
+                       "[:Broken] must be reached only through [:Unlocked], but [:Locked] -[:Kick]-> [:Broken] avoids it"))))
+
+(deftest a-machine-draws-as-a-state-diagram
+  (let [m (spec/mermaid 'writ.spec-demo.turnstile-spec {:machine 'turnstile})]
+    (is (str/starts-with? m "stateDiagram-v2"))
+    (is (str/includes? m "[*] --> Locked"))
+    (is (str/includes? m "Locked --> Unlocked : Coin"))
+    (is (str/includes? m "Locked --> [*]"))))

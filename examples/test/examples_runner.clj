@@ -4,10 +4,11 @@
             fetch.core-test
             life.core-test
             pong.core-test
+            screens.core-test
             shortener.core-test))
 
 (def test-namespaces
-  '[pong.core-test life.core-test shortener.core-test fetch.core-test])
+  '[pong.core-test life.core-test screens.core-test shortener.core-test fetch.core-test])
 
 (defn -main [& _]
   (let [{:keys [fail error]} (apply t/run-tests test-namespaces)]
