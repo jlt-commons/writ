@@ -74,7 +74,37 @@
     [map-empty     [:call map ?f [:sq [:enil]]]         [:sq [:enil]]]
     [map-cons      [:call map ?f [:sq [:econs ?h ?E]]]
                    [:sq [:econs [:ap ?f ?h] [:elems [:call map ?f [:sq ?E]]]]]]
-    [map-elems     [:call map ?f [:sq [:elems ?v]]]     [:call map ?f ?v]]])
+    [map-elems     [:call map ?f [:sq [:elems ?v]]]     [:call map ?f ?v]]
+    ;; apply of a comparison walks the list pairwise; it needs one argument
+    [apply-le-nil     [:call apply [:cfn <=] [:nil]]              [:bottom]]
+    [apply-le-empty   [:call apply [:cfn <=] [:sq [:enil]]]       [:bottom]]
+    [apply-le-one     [:call apply [:cfn <=] [:sq [:econs ?a [:enil]]]] [:lit true]]
+    [apply-le-more    [:call apply [:cfn <=] [:sq [:econs ?a [:econs ?b ?E]]]]
+                       [:if [:call <= ?a ?b] [:call apply [:cfn <=] [:sq [:econs ?b ?E]]] [:lit false]]]
+    [apply-le-elems   [:call apply [:cfn <=] [:sq [:elems ?v]]]   [:call apply [:cfn <=] ?v]]
+    [apply-lt-nil     [:call apply [:cfn <] [:nil]]              [:bottom]]
+    [apply-lt-empty   [:call apply [:cfn <] [:sq [:enil]]]       [:bottom]]
+    [apply-lt-one     [:call apply [:cfn <] [:sq [:econs ?a [:enil]]]] [:lit true]]
+    [apply-lt-more    [:call apply [:cfn <] [:sq [:econs ?a [:econs ?b ?E]]]]
+                       [:if [:call < ?a ?b] [:call apply [:cfn <] [:sq [:econs ?b ?E]]] [:lit false]]]
+    [apply-lt-elems   [:call apply [:cfn <] [:sq [:elems ?v]]]   [:call apply [:cfn <] ?v]]
+    [apply-ge-nil     [:call apply [:cfn >=] [:nil]]              [:bottom]]
+    [apply-ge-empty   [:call apply [:cfn >=] [:sq [:enil]]]       [:bottom]]
+    [apply-ge-one     [:call apply [:cfn >=] [:sq [:econs ?a [:enil]]]] [:lit true]]
+    [apply-ge-more    [:call apply [:cfn >=] [:sq [:econs ?a [:econs ?b ?E]]]]
+                       [:if [:call >= ?a ?b] [:call apply [:cfn >=] [:sq [:econs ?b ?E]]] [:lit false]]]
+    [apply-ge-elems   [:call apply [:cfn >=] [:sq [:elems ?v]]]   [:call apply [:cfn >=] ?v]]
+    [apply-gt-nil     [:call apply [:cfn >] [:nil]]              [:bottom]]
+    [apply-gt-empty   [:call apply [:cfn >] [:sq [:enil]]]       [:bottom]]
+    [apply-gt-one     [:call apply [:cfn >] [:sq [:econs ?a [:enil]]]] [:lit true]]
+    [apply-gt-more    [:call apply [:cfn >] [:sq [:econs ?a [:econs ?b ?E]]]]
+                       [:if [:call > ?a ?b] [:call apply [:cfn >] [:sq [:econs ?b ?E]]] [:lit false]]]
+    [apply-gt-elems   [:call apply [:cfn >] [:sq [:elems ?v]]]   [:call apply [:cfn >] ?v]]
+    ;; apply + sums; of nothing it is 0
+    [apply-sum-nil     [:call apply [:cfn +] [:nil]]                [:lit 0]]
+    [apply-sum-empty   [:call apply [:cfn +] [:sq [:enil]]]         [:lit 0]]
+    [apply-sum-cons    [:call apply [:cfn +] [:sq [:econs ?a ?E]]]  [:call + ?a [:call apply [:cfn +] [:sq ?E]]]]
+    [apply-sum-elems   [:call apply [:cfn +] [:sq [:elems ?v]]]     [:call apply [:cfn +] ?v]]])
 
 (defn- pvar? [x] (and (symbol? x) (str/starts-with? (name x) "?")))
 
@@ -174,31 +204,72 @@
 
 ;; --- deciding conditions ---------------------------------------------------------
 
+(defn- gcd [a b] (if (zero? b) (abs a) (recur b (mod a b))))
+
+(defn- tighten
+  "c + sum k*x >= 0 over integers, divided through by the gcd of the ks
+  with the constant rounded down: 2x - 1 >= 0 is x - 1 >= 0."
+  [{:keys [c m]}]
+  (let [m (into {} (remove (comp zero? val)) m)
+        g (reduce gcd 0 (vals m))]
+    (if (> g 1)
+      {:c (quot (- c (mod c g)) g) :m (into {} (map (fn [[x k]] [x (quot k g)])) m)}
+      {:c c :m m})))
+
+(defn- infeasible?
+  "Do these integer constraints, each c + sum k*x >= 0, have no solution?
+  Fourier-Motzkin elimination, tightened at each step for integers: a
+  true answer is a proof, a false one only means no proof was found."
+  [cs]
+  (loop [cs (map tighten cs), budget 400]
+    (let [cs (distinct cs)]
+      (cond
+        (some #(and (empty? (:m %)) (neg? (:c %))) cs) true
+        (> (count cs) budget) false
+        :else
+        (if-let [x (first (mapcat (comp keys :m) cs))]
+          (let [{pos true neg false} (group-by #(pos? (get-in % [:m x])) (filter #(get-in % [:m x]) cs))
+                rest (remove #(get-in % [:m x]) cs)
+                combined (for [p pos, q neg
+                               :let [a (get-in p [:m x]) b (- (get-in q [:m x]))]]
+                           (tighten (lin+ (lin* b p) (lin* a q))))]
+            (recur (concat rest combined) budget))
+          false)))))
+
+(defn- known-constraints
+  "The integer facts in ctx, as constraints c + sum k*x >= 0, with each
+  Nat atom they or `extra` mention known to be at least 0."
+  [ctx extra]
+  (let [facts (for [[f v] (:facts ctx)
+                    :when (true? v)
+                    lf (case (head f)
+                         :le (when-let [e (lin-of ctx (second f))] [e])
+                         :ieq (when-let [e (lin-of ctx (second f))] [e (lin* -1 e)])
+                         nil)]
+                lf)
+        atoms (distinct (mapcat (comp keys :m) (concat facts extra)))]
+    (concat facts (for [a atoms :when (nat-atom? ctx a)] {:c 0 :m {a 1}}))))
+
 (defn decide-le
   "true / false / nil for 0 <= d, from its form, Nat atoms and the facts."
   [ctx d]
   (let [lf (lin-of ctx d)]
     (when lf
       (let [{:keys [c m]} lf
-            ks (vals m)]
+            ks (vals m)
+            m* (into {} (remove (comp zero? val)) m)]
         (cond
-          (empty? m) (<= 0 c)
-          (and (every? #(nat-atom? ctx %) (keys m)) (every? pos? ks) (>= c 0)) true
-          (and (every? #(nat-atom? ctx %) (keys m)) (every? neg? ks) (< c 0)) false
+          (empty? m*) (<= 0 c)
+          (and (every? #(nat-atom? ctx %) (keys m*)) (every? pos? (vals m*)) (>= c 0)) true
+          (and (every? #(nat-atom? ctx %) (keys m*)) (every? neg? (vals m*)) (< c 0)) false
           :else
-          ;; each fact 0 <= e settles d when d - e or d + e is a constant;
-          ;; results are boxed, since `some` would skip a false one
-          (first
-            (some (fn [[f v]]
-                    (when (and v (= :le (head f)))
-                      (when-let [e (lin-of ctx (second f))]
-                        (let [diff (lin+ lf (lin* -1 e))
-                              sum (lin+ lf e)]
-                          (cond
-                            (and (empty? (remove (comp zero? val) (:m diff))) (>= (:c diff) 0)) [true]
-                            (and (empty? (remove (comp zero? val) (:m sum))) (<= (:c sum) -1)) [false]
-                            :else nil)))))
-                  (:facts ctx))))))))
+          (let [known (known-constraints ctx [lf])]
+            (cond
+              ;; d <= -1 contradicts what is known: 0 <= d
+              (infeasible? (cons (lin+ (lin* -1 lf) {:c -1 :m {}}) known)) true
+              ;; 0 <= d contradicts it: d < 0
+              (infeasible? (cons lf known)) false
+              :else nil)))))))
 
 (defn decide-ieq [ctx d]
   (let [lf (lin-of ctx d)]
@@ -219,13 +290,27 @@
     (contains? (:facts ctx) c) (get (:facts ctx) c)
     :else nil))
 
+(def ^:private seq-makers
+  "clojure.core fns that always return a seq or vector object, which is
+  truthy whatever it holds.  A lazy one is truthy before it is realised,
+  so its elements must not be computed to decide it."
+  '#{filter map concat rest cons list vector vec})
+
 (defn truthiness
-  "true / false for a term whose truthiness is settled, else nil."
+  "true / false for a term whose truthiness is settled, else nil.  An if
+  whose branches agree has their truthiness without its test being run:
+  a lazy seq's elements can hide behind such an if, and computing them
+  could throw where the seq, unrealised, would not."
   [ctx c]
   (case (head c)
     :nil false
     :lit (not (false? (second c)))
-    (:sq :fn) true
+    (:sq :fn :cfn) true
+    :if (let [a (truthiness ctx (nth c 2)) b (truthiness ctx (nth c 3))]
+          (when (and (some? a) (= a b)) a))
+    :call (if (contains? seq-makers (second c))
+            true
+            (let [d (decide ctx c)] (when (some? d) d)))
     (let [d (decide ctx c)] (when (some? d) d))))
 
 ;; --- equality ------------------------------------------------------------------
@@ -377,8 +462,12 @@
         nil))
 
     :ap (let [[_ f & args] x]
-          (when (and (= :fn (head f)) (= (count (second f)) (count args)))
-            (t/subst (nth f 2) (zipmap (second f) args))))
+          (cond
+            (and (= :fn (head f)) (= (count (second f)) (count args)))
+            (t/subst (nth f 2) (zipmap (second f) args))
+            ;; a core fn value applied is a call of it
+            (= :cfn (head f)) (into [:call (second f)] args)
+            :else nil))
 
     :le (let [d (decide ctx x)] (when (some? d) [:lit d]))
     :ieq (let [d (decide ctx x)] (when (some? d) [:lit d]))
@@ -448,6 +537,36 @@
             rhs))
         (:ih ctx)))
 
+(defn match-term
+  "Bindings of pattern variables `vs` that make `pat` equal to x, or nil."
+  ([pat x vs] (match-term pat x vs {}))
+  ([pat x vs m]
+   (cond
+     (nil? m) nil
+     (and (symbol? pat) (contains? vs pat))
+     (if (contains? m pat) (when (= (get m pat) x) m) (assoc m pat x))
+     (and (vector? pat) (vector? x) (= (count pat) (count x)))
+     (reduce (fn [m [p y]] (or (match-term p y vs m) (reduced nil))) m (map vector pat x))
+     (= pat x) m
+     :else nil)))
+
+(declare normalize truthiness)
+
+(defn- lemma-rewrite
+  "Rewrite x by an earlier proved law: its left side matched against x,
+  its hypothesis, instantiated, normalised to true here."
+  [ctx x]
+  (some (fn [{:keys [vars hyp lhs rhs name]}]
+          (when-let [m (match-term lhs x vars)]
+            (when (every? #(contains? m %) (t/vars rhs))
+              (when (or (nil? hyp)
+                        (let [h (t/subst hyp m)]
+                          (and (every? #(not (contains? vars %)) (t/vars h))
+                               (true? (truthiness ctx (normalize ctx h))))))
+                (swap! (:lemmas-used ctx) conj name)
+                (t/subst rhs m)))))
+        (:lemmas ctx)))
+
 (def ^:private boolean-fns
   '#{= not= not < <= > >= empty? zero? pos? neg? even? odd? nil? some? true? false?})
 
@@ -458,11 +577,15 @@
   (case (head t)
     (:le :ieq) true
     :lit (boolean? (second t))
-    :call (contains? boolean-fns (second t))
+    :call (or (contains? boolean-fns (second t))
+              ;; apply of a comparison
+              (and (= 'apply (second t)) (= :cfn (head (nth t 2 nil)))
+                   (contains? '#{< <= > >= =} (second (nth t 2)))))
     false))
 
 (defn- step [ctx x]
   (or (ih-rewrite ctx x)
+      (lemma-rewrite ctx x)
       (when (and (contains? (:facts ctx) x) (not (contains? #{:le :ieq} (head x)))
                  (boolean-term? x) (boolean? (get (:facts ctx) x)))
         [:lit (get (:facts ctx) x)])
@@ -491,7 +614,7 @@
     (let [r (cond
               (symbol? x) x
               (not (vector? x)) x
-              (contains? #{:lit :nil :enil :bottom} (head x)) x
+              (contains? #{:lit :nil :enil :bottom :cfn} (head x)) x
               :else
               (let [x* (case (head x)
                          :if (let [c (normalize ctx (nth x 1))
@@ -504,7 +627,10 @@
                                  :else
                                  (let [a (normalize (assume ctx c true) (nth x 2))
                                        b (normalize (assume ctx c false) (nth x 3))]
-                                   (if (= a b) a [:if c a b]))))
+                                   (cond (= a b) a
+                                         ;; (if c true false) is c when c is a boolean
+                                         (and (= [:lit true] a) (= [:lit false] b) (boolean-term? c)) c
+                                         :else [:if c a b]))))
                          :lin (let [[_ c pairs] x
                                     atoms (map (fn [[a k]] [(normalize ctx a) k]) pairs)]
                                 (if (every? #(int-term? ctx (first %)) atoms)
@@ -514,7 +640,12 @@
                          :fn (let [[_ ps body] x] [:fn ps (normalize ctx body)])
                          (into [(head x)] (map #(normalize ctx %)) (rest x)))]
                 (if (= :if (head x))
-                  x*
+                  ;; a boolean law's left side is often an if: an induction
+                  ;; hypothesis or a lemma may still rewrite the whole of one
+                  (if-let [y (and (= :if (head x*))
+                                  (or (ih-rewrite ctx x*) (lemma-rewrite ctx x*)))]
+                    (do (burn! ctx) (normalize ctx y))
+                    x*)
                   (do (burn! ctx)
                       (if-let [y (step ctx x*)]
                         (if (= y x*) x* (normalize ctx y))
@@ -525,9 +656,10 @@
 (defn context
   "A fresh normalising context.  defs: name -> {:params :body :recursive?};
   types: variable -> type; tenv: data declarations."
-  [{:keys [defs types tenv facts ih fuel]}]
+  [{:keys [defs types tenv facts ih fuel lemmas lemmas-used]}]
   {:defs (or defs {}) :types (or types {}) :tenv (or tenv {})
-   :facts (or facts {}) :ih (or ih [])
+   :facts (or facts {}) :ih (or ih []) :lemmas (or lemmas [])
+   :lemmas-used (or lemmas-used (atom #{}))
    :memo (atom {}) :stuck (atom #{}) :unfolded (atom #{}) :used-ih (atom 0)
    :fuel (atom (or fuel 20000))})
 
@@ -620,7 +752,9 @@
                      (gen/tuple (gen/one-of [(gen/return t/tnil) leaf]) (gen/choose -1 3)))
            (gen/fmap (fn [[f g x]] [:call f g x])
                      (gen/tuple (gen/elements '[filter map]) (gen/elements sample-fns) sub))
-           (gen/fmap (fn [[c a b]] [:if c a b]) (gen/tuple sub sub sub))])))))
+           (gen/fmap (fn [[c a b]] [:if c a b]) (gen/tuple sub sub sub))
+           (gen/fmap (fn [[f x]] [:call 'apply [:cfn f] x])
+                     (gen/tuple (gen/elements '[<= < >= > +]) sub))])))))
 
 (defn ground-check
   "Normalise random closed terms and run both: wherever the original

@@ -1249,24 +1249,49 @@
     (let [defs (delay (prover/definitions
                         [[target (book/read-forms (source-url target))]
                          [spec-ns (book/read-forms (source-url spec-ns))]]))]
-      (mapv (fn [r]
-              (if-not (and (:prop r) (contains? #{:tested :failed} (:status r)))
-                r
-                (let [pr (try (let [[ds own] @defs]
-                                (prover/prove-law {:prop (:prop r) :defs ds :tenv tenv
-                                                   :target target :own own}))
-                              (catch Throwable e
-                                {:proved false :reason (str "the prover failed: " (ex-message e))}))]
-                  (cond
-                    (and (:proved pr) (= :tested (:status r)))
-                    (assoc r :status :proved :proof (:summary pr))
+      ;; a law proved here is a lemma for any law proved after it; one that
+      ;; is only tested, or that a test refutes, never is.  Passes repeat
+      ;; while they prove something new, so a law may cite one that comes
+      ;; later in the spec, and no proof can lean on itself: each cites
+      ;; only laws whose proofs were finished before it began
+      (let [attempt (fn [r lemmas]
+                      (try (let [[ds own] @defs]
+                             (prover/prove-law {:prop (:prop r) :defs ds :tenv tenv
+                                                :target target :own own :lemmas lemmas}))
+                           (catch Throwable e
+                             {:proved false :reason (str "the prover failed: " (ex-message e))})))
+            open? (fn [r] (and (:prop r) (contains? #{:tested :failed} (:status r))
+                               (not (:proof r)) (not (:unproved-final r))))
+            pass (fn [[rs lemmas]]
+                   (reduce
+                     (fn [[out lemmas] r]
+                       (if-not (open? r)
+                         [(conj out r) lemmas]
+                         (let [pr (attempt r lemmas)]
+                           (cond
+                             (and (:proved pr) (= :tested (:status r)))
+                             [(conj out (cond-> (-> r (dissoc :unproved)
+                                                    (assoc :status :proved :proof (:summary pr)))
+                                          (seq (:lemmas pr)) (assoc :lemmas (:lemmas pr))))
+                              (conj lemmas {:name (:law r) :prop (:prop r)})]
 
-                    (and (:proved pr) (not (thrown? r)))
-                    (assoc r :prover-bug true :proof (:summary pr))
+                             (and (:proved pr) (not (thrown? r)))
+                             [(conj out (assoc r :prover-bug true :proof (:summary pr))) lemmas]
 
-                    (= :tested (:status r)) (assoc r :unproved (:reason pr))
-                    :else r))))
-            results))))
+                             (= :tested (:status r))
+                             [(conj out (cond-> (assoc r :unproved (:reason pr))
+                                          ;; outside the model: no lemma changes that
+                                          (str/starts-with? (str (:reason pr)) "outside")
+                                          (assoc :unproved-final true)))
+                              lemmas]
+                             :else [(conj out (assoc r :unproved-final true)) lemmas]))))
+                     [[] lemmas]
+                     rs))]
+        (loop [[rs lemmas] (pass [results []])]
+          (let [[rs2 lemmas2] (pass [rs lemmas])]
+            (if (= (count lemmas2) (count lemmas))
+              (mapv #(dissoc % :unproved-final) rs2)
+              (recur [rs2 lemmas2]))))))))
 
 (defn check
   "Check a spec namespace against its target (or opts :target).  Returns a

@@ -149,3 +149,60 @@
   (is (= [:nil] (norm [:call 'nth [:nil] [:lit 0]])))
   (is (= [:nil] (norm [:call 'nth [:nil] [:lit -1]])))
   (is (= [:lit :d] (norm [:call 'nth [:nil] [:lit 3] [:lit :d]]))))
+
+;; --- phase 2: core fns as values ------------------------------------------------
+
+(deftest a-core-fn-can-be-a-value
+  (let [ctx (writ.prove.translate/context {})
+        tm #(writ.prove.translate/lower-term ctx '[xs] %)]
+    (is (= [:call 'apply [:cfn '<=] 'xs] (tm '(apply <= xs))))
+    (is (= [:call 'filter [:cfn 'odd?] 'xs] (tm '(filter odd? xs))))))
+
+(deftest apply-of-a-comparison-walks-the-list
+  (is (= [:lit true] (norm [:call 'apply [:cfn '<=] (t/value->term [1 2 2 5])])))
+  (is (= [:lit false] (norm [:call 'apply [:cfn '<] (t/value->term [1 2 2 5])])))
+  (is (= [:lit 10] (norm [:call 'apply [:cfn '+] (t/value->term [1 2 3 4])])))
+  (testing "on two unknowns it is the comparison"
+    (is (= (norm {:types '{a Nat b Nat}} [:call '<= 'a 'b])
+           (norm {:types '{a Nat b Nat}} [:call 'apply [:cfn '<=] [:sq [:econs 'a [:econs 'b [:enil]]]]]))))
+  (testing "applying a core fn value calls it"
+    (is (= [:lit 4] (norm [:ap [:cfn 'inc] [:lit 3]])))))
+
+(deftest apply-rules-agree-with-the-runtime
+  (let [r (rw/self-test (filter #(re-find #"^apply" (name (first %))) rw/pattern-rules) 200 42)]
+    (is (:ok r) (pr-str (:failures r)))
+    (is (<= 10 (:checked r)))))
+
+(deftest comparisons-follow-from-chains-of-facts
+  ;; a <= b, b <= c, c <= d  gives  a <= d, and settles d < a false
+  (let [le (fn [x y] [:le [:lin 0 [[y 1] [x -1]]]])
+        ctx (reduce (fn [c f] (rw/assume c f true))
+                    (rw/context {:types '{a Int b Int c Int d Int}})
+                    [(le 'a 'b) (le 'b 'c) (le 'c 'd)])]
+    (is (true? (rw/decide ctx (le 'a 'd))))
+    (is (false? (rw/decide ctx [:le [:lin -1 '[[a 1] [d -1]]]])))
+    (is (nil? (rw/decide ctx (le 'd 'a))) "d <= a is open")
+    (testing "integers: 2x >= 1 means x >= 1"
+      (let [ctx (rw/assume (rw/context {:types '{x Int}}) [:le [:lin -1 '[[x 2]]]] true)]
+        (is (true? (rw/decide ctx [:le [:lin -1 '[[x 1]]]])))))))
+
+;; --- phase 2: case analysis and lemmas --------------------------------------------
+
+(deftest insert-keeps-sorted-is-proved-by-looking-at-the-tail
+  (let [l (law-result (spec/check 'writ.spec-demo.sort-spec {:seed 42}) 'insert-keeps-sorted)]
+    (is (= :proved (:status l)) (pr-str l))
+    (is (re-find #"by induction on xs" (:proof l)))
+    (is (re-find #"cases on xs-t" (:proof l)))))
+
+(deftest sorted-cites-insert-keeps-sorted
+  (let [l (law-result (spec/check 'writ.spec-demo.sort-spec {:seed 42}) 'sorted)]
+    (is (= :proved (:status l)) (pr-str l))
+    (is (= '[insert-keeps-sorted] (:lemmas l)))
+    (is (re-find #"citing insert-keeps-sorted" (:proof l)))))
+
+(deftest a-law-only-tested-is-never-a-lemma
+  (testing "with insert-keeps-sorted refuted, sorted cannot cite it"
+    (let [r (spec/check 'writ.spec-demo.sort-spec {:seed 42 :target 'writ.spec-demo.sort-desc})]
+      (is (not= :proved (:status (law-result r 'insert-keeps-sorted))))
+      (is (not= :proved (:status (law-result r 'sorted))))
+      (is (not-any? :prover-bug (:laws r))))))

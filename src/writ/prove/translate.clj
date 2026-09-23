@@ -12,7 +12,12 @@
 (def core-fns
   "The clojure.core fns the prover models."
   '#{seq first rest next second empty? count cons list vector vec concat
-     filter map not = < <= > >= + - * inc dec zero? pos? neg? nth identity})
+     filter map not = < <= > >= + - * inc dec zero? pos? neg? nth identity apply})
+
+(def value-fns
+  "The clojure.core fns that may be passed as values: the modelled ones,
+  and pure predicates the prover keeps opaque."
+  (into core-fns '#{odd? even? max min not= nil? some? true? false?}))
 
 (defn outside!
   "Signal a form the prover does not model."
@@ -59,6 +64,10 @@
                  :else [:lit v]))
     :ref (let [s (:name ast)]
            (cond (contains? env s) (get env s)
+                 (and (not (contains? (:own ctx) s))
+                      (contains? #{nil "clojure.core"} (namespace s))
+                      (contains? value-fns (symbol (name s))))
+                 [:cfn (symbol (name s))]
                  (or (contains? (:own ctx) s) (call-head ctx env s))
                  (outside! (str "`" s "` passed as a value"))
                  :else (outside! (str "the name `" s "`"))))

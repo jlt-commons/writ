@@ -29,7 +29,7 @@
     (is (= 'writ.spec-demo.sort (:target r)))
     (testing "each law says how it was discharged"
       (is (= :evaluated (:status (law-result r 'insert-empty))))
-      (is (= :tested (:status (law-result r 'sorted))))
+      (is (= :proved (:status (law-result r 'sorted))))
       (is (= :tested (:status (law-result r 'permutation))))
       (is (= :tested (:status (law-result r 'smallest-first))))
       (is (= :witnessed (:status (law-result r 'has-fixed-point)))))
