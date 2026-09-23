@@ -192,7 +192,7 @@
 (deftest a-tree-taken-apart-with-case-meets-its-spec
   (let [r (spec/check tree-spec {:seed 42})]
     (is (:ok r) (:message r))
-    (is (= :tested (:status (law-result r 'size-counts))))
+    (is (= :proved (:status (law-result r 'size-counts))))
     (is (= :tested (:status (law-result r 'insert-keeps-order))))
     (is (= :evaluated (:status (law-result r 'insert-into-empty))))))
 
@@ -296,7 +296,7 @@
 (deftest a-spec-that-does-not-pin-a-fn-down-has-gaps
   (let [r (spec/check 'writ.spec-demo.sort-weak-spec {:seed 42})
         gap-fns (set (map :fn (:gaps r)))]
-    (is (every? #(= :tested (:status %)) (:laws r)) "every law holds")
+    (is (every? #(contains? #{:tested :proved} (:status %)) (:laws r)) "every law holds")
     (is (not (:ok r)) "but the spec is too weak to mean anything")
     (is (contains? gap-fns 'isort))
     (testing "the report names the impostor that satisfied every law"
@@ -345,7 +345,7 @@
 
 (deftest laws-that-fix-an-argument-leave-the-rest-unspecified
   (let [r (spec/check 'writ.spec-demo.classify-weak-spec {:seed 42})]
-    (is (every? #(= :tested (:status %)) (:laws r)) "every law holds")
+    (is (every? #(contains? #{:tested :proved} (:status %)) (:laws r)) "every law holds")
     (is (not (:ok r)))
     (is (= ['classify-read] (map :fn (:gaps r))))
     (is (re-find #"when it returns a different value whenever `n` is not one of -127, -2, -1, 0"

@@ -44,6 +44,7 @@
             [writ.law :as lw]
             [writ.norm :as norm]
             [writ.types :as ty]
+            [writ.prove :as prover]
             [clojure.test.check :as tc]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
@@ -827,9 +828,12 @@
 
 ;; --- check ---------------------------------------------------------------------
 
-(defn- format-failure [{:keys [law counterexample detail original trial seed error]}]
+(defn- format-failure [{:keys [law counterexample detail original trial seed error prover-bug proof]}]
   (let [pad (apply max 0 (map (comp count str) (keys counterexample)))]
-    (str "law `" law "` fails"
+    (str (when prover-bug
+           (str "writ bug: law `" law "` was proved (" proof ") but a test refutes it; "
+                "please report this with the seed below.\n"))
+         "law `" law "` fails"
          (if (seq counterexample)
            (str " for\n"
                 (str/join "\n" (map (fn [[k v]] (str "  " k (apply str (repeat (- pad (count (str k))) " "))
@@ -847,6 +851,8 @@
   "The report as text for an agent or a person: what failed and why."
   [{:keys [ok target spec static laws gaps unspecified rejected]}]
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
+       (apply str (for [{l :law p :proof st :status} laws :when (= :proved st)]
+                    (str "\n  law `" l "` proved " p)))
        (when ok
          (apply str (for [{f :fn n :laws imps :rejected} rejected]
                       (str "\n  `" f "`: " n (if (= 1 n) " law, " " laws, ")
@@ -869,13 +875,45 @@
        (when (seq unspecified)
          (str "\n\nnot in the spec (no signature): " (str/join ", " unspecified)))))
 
+(defn- thrown? [r]
+  (or (:error r) (some (fn [[_ v]] (str/starts-with? (str v) "threw:")) (:detail r))))
+
+(defn- prove-laws
+  "Try to prove each law that ran.  A tested law the prover proves becomes
+  :proved; a law it cannot prove keeps :tested with the reason.  A law
+  that is proved yet refuted by a value (not a throw) is a writ bug."
+  [results opts target spec-ns tenv]
+  (if (= false (:prove opts))
+    results
+    (let [defs (delay (prover/definitions
+                        [[target (book/read-forms (source-url target))]
+                         [spec-ns (book/read-forms (source-url spec-ns))]]))]
+      (mapv (fn [r]
+              (if-not (and (:prop r) (contains? #{:tested :failed} (:status r)))
+                r
+                (let [[ds own] @defs
+                      pr (try (prover/prove-law {:prop (:prop r) :defs ds :tenv tenv
+                                                 :target target :own own})
+                              (catch Throwable e
+                                {:proved false :reason (str "the prover failed: " (ex-message e))}))]
+                  (cond
+                    (and (:proved pr) (= :tested (:status r)))
+                    (assoc r :status :proved :proof (:summary pr))
+
+                    (and (:proved pr) (not (thrown? r)))
+                    (assoc r :prover-bug true :proof (:summary pr))
+
+                    (= :tested (:status r)) (assoc r :unproved (:reason pr))
+                    :else r))))
+            results))))
+
 (defn check
   "Check a spec namespace against its target (or opts :target).  Returns a
   report map; :ok says whether everything held and :message explains any
   failure.  opts: :target, :trials (test.check runs per law, default 100),
   :seed (default random; each law's report carries the one it used) and
-  :max-size (the largest generated size, default 50) and :adequacy (false
-  skips the gap check)."
+  :max-size (the largest generated size, default 50), :adequacy (false
+  skips the gap check) and :prove (false skips the prover)."
   ([spec-ns] (check spec-ns {}))
   ([spec-ns opts]
    (let [{:keys [trials seed max-size] :or {trials 100 max-size 50}} opts
@@ -929,6 +967,7 @@
                                   {:law name :status :failed :counterexample {} :detail []
                                    :error (or (ex-message ex) (str ex))}))))
                        (finally (unwrap! wrapped)))
+             results (prove-laws results opts target spec-ns tenv)
              unq (fn unq [f]
                    (cond (and (symbol? f) (contains? #{(name target) (name spec-ns)} (namespace f)))
                          (symbol (name f))

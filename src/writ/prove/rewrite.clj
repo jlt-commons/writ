@@ -186,16 +186,19 @@
           (and (every? #(nat-atom? ctx %) (keys m)) (every? pos? ks) (>= c 0)) true
           (and (every? #(nat-atom? ctx %) (keys m)) (every? neg? ks) (< c 0)) false
           :else
-          (some (fn [[f v]]
-                  (when (and v (= :le (head f)))
-                    (when-let [e (lin-of ctx (second f))]
-                      (let [diff (lin+ lf (lin* -1 e))
-                            sum (lin+ lf e)]
-                        (cond
-                          (and (empty? (remove (comp zero? val) (:m diff))) (>= (:c diff) 0)) true
-                          (and (empty? (remove (comp zero? val) (:m sum))) (<= (:c sum) -1)) false
-                          :else nil)))))
-                (:facts ctx)))))))
+          ;; each fact 0 <= e settles d when d - e or d + e is a constant;
+          ;; results are boxed, since `some` would skip a false one
+          (first
+            (some (fn [[f v]]
+                    (when (and v (= :le (head f)))
+                      (when-let [e (lin-of ctx (second f))]
+                        (let [diff (lin+ lf (lin* -1 e))
+                              sum (lin+ lf e)]
+                          (cond
+                            (and (empty? (remove (comp zero? val) (:m diff))) (>= (:c diff) 0)) [true]
+                            (and (empty? (remove (comp zero? val) (:m sum))) (<= (:c sum) -1)) [false]
+                            :else nil)))))
+                  (:facts ctx))))))))
 
 (defn decide-ieq [ctx d]
   (let [lf (lin-of ctx d)]
@@ -395,13 +398,30 @@
   [t]
   (keep (fn [x] (when (= :if (head x)) (nth x 1))) (t/subterms t)))
 
+(declare assume truthiness)
+
 (defn- settled?
-  "An unfolding is kept when every branch it leaves open is an integer
-  comparison the prover can split on.  An open test on the shape of an
-  unknown value (seq xs, first t) means the definition was unfolded too
-  early: it stays folded until induction or a split reveals that shape."
-  [x]
-  (every? splittable? (open-conditions x)))
+  "Should a recursive definition, its arguments substituted in, be
+  unfolded?  Its guards -- the tests of its if-tree, from the top -- are
+  decided one by one, following the branch each takes.  It is unfolded
+  when every guard left open is an integer comparison the prover can
+  split on.  An open test on the shape of an unknown value (seq xs,
+  first t) means it is too early: the call stays folded until induction
+  or a split reveals that shape.  Only the guards are normalised, never
+  the branches, so a recursive call inside a branch is not unfolded here."
+  [ctx body]
+  (if (= :if (head body))
+    (let [c (normalize ctx (nth body 1))
+          tr (truthiness ctx c)]
+      (cond
+        (true? tr) (settled? ctx (nth body 2))
+        (false? tr) (settled? ctx (nth body 3))
+        (and (= :call (head c)) (= 'not (second c)))
+        (settled? ctx [:if (nth c 2) (nth body 3) (nth body 2)])
+        (splittable? c) (and (settled? (assume ctx c true) (nth body 2))
+                             (settled? (assume ctx c false) (nth body 3)))
+        :else false))
+    true))
 
 (defn- unfold [ctx x]
   (let [[_ f & args] x
@@ -412,10 +432,9 @@
       (let [body (t/subst (:body d) (zipmap (:params d) args))]
         (if-not (:recursive? d)
           (do (swap! (:unfolded ctx) conj f) body)
-          (let [r (normalize ctx body)]
-            (if (settled? r)
-              (do (swap! (:unfolded ctx) conj f) r)
-              (do (swap! (:stuck ctx) conj x) nil))))))))
+          (if (settled? ctx body)
+            (do (swap! (:unfolded ctx) conj f) body)
+            (do (swap! (:stuck ctx) conj x) nil)))))))
 
 (defn- ih-rewrite [ctx x]
   (some (fn [{:keys [hyp lhs rhs]}]
@@ -436,11 +455,13 @@
   "ctx with condition c taken to be v.  A false 0 <= d is also kept as
   0 <= -d-1, the form the integer reasoning reads."
   [ctx c v]
+  (if (and (= :call (head c)) (= 'not (second c)) (boolean? v))
+    (assume ctx (nth c 2) (not v))
   (let [facts (assoc (:facts ctx) c v)
         facts (if (and (= :le (head c)) (false? v) (lin-of ctx (second c)))
                 (assoc facts [:le (lin->term (lin+ (lin* -1 (lin-of ctx (second c))) {:c -1 :m {}}))] true)
                 facts)]
-    (assoc ctx :facts facts :memo (atom {}) :stuck (atom #{}))))
+    (assoc ctx :facts facts :memo (atom {}) :stuck (atom #{})))))
 
 (defn normalize
   "Rewrite t to normal form under ctx.  An if whose test is open gets its

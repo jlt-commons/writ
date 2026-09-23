@@ -183,8 +183,14 @@ Other options are `:trials`, the test.check runs per law (default 100),
 law runs until it is fixed. After that, each law has a `:status`:
 
 - `:vacuous`: true of any implementation; the spec must change.
+- `:proved`: passed its tests, and the prover derived it from the code for
+  every input. `:proof` says how.
 - `:evaluated`: a law with no quantifiers, run once.
 - `:tested`: passed test.check's trials. This is evidence, not proof.
+  `:unproved` says why the prover did not prove it: a form outside its
+  model (`conj`, maps, `loop`, a core fn passed as a value), a lemma it
+  would need, or no proof found. That is not a failure. A law written with
+  modelled forms and the spec's own helpers is more likely to be proved.
 - `:witnessed`: an `exists` law, and a value was found.
 - `:failed`: see the message.
 
@@ -244,6 +250,10 @@ confirm it, then without one.
 - ``cannot find the source of `ns` on the classpath`` - the target file is
   not under a source path.
 - ``is not a spec namespace`` - the namespace has no `(spec target)` form.
+
+- ``writ bug: law `x` was proved (...) but a test refutes it`` - the
+  prover is wrong, not your code. Report it with the seed, and rerun with
+  `{:prove false}` meanwhile.
 
 ### Tagged data
 
@@ -481,6 +491,9 @@ broken implementations and the reports they produce.
 ## Source map
 
 - `writ.spec` spec namespaces, law checking with test.check, instrument
+- `writ.prove` proofs of laws from the code: `.term` the value model,
+  `.rewrite` the rules (checked against the runtime), `.translate` Clojure
+  to terms
 - `writ.book` runs every rule over a namespace's forms
 - `writ.check` quantities, termination, ordering, effects, arity
 - `writ.types` types and tagged data, `writ.kind` well-kindedness
