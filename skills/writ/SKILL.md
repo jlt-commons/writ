@@ -155,7 +155,10 @@ Plain Clojure, with no writ require and no annotations. writ rejects:
   must pass a strict part of one parameter, under a test on it:
   - `(rest xs)` or `(next xs)` under `(seq xs)` or `(empty? xs)`, and only
     on a collection typed finite, which the `ann` provides
-  - `(dec n)` under `(pos? n)`, or `(zero? n)` on a `Nat`
+  - `(dec n)` under `(pos? n)`, or `(zero? n)` on a `Nat`; a chain
+    `(dec (dec n))` needs each depth guarded
+  - `(- n k)`, `k` a literal, under a comparison proving `n >= k`, such
+    as `(if (< n k) base (f (- n k)))`
   - fields from destructuring or `first`/`nth` under a non-nil test,
     including a `case` on `(first t)`
 

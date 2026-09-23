@@ -311,7 +311,9 @@
     (case h
       dec (when (= n 1) [:dec a])
       inc (when (= n 1) [:inc a])
-      - (when (and (= n 2) (= 1 (lit-val b))) [:dec a])
+      ;; subtracting a literal k is k decs
+      - (when (and (= n 2) (pos-int-lit? b))
+          (if (= 1 (lit-val b)) [:dec a] [[:sub (lit-val b)] a]))
       + (cond (and (= n 2) (= 1 (lit-val b))) [:inc a]
               (and (= n 2) (= 1 (lit-val a))) [:inc b]
               :else nil)
@@ -366,11 +368,15 @@
     (= :invoke (:op t))
     (if-let [[step x] (shrink-step t info)]
       (when-let [o (origin x info stop)]
-        (case step
+        (case (if (vector? step) (first step) step)
           :dec (when (numeric-only? o)
                  (let [k (:net o 0)]
                    {:col (:col o) :net (inc k) :strict? true
                     :needs (conj (:needs o) [:num k])}))
+          :sub (when (numeric-only? o)
+                 (let [k (:net o 0) d (second step)]
+                   {:col (:col o) :net (+ k d) :strict? true
+                    :needs (into (:needs o) (for [j (range d)] [:num (+ k j)]))}))
           ;; inc undoes a dec; back at (or past) the column is not smaller
           :inc (when (and (numeric-only? o) (pos? (:net o 0)))
                  (let [k (dec (:net o 0))]
@@ -393,6 +399,12 @@
                       (when (and o (numeric-only? o)) [(:col o) (:net o 0)])))
         num-fact (fn [f e] (if-let [[c k] (num e)] #{[f c k]} #{}))
         one (fn [f c] (if c #{[f c]} #{}))
+        ;; e >= m: each depth below m is positive
+        at-least (fn [e m] (if-let [[c k] (num e)]
+                             (into #{} (for [j (range m)] [:pos c (+ k j)]))
+                             #{}))
+        ka (let [v (lit-val (first (:args test)))] (when (int? v) v))
+        kb (let [v (lit-val (second (:args test)))] (when (int? v) v))
         h (core-head test info)
         [a b] (:args test)
         none [#{} #{}]
@@ -429,14 +441,23 @@
                                #{}]
                  (some? v) [(one :nonnil (col e)) #{}]
                  :else none))
-      < (cond (= 0 (lit-val a)) [(num-fact :pos b) #{}]
-              (= 1 (lit-val b)) [#{} (num-fact :pos a)]
+      ;; a comparison with an integer literal bounds the other side
+      < (cond (not= 2 (count (:args test))) none
+              kb [#{} (at-least a kb)]
+              ka [(at-least b (inc ka)) #{}]
               :else none)
-      > (cond (= 0 (lit-val b)) [(num-fact :pos a) #{}]
-              (= 1 (lit-val a)) [#{} (num-fact :pos b)]
+      > (cond (not= 2 (count (:args test))) none
+              kb [(at-least a (inc kb)) #{}]
+              ka [#{} (at-least b ka)]
               :else none)
-      <= (cond (= 0 (lit-val b)) [#{} (num-fact :pos a)] :else none)
-      >= (cond (= 0 (lit-val a)) [#{} (num-fact :pos b)] :else none)
+      <= (cond (not= 2 (count (:args test))) none
+               kb [#{} (at-least a (inc kb))]
+               ka [(at-least b ka) #{}]
+               :else none)
+      >= (cond (not= 2 (count (:args test))) none
+               kb [(at-least a kb) #{}]
+               ka [#{} (at-least b (inc ka))]
+               :else none)
       (seq not-empty) [(one :nonempty (col a)) #{}]
       empty? [#{} (one :nonempty (col a))]
       nil? [#{} (one :nonnil (col a))]

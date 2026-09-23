@@ -525,3 +525,12 @@
         d (:detail (law-result r 'every-prefix-starts-low))]
     (is (not (:ok r)))
     (is (not-any? #(str/includes? (second %) "#object") d) (pr-str d))))
+
+(deftest recursion-down-a-nat-by-more-than-one
+  (let [r (spec/check 'writ.spec-demo.nat-chain-spec {:seed 42 :adequacy false :prove false})]
+    (is (:ok r) (:message r)))
+  (testing "a guard that proves too little is not enough"
+    (let [r (spec/check 'writ.spec-demo.nat-chain-spec
+                        {:target 'writ.spec-demo.nat-chain-short :seed 42 :adequacy false})]
+      (is (not (:ok (:static r))))
+      (is (re-find #"thirds" (:message r)) (:message r)))))

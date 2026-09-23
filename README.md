@@ -549,7 +549,12 @@ These rules apply to the plain implementation.
   structurally smaller part of one parameter, under a test that proves the
   shrink:
   - `rest` and `next` need `seq` or `empty?`
-  - `dec` needs `pos?`, or `zero?` on a `Nat`
+  - `dec` needs `pos?`, or `zero?` on a `Nat`. A chain of them needs a
+    guard at each depth: `(dec (dec n))` under `(zero? n)` and
+    `(zero? (dec n))` both false
+  - `(- n k)` for a literal `k` is `k` decs, so it needs `n` to be at
+    least `k`; `(< n k)` false or `(>= n k)` true proves it, and so does
+    any comparison of `n` with a literal that implies it
   - element reads such as `first`, `nth` and destructured fields need the
     value to be non-nil. A truthiness test works, and so does a `case` on
     `(first t)`

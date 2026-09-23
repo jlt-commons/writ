@@ -221,39 +221,82 @@
       (fail! "`" (display b) "` in `" nm "` is reusable (^:many) but its type "
              (show t) " is not Data; a function type cannot be reused"))))
 
-(defn- guard-refs
-  "Names a test proves nonzero: [then-branch else-branch].  (zero? x) and
-  (= x 0) prove x nonzero in the else branch; (pos? x), (< 0 x) and
-  (> x 0) in the then branch; `not` swaps them."
+(defn- int-lit [a]
+  (when (and (map? a) (= :lit (:op a)) (int? (:val a))) (:val a)))
+
+(defn- at-least
+  "The fact that expression `e` is at least `m`, as {e m}; nothing when
+  `m` says nothing a Nat does not already know."
+  [e m]
+  (if (and (map? e) (pos? m)) {e m} {}))
+
+(defn- guard-bounds
+  "Lower bounds a test proves: [then-branch else-branch], each {expr n},
+  meaning expr >= n there.  (zero? x) and (= x 0) prove x >= 1 in the else
+  branch, (pos? x) in the then branch, and a comparison with an integer
+  literal proves the bound it implies on the branch where it does; `not`
+  swaps them."
   [test]
   (let [ref-name (fn [a] (when (and (map? a) (= :ref (:op a))) (:name a)))
-        zero-lit? (fn [a] (and (map? a) (= :lit (:op a)) (= 0 (:val a))))
         head (when (and (= :invoke (:op test)) (= :ref (:op (:fn test))))
                (symbol (name (:name (:fn test)))))
         [a b] (:args test)
+        ka (int-lit a)
+        kb (int-lit b)
         ;; `and` and `or` expand to (let [g x] (if g more g)) and
         ;; (let [g x] (if g g more))
         [g x body] (when (and (= :let (:op test)) (= 1 (count (:bindings test))))
                      (let [[[g x]] (:bindings test)] [g x (:body test)]))
-        g-ref? (fn [e] (= g (ref-name e)))]
+        g-ref? (fn [e] (= g (ref-name e)))
+        none [{} {}]]
     (cond
       (and g (= :if (:op body)) (g-ref? (:test body)) (g-ref? (:else body)))
-      [(into (first (guard-refs x)) (first (guard-refs (:then body)))) #{}]
+      [(merge-with max (first (guard-bounds x)) (first (guard-bounds (:then body)))) {}]
 
       (and g (= :if (:op body)) (g-ref? (:test body)) (g-ref? (:then body)))
-      [#{} (into (second (guard-refs x)) (second (guard-refs (:else body))))]
+      [{} (merge-with max (second (guard-bounds x)) (second (guard-bounds (:else body))))]
+
+      (not= 2 (count (:args test)))
+      (case head
+        zero? [{} (at-least a 1)]
+        pos? [(at-least a 1) {}]
+        not (let [[t e] (guard-bounds a)] [e t])
+        none)
 
       :else
-    (case head
-      zero? (if-let [x (ref-name a)] [#{} #{x}] [#{} #{}])
-      pos? (if-let [x (ref-name a)] [#{x} #{}] [#{} #{}])
-      = (cond (and (ref-name a) (zero-lit? b)) [#{} #{(ref-name a)}]
-              (and (zero-lit? a) (ref-name b)) [#{} #{(ref-name b)}]
-              :else [#{} #{}])
-      < (if (and (zero-lit? a) (ref-name b)) [#{(ref-name b)} #{}] [#{} #{}])
-      > (if (and (ref-name a) (zero-lit? b)) [#{(ref-name a)} #{}] [#{} #{}])
-      not (let [[t e] (guard-refs a)] [e t])
-      [#{} #{}]))))
+      (case head
+        (= ==) (cond (= 0 kb) [{} (at-least a 1)]
+                     (= 0 ka) [{} (at-least b 1)]
+                     :else none)
+        < (cond kb [{} (at-least a kb)]
+                ka [(at-least b (inc ka)) {}]
+                :else none)
+        > (cond kb [(at-least a (inc kb)) {}]
+                ka [{} (at-least b ka)]
+                :else none)
+        <= (cond kb [{} (at-least a (inc kb))]
+                 ka [(at-least b ka) {}]
+                 :else none)
+        >= (cond kb [(at-least a kb) {}]
+                 ka [{} (at-least b (inc ka))]
+                 :else none)
+        none))))
+
+(defn- lower-bound
+  "What the guards in scope prove `e` is at least: its own bound, or one
+  worked out through a dec, an inc or a literal subtraction."
+  [env e]
+  (let [own (get (::lb env) e)
+        h (when (and (= :invoke (:op e)) (= :ref (:op (:fn e))))
+            (symbol (name (:name (:fn e)))))
+        [a b] (:args e)
+        derived (case h
+                  dec (some-> (lower-bound env a) dec)
+                  inc (some-> (lower-bound env a) inc)
+                  - (when-let [k (int-lit b)] (some-> (lower-bound env a) (- k)))
+                  (int-lit e))]
+    (cond (and own derived) (max own derived)
+          :else (or own derived (int-lit e)))))
 
 ;; --- tagged data (*tagged*) --------------------------------------------------
 
@@ -437,8 +480,8 @@
       :map (let [ts (mapv #(w env %) (concat (:keys ast) (:vals ast)))]
              (when (every? #(data? % tenv) ts) data))
       :do (do (doseq [s (:stmts ast)] (w env s)) (w env (:ret ast)))
-      :if (let [[pt pe] (guard-refs (:test ast))
-                pos (fn [e xs] (update e ::pos (fnil into #{}) xs))]
+      :if (let [[pt pe] (guard-bounds (:test ast))
+                pos (fn [e bs] (update e ::lb #(merge-with max % bs)))]
             (w env (:test ast))
             (join (w (pos env pt) (:then ast)) (w (pos env pe) (:else ast)) tenv))
       :case (if-let [x (and *tagged* (tag-scrut (:scrut ast)))]
@@ -498,12 +541,17 @@
 
               local? (when (kind/function-type? lt) (last lt))
 
-              ;; under a guard proving it nonzero, dec of a Nat stays Nat
-              ;; (Bend's 1n+p arm)
-              (and (= 'dec (symbol (name s))) (not (contains? (:shadow ctx) s))
-                   (= 1 (count (:args ast))) (= :ref (:op (first (:args ast))))
+              ;; under guards proving it big enough, dec of a Nat, or a
+              ;; literal subtracted from one, stays Nat (Bend's 1n+p arm)
+              (and (not (contains? (:shadow ctx) s))
+                   (or (nil? (namespace s)) (= "clojure.core" (namespace s)))
                    (= 'Nat (first ats))
-                   (contains? (::pos env) (:name (first (:args ast)))))
+                   (let [[a b] (:args ast)
+                         k (case (symbol (name s))
+                             dec (when (= 1 (count (:args ast))) 1)
+                             - (when (= 2 (count (:args ast))) (int-lit b))
+                             nil)]
+                     (and k (<= 0 k) (<= k (or (lower-bound env a) 0)))))
               'Nat
 
               (get sigs s)
