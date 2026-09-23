@@ -283,6 +283,50 @@
 
 (declare walk)
 
+(defn- built-type
+  "The type of a literal [:Ctor field ...].  Its field count must match,
+  and each field whose type is known must fit: a type parameter is
+  instantiated by the first field that is exactly that parameter, and
+  must agree everywhere after.  Only a provable mismatch fails; unknown
+  types pass.  The value is typed (T args) when every parameter was
+  instantiated, else as some data."
+  [ctx owner k ts]
+  (let [{:keys [nm tenv]} ctx
+        d (get tenv owner)
+        fs (:fields (get (:ctors d) k))
+        params (set (:params d))]
+    (when (not= (count ts) (count fs))
+      (fail! "`" nm "`: " k " takes " (count fs) " field(s) but is built with " (count ts)))
+    (let [inst (reduce
+                 (fn [m [i f t]]
+                   (if (contains? params f)
+                     (let [[prev from] (get m f)]
+                       (cond
+                         (nil? t) m
+                         (nil? prev) (assoc m f [t (inc i)])
+                         (and (not (compat? prev t tenv)) (not (compat? t prev tenv)))
+                         (fail! "`" nm "`: field " (inc i) " of " k " expects " f
+                                ", which field " from " made " (show prev)
+                                ", but is given " (show t))
+                         :else m))
+                     m))
+                 {} (map vector (range) fs ts))
+          sub (fn sub [x] (cond (symbol? x) (if-let [[t] (get inst x)] t x)
+                                (seq? x) (apply list (map sub x))
+                                :else x))
+          ;; an uninstantiated parameter stands for any type
+          tenv* (into tenv (map (fn [p] [p {:arity 0 :params [] :ctors {} :tvar true}]))
+                      (remove inst params))]
+      (doseq [[i f t] (map vector (range) fs ts)]
+        (let [ft (sub f)]
+          (when-not (compat? ft t tenv*)
+            (fail! "`" nm "`: field " (inc i) " of " k " expects " (show ft)
+                   " but is given " (show t)))))
+      (cond
+        (empty? params) owner
+        (every? inst (:params d)) (apply list owner (map #(first (get inst %)) (:params d)))
+        :else data))))
+
 (defn- walk-tag-case
   "(case (first x) :Ctor body ...) over a tagged data value."
   [ctx env ast x t]
@@ -356,12 +400,7 @@
                      (symbol (name (:val (first items)))))
                  owner (when k (ctor-owner tenv k))]
              (if owner
-               (let [d (get tenv owner)
-                     fs (:fields (get (:ctors d) k))
-                     n (dec (count items))]
-                 (when (not= n (count fs))
-                   (fail! "`" nm "`: " k " takes " (count fs) " field(s) but is built with " n))
-                 (if (empty? (:params d)) owner data))
+               (built-type ctx owner k (rest ts))
                (when (every? #(data? % tenv) ts) data)))
       :set (let [ts (mapv #(w env %) (:items ast))]
              (when (every? #(data? % tenv) ts) data))

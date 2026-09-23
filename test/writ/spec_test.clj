@@ -233,3 +233,43 @@
       (is (re-find #"take it apart with `\(case \(first t\) \.\.\.\)`"
                    (err '[(data Tree Leaf (Node Tree Nat Tree))
                           (defn f [^{:writ/type Tree} t] (second t))]))))))
+
+;; --- built values: field types checked at compile time -----------------------
+
+(defn- tagged-err [forms]
+  (binding [writ.types/*tagged* true]
+    (try (writ.book/check-book forms) nil
+         (catch Throwable e (ex-message e)))))
+
+(deftest a-provably-wrong-field-is-caught-before-running
+  (let [r (tree-run 'writ.spec-demo.tree-bad-field)]
+    (is (not (:ok r)))
+    (is (re-find #"`insert`: field 1 of Node expects Tree but is given Nat"
+                 (get-in r [:static :error])))
+    (is (empty? (:laws r)))))
+
+(deftest field-types-are-checked-only-when-known
+  (testing "a built value may nest other built values"
+    (is (nil? (tagged-err '[(data Tree Leaf (Node Tree Nat Tree))
+                            (defn one [^{:writ/type Nat} x] [:Node [:Leaf] x [:Leaf]])]))))
+  (testing "an unknown value passes: only a provable mismatch is an error"
+    (is (nil? (tagged-err '[(data Tree Leaf (Node Tree Nat Tree))
+                            (defn one [x] [:Node [:Leaf] x [:Leaf]])]))))
+  (testing "a built subtree in a Nat field is rejected"
+    (is (re-find #"field 2 of Node expects Nat but is given Tree"
+                 (tagged-err '[(data Tree Leaf (Node Tree Nat Tree))
+                               (defn bad [] [:Node [:Leaf] [:Leaf] [:Leaf]])])))))
+
+(deftest parametric-fields-are-instantiated-from-their-values
+  (testing "consistent instantiation passes and types the value"
+    (is (nil? (tagged-err '[(data Pair [a] (MkPair a a))
+                            (defn p [] [:MkPair 1 2])])))
+    (is (re-find #"`q` returns \(Box String\) but its body has type \(Box Nat\)"
+                 (tagged-err '[(data Box [a] (Wrap a))
+                               (defn ^{:tag (Box String)} q [] [:Wrap 1])])))
+    (is (nil? (tagged-err '[(data Box [a] (Wrap a))
+                            (defn ^{:tag (Box Nat)} q [] [:Wrap 1])]))))
+  (testing "a parameter given two different types is rejected"
+    (is (re-find #"`p`: field 2 of MkPair expects a, which field 1 made Nat, but is given String"
+                 (tagged-err '[(data Pair [a] (MkPair a a))
+                               (defn p [] [:MkPair 1 "x"])])))))
