@@ -114,3 +114,38 @@
   (let [ctx (rw/assume (rw/context {:types '{x Nat h Nat}})
                        [:le [:lin -1 '[[h -1] [x 1]]]] true)]
     (is (false? (rw/decide ctx [:le [:lin 0 '[[h 1] [x -1]]]])))))
+
+;; --- soundness ----------------------------------------------------------------
+
+(deftest an-assumed-test-is-a-value-only-when-it-is-a-boolean
+  (testing "(seq xs) assumed truthy is not true"
+    (is (not= [:lit true]
+              (norm {:types '{xs (List Int)}}
+                    [:if [:call 'seq 'xs] [:call '= [:call 'seq 'xs] [:lit true]] [:lit true]]))))
+  (testing "(first xs) assumed falsy may be nil, not false"
+    (is (not= [:lit true]
+              (norm {:types '{xs (List Bool)}}
+                    [:if [:call 'first 'xs] [:lit true] [:call '= [:call 'first 'xs] [:lit false]]]))))
+  (testing "a boolean test is still its assumed value"
+    (is (= [:lit true]
+           (norm {:types '{xs (List Int)}}
+                 [:if [:call 'empty? 'xs] [:call '= [:call 'empty? 'xs] [:lit true]] [:lit true]])))))
+
+(deftest substitution-does-not-capture
+  (let [f (t/subst [:fn '[a] [:call '+ 'a 'b]] {'b 'a})]
+    (is (= 11 (t/evaluate [:ap f [:lit 10]] {'a 1})))))
+
+(deftest substitution-leaves-quoted-symbols-alone
+  (is (= [:lit 'x] (t/subst [:lit 'x] {'x [:lit 1]})))
+  (is (= [:call '= [:lit 'x] [:lit 1]] (t/subst [:call '= [:lit 'x] 'x] {'x [:lit 1]}))))
+
+(deftest a-recursive-datatype-is-float-free
+  (let [ctx (rw/context {:tenv '{Tree {:ctors {Leaf {:fields []} Node {:fields [Tree Nat Tree]}}}}
+                         :types '{t Tree}})
+        r (deref (future (rw/float-free? ctx 't)) 5000 ::timeout)]
+    (is (true? r))))
+
+(deftest nth-of-nil-is-nil
+  (is (= [:nil] (norm [:call 'nth [:nil] [:lit 0]])))
+  (is (= [:nil] (norm [:call 'nth [:nil] [:lit -1]])))
+  (is (= [:lit :d] (norm [:call 'nth [:nil] [:lit 3] [:lit :d]]))))

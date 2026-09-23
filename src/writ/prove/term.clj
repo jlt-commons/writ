@@ -53,20 +53,6 @@
 
 (defn var? [t] (symbol? t))
 
-(defn subst
-  "Replace variables by terms: m is sym -> term.  A fn's own parameters
-  hide the outer binding."
-  [t m]
-  (cond
-    (symbol? t) (get m t t)
-    (not (vector? t)) t
-    (= :fn (head t)) (let [[_ ps body] t
-                           m* (apply dissoc m ps)]
-                       [:fn ps (subst body m*)])
-    (= :lin (head t)) (let [[_ c pairs] t]
-                        [:lin c (mapv (fn [[a k]] [(subst a m) k]) pairs)])
-    :else (into [(first t)] (map #(subst % m)) (rest t))))
-
 (defn vars
   "The free variables of a term."
   [t]
@@ -77,6 +63,29 @@
     (= :lin (head t)) (into #{} (mapcat (fn [[a _]] (vars a))) (nth t 2))
     (= :lit (head t)) #{}
     :else (into #{} (mapcat vars) (rest t))))
+
+(defn subst
+  "Replace variables by terms: m is sym -> term.  A fn's own parameters
+  hide the outer binding, and are renamed when a substituted term
+  mentions them, so its variables are not captured.  A quoted symbol is
+  data, not a variable."
+  [t m]
+  (cond
+    (symbol? t) (get m t t)
+    (not (vector? t)) t
+    (contains? #{:lit :nil :enil :bottom} (head t)) t
+    (= :fn (head t)) (let [[_ ps body] t
+                           m* (apply dissoc m ps)
+                           free (into #{} (comp (filter #(contains? (vars body) (key %)))
+                                                (mapcat (comp vars val)))
+                                      m*)
+                           ren (into {} (keep (fn [p] (when (contains? free p)
+                                                         [p (gensym (str (name p) "%"))])))
+                                     ps)]
+                       [:fn (mapv #(get ren % %) ps) (subst body (merge m* ren))])
+    (= :lin (head t)) (let [[_ c pairs] t]
+                        [:lin c (mapv (fn [[a k]] [(subst a m) k]) pairs)])
+    :else (into [(first t)] (map #(subst % m)) (rest t))))
 
 (defn subterms [t]
   (tree-seq (fn [x] (and (vector? x) (not (lit? x))))
