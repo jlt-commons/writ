@@ -515,7 +515,7 @@
       {}
       (into {} (for [i (range n)
                      :let [as (map #(nth % (inc i) ::none) calls)]
-                     :when (every? lit? as)]
+                     :when (every? #(and (not= ::none %) (lit? %)) as)]
                  [i (set as)])))))
 
 (defn impostors
@@ -620,6 +620,10 @@
 
 ;; --- the target's source -----------------------------------------------------
 
+(def ^:private spec-forms-accepted
+  (str "is not supported: in the code a spec covers, writ checks def and defn "
+       "forms only (the ns form and comment blocks are skipped)"))
+
 (defn- source-url [target]
   (let [base (-> (name target) (str/replace "-" "_") (str/replace "." "/"))]
     (or (io/resource (str base ".clj")) (io/resource (str base ".cljc"))
@@ -685,7 +689,8 @@
             [nsf others] [(filter #(head? % "ns") forms*) (remove #(head? % "ns") forms*)]]
         (binding [ck/*affine* false
                   ck/*descend-all* true
-                  ty/*tagged* true]
+                  ty/*tagged* true
+                  book/*forms-accepted* spec-forms-accepted]
           (book/check-book (vec (concat nsf data others))))
         {:ok true :defns defns}))
     (catch Throwable e
@@ -723,7 +728,8 @@
                          (try
                            (binding [ck/*affine* false
                                      ck/*descend-all* true
-                                     ty/*tagged* true]
+                                     ty/*tagged* true
+                                     book/*forms-accepted* spec-forms-accepted]
                              (book/check-book (vec (concat nsf kept [f]))))
                            [:ok nil]
                            (catch Throwable e

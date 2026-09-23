@@ -368,7 +368,10 @@
     (testing "each rejection carries writ's own reason"
       (is (re-find #"`\.toUpperCase` is host interop" (why 'shout)))
       (is (re-find #"`println` in `log!` is effect code" (why 'log!)))
-      (is (re-find #"`defrecord` is not supported" (why 'Conn))))
+      (is (re-find #"`defrecord` is not supported" (why 'Conn)))
+      (testing "in the words of the spec workflow, not writ.defn's books"
+        (is (not (re-find #"book|law and proof" (why 'Conn))))
+        (is (re-find #"def and defn" (why 'Conn)))))
     (testing "a fn that calls a rejected one says which"
       (is (= "it uses `shout`, which writ cannot check" (why 'loud-classify))))
     (testing "an unsigned collection is a missing ann, not a rejection"
@@ -386,3 +389,25 @@
       (is (= '{insert :needs-ann, isort :needs-ann} st)))
     (is (= "it uses `insert`, which needs an `ann` first"
            (:why (second (:forms (spec/scan 'writ.spec-demo.sort))))))))
+
+(deftest scan-rejects-static-host-members-and-accepts-doseq
+  (let [{:keys [forms]} (spec/scan 'writ.spec-demo.scan-host)
+        st (into {} (map (juxt :name :status)) forms)
+        why (into {} (map (juxt :name :why)) forms)]
+    (testing "System/getenv and System/currentTimeMillis are host interop"
+      (is (= :no (st 'env)))
+      (is (re-find #"`System/getenv` is host interop" (str (why 'env))))
+      (is (= :no (st 'now))))
+    (testing "a doseq is a loop that is not the fn's last form"
+      (is (not (re-find #"tail position" (str (why 'touch-all)))))
+      (testing "and it is missing a type, named in the code's own words"
+        (is (= :needs-ann (st 'touch-all)))
+        (is (re-find #"a macro's loop in `touch-all`, such as a `doseq`" (why 'touch-all)))
+        (is (re-find #"`xs` must be a finite collection" (why 'touch-all)))
+        (is (not (re-find #"G__" (why 'touch-all))))))
+    (testing "a loop's recur that keeps an accumulator first names the fix"
+      (is (re-find #"`recur` in `loop-sum` does not descend" (str (why 'loop-sum))))
+      (is (re-find #"put `ys` first in the `loop` bindings" (str (why 'loop-sum)))))))
+
+(deftest pinned-args-ignore-calls-that-leave-an-argument-out
+  (is (= {0 #{1}} (#'spec/pinned-args '[(f 1 2) (f 1)] 'f 2))))

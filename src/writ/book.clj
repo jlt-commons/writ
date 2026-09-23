@@ -345,6 +345,11 @@
               :else f))]
     (walk form)))
 
+(def ^:dynamic *forms-accepted*
+  "How a rejection of an unsupported top-level form ends: writ.spec rebinds
+  it, since the code a spec covers is plain Clojure and not a book."
+  "is not supported in a book; a book checks def, defn, data, law and proof forms only")
+
 (defn check-book
   [forms]
   (let [info (ns-info forms)
@@ -480,16 +485,14 @@
             (recur (rest fs) tenv (conj ok n) (conj seen n)))
 
           (deflike-form? f)
-          (fail! "`" (first f) "` is not supported in a book; a book checks "
-                  "def, defn, data, law and proof forms only")
+          (fail! "`" (first f) "` " *forms-accepted*)
 
           (or (ns-form? f) (comment-form? f))
           (recur (rest fs) tenv ok seen)
 
           :else
           (fail! "`" (if (and (seq? f) (symbol? (first f))) (first f) f)
-                 "` is not supported in a book; a book checks "
-                 "def, defn, data, law and proof forms only"))
+                 "` " *forms-accepted*))
         tenv))]
       (binding [norm/*opaque* shadow
                 norm/*numeric-fns* (into #{} (keep (fn [[k s]]

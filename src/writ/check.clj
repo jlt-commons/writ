@@ -164,6 +164,12 @@
   [s]
   (if (symbol? s) (symbol (clojure.string/replace (name s) #"__\d+$" "")) s))
 
+(defn- gensym?
+  "A name a macro made up (doseq's `G__1`, a syntax-quoted `x__auto__`),
+  which the programmer never wrote and cannot find in their code."
+  [s]
+  (and (symbol? s) (boolean (re-find #"^G__\d+$|__auto__" (name (display s))))))
+
 (defn- check-overlaps
   "Destructuring consumes its source like a match; a pattern whose binders
   overlap (a key read twice, `:as` beside fields) copies the source, which
@@ -477,28 +483,32 @@
   "Bend's descent law at one self-call or recur: the arguments before the
   shrinking one pass their columns unchanged, and the shrinking one is a
   strict subterm of its own column under a guard proving the shrink."
-  [nm args names facts info]
-  (let [stop (set names)
+  [nm args names facts info & [what where]]
+  (let [what (or what (str "recursive call to `" nm "`"))
+        where (or where "parameters")
+        stop (set names)
         os (mapv #(origin % info stop) args)
         own? (fn [i] (let [o (nth os i)] (and o (= (:col o) (nth names i nil)))))
         smaller (fn [i] (or (literal-smaller? (nth args i) (nth names i nil) facts)
                             (and (own? i) (:strict? (nth os i)))))
         idx (first (filter smaller (range (count args))))]
     (when (nil? idx)
-      (fail! "recursive call to `" nm "` does not descend: no argument is a "
+      (fail! what " does not descend: no argument is a "
              "structurally smaller part of its own parameter (destructure it, "
              "or use dec/rest/next of it under a test)"))
     (dotimes [i idx]
       (when-not (and (own? i) (not (:strict? (nth os i))))
-        (fail! "recursive call to `" nm "` does not descend: argument " (inc i)
-               " before the shrinking one must be passed unchanged")))
+        (fail! what " does not descend: argument " (inc i)
+               " before the shrinking one must be passed unchanged; put `"
+               (display (nth names idx)) "` first in the " where)))
     (when-not (literal-smaller? (nth args idx) (nth names idx) facts)
       (let [c (nth names idx)]
         (doseq [need (sort-by pr-str (:needs (nth os idx)))]
           (when-not (proven? need c facts info)
-            (fail! "recursive call to `" nm "` does not descend: argument "
-                   (inc idx) " shrinks `" (display c) "` without a guard; "
-                   (need-text need c))))))))
+            (let [shown (get (:sources info) c c)]
+              (fail! what " does not descend: argument "
+                     (inc idx) " shrinks `" (display shown) "` without a guard; "
+                     (need-text need shown)))))))))
 
 (defn- term-info
   "What origin tracing needs about a body: let binders -> init, loop binder
@@ -514,6 +524,7 @@
                                 (and (seq? t) (contains? tenv (first t))))))
         binds (atom {})
         loops (atom #{})
+        sources (atom {})
         nat (atom (into #{} (comp (filter #(= 'Nat (ty/binder-type % tenv)))
                                   (map qname-of))
                         params))
@@ -533,6 +544,12 @@
           :let (doseq [[b init] (:bindings n)] (swap! binds assoc b init))
           :loop (doseq [[b init] (:bindings n)]
                   (swap! loops conj b)
+                  (when (gensym? b)
+                    (let [x (if (and (= :invoke (:op init)) (= 1 (count (:args init)))
+                                     (contains? '#{seq vec} (core-head init {:bound #{}})))
+                              (first (:args init))
+                              init)]
+                      (when (ref? x) (swap! sources assoc b (:name x)))))
                   (when (or (= 'Nat (ty/binder-type b tenv))
                             (let [v (lit-val init)] (and (integer? v) (>= v 0)))
                             (and (ref? init) (contains? @nat (qname-of (:name init))))
@@ -544,6 +561,7 @@
           nil)))
     {:binds @binds
      :loops @loops
+     :sources @sources
      :nat @nat
      :finite @finite
      :bound (into (set shadow) (comp (remove nil?) (map qname-of)) params)}))
@@ -633,7 +651,11 @@
         (when (not= (count (:args ast)) slots)
           (fail! "`recur` in `" nm "` rebinds " slots " value(s) but is passed "
                  (count (:args ast))))
-        (check-descent! nm (:args ast) names facts info)))
+        (check-descent! nm (:args ast) names facts info
+                        (if (and (seq names) (every? gensym? names))
+                          (str "a macro's loop in `" nm "`, such as a `doseq`,")
+                          (str "`recur` in `" nm "`"))
+                        (if (:loop? fr) "`loop` bindings" "parameters"))))
     (when (and (= :invoke (:op ast)) (self? (:fn ast)))
       (when-not marked?
         (fail! "`" self "` is recursive: mark it ^{:writ/descend true} so every "
@@ -645,7 +667,7 @@
           [ft fe] (when (= :if (:op ast)) (test-facts (:test ast) info stop))
           loops-t (case (:op ast)
                     :loop (conj loops (assoc (frame (map first (:bindings ast)))
-                                             :tries tries))
+                                             :tries tries :loop? true))
                     :fn   (conj loops (assoc (frame (filter some? (:params ast)))
                                              :tries tries))
                     loops)
