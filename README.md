@@ -507,13 +507,39 @@ as a hypothesis:
 - a `Nat` is 0 or p + 1
 - a datatype has one case per constructor
 
-Within a case, an open integer comparison is split into its two outcomes,
-and an equality that holds is substituted away. The sort example's
-`insert-adds` is proved this way, as is the tree's `size-counts`:
+Within a case, the prover:
+
+- splits an open integer comparison into its two outcomes, and
+  substitutes an equality that holds
+- splits an unknown tail into empty, and a head and a tail. That is how
+  `insert-keeps-sorted` sees the second element.
+- decides integer conditions from all the facts at once (Fourier-Motzkin
+  elimination, tightened for integers), so `a <= b`, `b <= c` and
+  `c < a` are seen to contradict each other
+
+When a case still isn't closed, the prover tries two things:
+
+- **Generalising.** It uses an equality hypothesis the other way round,
+  replaces the recursive call that brings in with a fresh variable, and
+  proves that more general goal by an induction of its own.
+  `permutation` is proved this way, with `(isort xs-t)` generalised.
+- **An accumulator.** A fold that grows an accumulator by addition from
+  0, as a `loop` or a `reduce`, is first proved to give acc plus the fold
+  from 0, from any integer acc, by induction with acc left free in the
+  hypothesis. The law is then proved citing that.
+
+A law proved earlier is a lemma for the laws after it: an equality
+rewrites its left side to its right, anything else rewrites to true, when
+its hypotheses hold. The passes repeat until nothing new is proved, so a
+law may cite one that comes later in the spec. A law that is only tested
+is never cited. The report names what each proof used:
 
 ```
 writ.spec: my.sort-spec against my.sort: ok
-  law `insert-adds` proved by induction on xs, splitting on (<= x xs-h)
+  law `sorted` proved by induction on xs, citing insert-keeps-sorted
+  law `permutation` proved by induction on xs, generalising (isort xs-t)
+  law `insert-keeps-sorted` proved by induction on xs, splitting on (<= x xs-h), with cases on xs-t
+  law `insert-adds` proved by induction on xs
 ```
 
 The model follows Typed Clojure's, so the prover keeps the distinctions
@@ -524,19 +550,32 @@ Clojure makes:
 - Lists, vectors, cons cells and lazy seqs are one kind of value. The ops
   that tell them apart (`conj`, `peek`, `vector?`, ...) are outside the
   model, so a law that needs them stays tested.
+- A lazy seq is truthy before it is realised, so deciding one never runs
+  its elements.
 - `=` is Clojure's: sequentials compare element by element, `1` never
   equals `1.0`, and a term equals itself only when no float can be inside,
   because `NaN` is not `=` to itself.
 - Integers are exact (jolt promotes on overflow). `+` is associative and
-  commutative only on integers. Floats get no algebra.
+  commutative only on integers. Floats get no algebra. A term counts as
+  an integer only when its form or a proved fact says so, never because a
+  signature says so.
 
 A proof holds for every input on which the law's terms return a value.
 That is Typed Clojure's notion of soundness, well-typed code returns or
 throws. Since writ also runs every law, an input where a term throws still
-fails the check.
+fails the check. One step takes a signature at its word: a generalised
+call ranges over its fn's signed return type. The laws' runs check every
+signature on every trial.
 
 Several things guard the prover itself:
 
+- **The checker.** Every proof is replayed before it is reported, by a
+  checker that searches for nothing. It rebuilds each step and confirms
+  it: an induction's cases are exactly its type's cases, each split
+  proves both sides, a generalisation uses a hypothesis the case really
+  has, and a lemma is cited only if it was proved. A proof it rejects is
+  not reported. What must be trusted is the rewrite rules, the induction
+  schemes and the checker, not the search.
 - Each rewrite rule is checked against the runtime by test.check.
 - Random closed terms are normalised and run, to check that the
   normaliser agrees with jolt.
@@ -548,13 +587,16 @@ Several things guard the prover itself:
 The prover covers:
 
 - `seq`, `first`, `rest`, `next`, `second`, `empty?`, `count`, `cons`,
-  `list`, `vector`, `concat`, `filter`, `map` and `nth`
-- `=`, integer arithmetic and comparisons, `if`, `case`, `let` and
-  destructuring
-- fn literals, and the target's and the spec's own `defn`s
+  `list`, `vector`, `concat`, `filter`, `map`, `reduce` and `nth`
+- `=`, integer arithmetic and comparisons, `integer?`, `if`, `case`, `let`
+  and destructuring
+- core fns passed as values, with `apply` of `<=`, `<`, `>=`, `>` and `+`,
+  so a predicate like `(apply <= xs)` translates
+- fn literals, `loop`/`recur`, and the target's and the spec's own
+  `defn`s
 
 Anything else leaves the law tested, with `:unproved` saying why, for
-example "outside the prover: `<=` passed as a value".
+example "outside the prover: the name `min`".
 
 ### Which fns qualify
 
@@ -692,7 +734,8 @@ of forms, and `writ.book/check-files` checks source files as one book.
 - `writ.spec`: spec namespaces, law checking, the call graph, instrument
 - `writ.prove`: the proof search; `writ.prove.term`, `writ.prove.rewrite`
   and `writ.prove.translate` hold the terms, the rewrite rules and the
-  translation from Clojure
+  translation from Clojure; `writ.prove.scheme` the steps a proof is made
+  of, and `writ.prove.check` the checker that replays every proof
 - `writ.book`: runs every rule over a namespace's forms
 - `writ.check`: quantities, termination, ordering, effects, arity
 - `writ.types`: type checking and tagged data

@@ -242,13 +242,17 @@ law runs until it is fixed. After that, each law has a `:status`:
 
 - `:vacuous`: true of any implementation; the spec must change.
 - `:proved`: passed its tests, and the prover derived it from the code for
-  every input. `:proof` says how.
+  every input, and the proof checker replayed the derivation. `:proof`
+  says how; `:lemmas` names the other laws it cited. Proved laws are
+  lemmas for each other, in any order, so a spec whose laws build on each
+  other (`insert-keeps-sorted`, then `sorted`) gets more of them proved.
 - `:evaluated`: a law with no quantifiers, run once.
 - `:tested`: passed test.check's trials. This is evidence, not proof.
   `:unproved` says why the prover did not prove it: a form outside its
-  model (`conj`, maps, `loop`, a core fn passed as a value), a lemma it
-  would need, or no proof found. That is not a failure. A law written with
-  modelled forms and the spec's own helpers is more likely to be proved.
+  model (`conj`, maps, `min`, strings), the proof checker rejecting the
+  proof (a writ bug; report it), or no proof found. That is not a failure.
+  A law written with modelled forms and the spec's own helpers is more
+  likely to be proved.
 - `:witnessed`: an `exists` law, and a value was found.
 - `:failed`: see the message.
 

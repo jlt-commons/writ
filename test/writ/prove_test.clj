@@ -281,3 +281,48 @@
     (doseq [nm '[total-sums size-counts reduce-sums]]
       (is (= :failed (:status (law-result r nm))) (str nm)))
     (is (not-any? :prover-bug (:laws r)))))
+
+;; --- the proof checker --------------------------------------------------------------
+
+(defn- law-input [spec-ns nm]
+  (require spec-ns)
+  (let [e (get @spec/registry spec-ns)
+        target (:target e)
+        _ (require target)
+        l (first (filter #(= nm (:name %)) (:laws e)))
+        qp (#'spec/qualify (#'spec/desugar (:prop l)) #{} (set (keys (ns-publics (the-ns target))))
+                           (set (keys (ns-interns (the-ns spec-ns)))) target spec-ns)
+        [defs own] (prover/definitions [[target (writ.book/read-forms (#'spec/source-url target))]
+                                        [spec-ns (writ.book/read-forms (#'spec/source-url spec-ns))]])
+        [bs body] (writ.prove.scheme/split-foralls qp)
+        rets (into {} (for [[f sig] (:anns e)] [(symbol (str target) (str f)) (:ret sig)]))]
+    {:law {:prop qp :defs defs :own own :target target :tenv (#'spec/tenv-of (:data e)) :rets rets}
+     :opts {:defs defs :tenv (#'spec/tenv-of (:data e))
+            :types (into {} (map (fn [[x ty]] [x (writ.prove.scheme/plain ty)])) bs)
+            :fuel 20000 :lemmas [] :rets rets}
+     :goal (writ.prove.scheme/goal (writ.prove.translate/context own) (mapv first bs) body)}))
+
+(deftest every-proof-is-replayed-by-the-checker
+  (let [{:keys [law opts goal]} (law-input 'writ.spec-demo.sort-spec 'insert-keeps-sorted)
+        r (prover/prove-law law)]
+    (is (:proved r))
+    (is (= {:ok true} (writ.prove.check/check-proof opts goal (:trace r))))
+    (testing "a proof with a case left out is rejected"
+      (let [bad (update-in (:trace r) [:cases] pop)]
+        (is (re-find #"the cases of `xs` are" (:reason (writ.prove.check/check-proof opts goal bad))))))
+    (testing "a goal claimed closed by rewriting that is not"
+      (let [bad (assoc-in (:trace r) [:cases 2 :proof 0] {:by :rewriting})]
+        (is (re-find #"does not rewrite to true" (:reason (writ.prove.check/check-proof opts goal bad))))))
+    (testing "a split that proves only one side"
+      (is (not (:ok (writ.prove.check/check-proof opts goal
+                                                  (assoc-in (:trace r) [:cases 2 :proof 0 :else]
+                                                            {:by :rewriting}))))))
+    (testing "induction on a variable at the wrong type"
+      (is (re-find #"induction on `xs`"
+                   (:reason (writ.prove.check/check-proof opts goal (assoc (:trace r) :ty '(List Int))))))))
+  (testing "a generalisation and an accumulator replay too"
+    (doseq [[sp nm] '[[writ.spec-demo.sort-spec permutation] [writ.spec-demo.total-spec size-counts]]]
+      (let [{:keys [law opts goal]} (law-input sp nm)
+            r (prover/prove-law law)]
+        (is (:proved r) (str nm))
+        (is (= {:ok true} (writ.prove.check/check-proof opts goal (:trace r))) (str nm))))))
