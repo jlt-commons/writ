@@ -4,10 +4,11 @@
   (:require [clojure.test :as t]
             writ.check-test
             writ.book-test
-            writ.gaps-test))
+            writ.gaps-test
+            writ.spec-test))
 
 (def test-namespaces
-  '[writ.check-test writ.book-test writ.gaps-test])
+  '[writ.check-test writ.book-test writ.gaps-test writ.spec-test])
 
 (defn -main [& _]
   (let [{:keys [fail error]} (apply t/run-tests test-namespaces)]

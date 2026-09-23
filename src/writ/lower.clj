@@ -337,6 +337,8 @@
 (defn lower [form]
   (cond
     (symbol? form) {:op :ref :name form}
+    ;; `()` is the empty list, a literal, not a call
+    (and (seq? form) (empty? form)) {:op :lit :val ()}
     (seq? form)
     (let [h (first form)]
       (cond

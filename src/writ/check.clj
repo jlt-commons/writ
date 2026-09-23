@@ -33,6 +33,17 @@
 
 (defn- qname-of [p] (if (symbol? p) (symbol (clojure.core/name p)) p))
 
+(def ^:dynamic *affine*
+  "When false, the quantity rules (affinity, erasure, reuse, captures and
+  overlapping destructures) are skipped.  writ.spec checks plain Clojure,
+  which carries no quantity annotations, with this off."
+  true)
+
+(def ^:dynamic *descend-all*
+  "When true, every defn is checked for descent as if it were marked
+  ^{:writ/descend true}.  writ.spec checks plain Clojure with this on."
+  false)
+
 (def core-names
   "Names resolvable in clojure.core; invoking them is always in scope."
   (into #{} (map key) (ns-publics 'clojure.core)))
@@ -1206,19 +1217,20 @@
                                             params)]
                    (l/lower (if (= 1 (count body)) (first body) (cons 'do body))))
          body-ast (l/uniquify raw-ast)
-         marked? (boolean (or (:writ/descend attrs) (:writ/descend (meta nm))))]
+         marked? (boolean (or *descend-all* (:writ/descend attrs) (:writ/descend (meta nm))))]
      (check-param-dups nm (vec params))
      (check-recur-shape nm params body-ast)
      (check-effects nm params raw-ast shadow)
-     (check-quantities nm params raw-ast body-ast)
-     (check-overlaps nm params raw-ast)
-     (check-captures nm params body-ast shadow)
+     (when *affine*
+       (check-quantities nm params raw-ast body-ast)
+       (check-overlaps nm params raw-ast)
+       (check-captures nm params body-ast shadow))
      (check-case-constants nm raw-ast)
      (check-lookup-calls nm raw-ast)
      (check-local-cycles nm raw-ast)
      (check-termination nm params body-ast marked? shadow (:tenv ctx))
      (check-local-arities nm raw-ast)
-     (check-fn-reuse nm params body-ast)
+     (when *affine* (check-fn-reuse nm params body-ast))
      (check-names nm params body-ast ok shadow arities)
      ;; the defn's own signature types its self-calls
      (let [tenv (or (:tenv ctx) {})

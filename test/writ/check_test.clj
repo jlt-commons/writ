@@ -143,3 +143,9 @@
     (let [m (check-msg 'none '[x :- (List)] '(x))]
       (is (some? m))
       (is (re-find #"takes 1 type argument" m)))))
+
+(deftest empty-list-literal-is-a-value
+  ;; `()` evaluates to the empty list; it is not a call with a nil head
+  (is (= {:ok true} (ck/check-defn '(defn f [xs] ()))))
+  (is (= {:ok true} (ck/check-defn '(defn f [] ()))))
+  (is (= {:ok true} (ck/check-defn '(defn f [x] (if x 1 ()))))))

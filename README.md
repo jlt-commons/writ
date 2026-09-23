@@ -239,6 +239,7 @@ throws.
 - `writ.book` — book orchestration
 - `writ.defn` — the surface macros
 - `writ.core` — public entry points
+- `writ.spec` — spec namespaces: signatures and laws kept outside plain code
 
 ## Tests
 
