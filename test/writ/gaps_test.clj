@@ -874,7 +874,10 @@
         (is (re-find #"host interop or effect" (str m))))))
   (testing "a call into another namespace still passes"
     (is (nil? (err-msg '(defn f [s] (clojure.string/upper-case s)))))
-    (is (nil? (err-msg '(defn f [s] (str/upper-case s)))))))
+    (is (nil? (err-msg '(defn f [s] (str/upper-case s))))))
+  (testing "a capitalised alias of a namespace is resolved, not taken for a class"
+    (is (nil? (book-err '[(ns book (:require [clojure.string :as S]))
+                          (writ.defn/defn f [s] :- String (S/upper-case s))])))))
 
 ;; --- G40: unknown top-level forms are rejected, not silently skipped ---------
 

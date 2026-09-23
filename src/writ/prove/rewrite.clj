@@ -233,15 +233,20 @@
 (def ^:private float-free-types
   '#{Nat Int Bool String Keyword Symbol Char Unit})
 
-(defn- float-free-type? [ctx ty]
-  (cond
-    (contains? float-free-types ty) true
-    (and (seq? ty) (contains? '#{List Vec} (first ty))) (float-free-type? ctx (second ty))
-    (and (map? ty) (:elems ty)) (float-free-type? ctx (:elems ty))
-    (and (symbol? ty) (get-in ctx [:tenv ty]))
-    (every? (fn [[_ c]] (every? #(float-free-type? ctx %) (:fields c)))
-            (:ctors (get-in ctx [:tenv ty])))
-    :else false))
+(defn- float-free-type?
+  "seen: the data types already being checked; a field of one of them is
+  float-free if the rest of the type is."
+  ([ctx ty] (float-free-type? ctx ty #{}))
+  ([ctx ty seen]
+   (cond
+     (contains? float-free-types ty) true
+     (contains? seen ty) true
+     (and (seq? ty) (contains? '#{List Vec} (first ty))) (float-free-type? ctx (second ty) seen)
+     (and (map? ty) (:elems ty)) (float-free-type? ctx (:elems ty) seen)
+     (and (symbol? ty) (get-in ctx [:tenv ty]))
+     (every? (fn [[_ c]] (every? #(float-free-type? ctx % (conj seen ty)) (:fields c)))
+             (:ctors (get-in ctx [:tenv ty])))
+     :else false)))
 
 (defn float-free?
   "Can this term's value hold no float?  Then two syntactically equal
@@ -297,8 +302,8 @@
 (defn- nth-rule [v i d]
   (let [miss (if (= ::none d) [:bottom] d)]
     (cond
+      (= :nil (head v)) (if (= ::none d) [:nil] d)
       (neg? i) miss
-      (= :nil (head v)) miss
       (= :sq (head v))
       (let [e (second v)]
         (case (head e)
@@ -443,9 +448,23 @@
             rhs))
         (:ih ctx)))
 
+(def ^:private boolean-fns
+  '#{= not= not < <= > >= empty? zero? pos? neg? even? odd? nil? some? true? false?})
+
+(defn- boolean-term?
+  "Does t return true or false, never another value?  Only then is an
+  assumed test the value true or false: (seq xs) assumed true is not true."
+  [t]
+  (case (head t)
+    (:le :ieq) true
+    :lit (boolean? (second t))
+    :call (contains? boolean-fns (second t))
+    false))
+
 (defn- step [ctx x]
   (or (ih-rewrite ctx x)
-      (when (and (contains? (:facts ctx) x) (not (contains? #{:le :ieq} (head x))))
+      (when (and (contains? (:facts ctx) x) (not (contains? #{:le :ieq} (head x)))
+                 (boolean-term? x) (boolean? (get (:facts ctx) x)))
         [:lit (get (:facts ctx) x)])
       (apply-patterns (get @indexed (rule-key x)) x)
       (computed ctx x)
@@ -594,6 +613,11 @@
            (gen/fmap (fn [[f x y]] [:call f x y])
                      (gen/tuple (gen/elements '[+ - < <= = max]) int-leaf int-leaf))
            (gen/fmap (fn [[x i]] [:call 'nth x [:lit i] [:nil]]) (gen/tuple sub (gen/choose -1 3)))
+           ;; nth with no default only on nil and plain lists: on jolt, nth
+           ;; past the end of an empty lazy seq is nil while on () it throws,
+           ;; and the model has one empty sequential, so it says [:bottom]
+           (gen/fmap (fn [[x i]] [:call 'nth x [:lit i]])
+                     (gen/tuple (gen/one-of [(gen/return t/tnil) leaf]) (gen/choose -1 3)))
            (gen/fmap (fn [[f g x]] [:call f g x])
                      (gen/tuple (gen/elements '[filter map]) (gen/elements sample-fns) sub))
            (gen/fmap (fn [[c a b]] [:if c a b]) (gen/tuple sub sub sub))])))))
