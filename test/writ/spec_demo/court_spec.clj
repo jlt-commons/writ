@@ -3,7 +3,7 @@
   constants, max and min, abs, not=, every? and some, a comparison of
   three, and contains? on a set of keywords."
   (:require [writ.spec-demo.court :refer [H PH]]
-            [writ.spec :refer [spec data ann law]]))
+            [writ.spec :refer [spec data ann law refine]]))
 
 (spec writ.spec-demo.court {:require :proved})
 
@@ -38,3 +38,8 @@
 
 (law distance-is-the-gap
   (forall [a Int, b Int] (= (distance a b) (if (< a b) (- b a) (- a b)))))
+
+(refine Row [y Int] (<= 0 y top))
+
+(law idle-keeps-a-row-on-the-court
+  (forall [y Row] (= y (move y [:Idle]))))

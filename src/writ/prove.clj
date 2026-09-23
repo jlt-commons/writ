@@ -227,6 +227,21 @@
                                            (tree-seq coll? seq trace))))]
            (str ", generalising the accumulator of " (str/join " and " (map pr-str as)))))))
 
+(defn- expand-tuples
+  "Each binder of a Tuple type as a vector of fresh variables, one per
+  component, with the component's type: a value of (Tuple A B) is exactly
+  a vector [a b] with a an A and b a B.  Returns [binders goal]."
+  [bs g]
+  (loop [todo (seq bs), out [], g g]
+    (if-let [[x ty] (first todo)]
+      (if (and (seq? ty) (= 'Tuple (first ty)))
+        (let [xs (mapv #(symbol (str x "-" %)) (range (count (rest ty))))
+              sub #(t/subst % {x (t/seq-term xs)})]
+          (recur (concat (map vector xs (rest ty)) (rest todo)) out
+                 {:hyps (mapv sub (:hyps g)) :goals (mapv sub (:goals g))}))
+        (recur (rest todo) (conj out [x ty]) g))
+      [out g])))
+
 (defn prove-law
   "Try to prove a law.  prop is the desugared law, its names qualified;
   defs are the translated definitions; target the implementation's ns;
@@ -234,10 +249,10 @@
   Returns {:proved true :trace :summary :lemmas} or {:proved false :reason}."
   [{:keys [prop defs tenv target own fuel lemmas rets]}]
   (try
-    (let [[bs body] (split-foralls prop)
-          vars (mapv first bs)
+    (let [[bs0 body] (split-foralls prop)
           tctx (tr/context own)
-          g (goal tctx vars body)
+          g0 (goal tctx (mapv first bs0) body)
+          [bs g] (expand-tuples (map (fn [[x ty]] [x (plain ty)]) bs0) g0)
           unfolded (atom #{})
           lemmas-used (atom #{})
           opts {:defs defs :tenv tenv :types (into {} (map (fn [[x ty]] [x (plain ty)])) bs)

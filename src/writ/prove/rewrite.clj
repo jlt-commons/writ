@@ -406,6 +406,20 @@
       :elems (float-free? ctx (second x))
       false)))
 
+(defn- exact-scalar?
+  "A value = compares by identity of value: two of them are = exactly when
+  they are the same, and = to a third agrees with either."
+  [v]
+  (or (keyword? v) (string? v) (boolean? v) (char? v) (symbol? v) (integer? v)))
+
+(defn- known-literal
+  "The exact literal term t is known to equal, from the facts."
+  [ctx t]
+  (first (for [[c v] (:facts ctx)
+               :when (and (true? v) (= :call (head c)) (= '= (second c)) (= 3 (count (rest c)))
+                          (= t (nth c 2)) (= :lit (head (nth c 3))) (exact-scalar? (second (nth c 3))))]
+           (second (nth c 3)))))
+
 (defn- equality [ctx a b]
   (let [ha (head a) hb (head b)]
     (cond
@@ -429,6 +443,12 @@
       (and (int-term? ctx a) (int-term? ctx b))
       [:ieq (lin-neg-canon (lin+ (lin-of ctx a) (lin* -1 (lin-of ctx b))))]
       (and (= a b) (float-free? ctx a)) [:lit true]
+      ;; a literal goes second, so a fact and a test of it are one term
+      (and (= :lit ha) (not= :lit hb)) [:call '= b a]
+      ;; a term known to equal one exact literal is not another
+      (and (= :lit hb) (exact-scalar? (second b)))
+      (when-let [v (known-literal ctx a)]
+        [:lit (= v (second b))])
       :else nil)))
 
 ;; --- computed rules --------------------------------------------------------------
