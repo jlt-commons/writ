@@ -25,19 +25,21 @@ Each example is built around a different kind of mistake writ catches:
 ## Running
 
 This is a standalone jolt project. It depends on writ through
-`:local/root ".."` and on the libraries above as git deps.
+`:local/root ".."` and on the libraries above as git deps. raylib sits on
+its own `:raylib` alias, since it loads libraylib at startup, so the tests
+run without it.
 
 ```sh
 cd examples
-jolt -M:test          # every spec, every broken variant, and the live server
-jolt -M:pong          # needs libraylib: brew install raylib
-jolt -M:life
-jolt -M:screens
-jolt -M:shortener     # then: curl -d https://clojure.org localhost:3000
-jolt -M:fetch         # or pass URLs: jolt -M:fetch https://httpbin.org/status/503
+jolt -M:test             # every spec, every broken variant, and the live server
+jolt -M:raylib:pong      # the windows need libraylib: brew install raylib
+jolt -M:raylib:life
+jolt -M:raylib:screens
+jolt -M:shortener        # then: curl -d https://clojure.org localhost:3000
+jolt -M:fetch            # or pass URLs: jolt -M:fetch https://httpbin.org/status/503
 ```
 
-`WRIT_EXAMPLE_FRAMES=120 jolt -M:pong` closes the window after 120 frames,
+`WRIT_EXAMPLE_FRAMES=120 jolt -M:raylib:pong` closes the window after 120 frames,
 for a smoke run.
 
 ## Writing specs like these

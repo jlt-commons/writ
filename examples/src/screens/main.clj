@@ -1,5 +1,5 @@
 (ns screens.main
-  "raylib's screen manager (`jolt -M:screens`): a logo, a title, options,
+  "raylib's screen manager (`jolt -M:raylib:screens`): a logo, a title, options,
   a game you can pause, and an ending. ENTER confirms, O opens the options,
   BACKSPACE goes back, P pauses, F finishes the game, Q quits to the title.
 

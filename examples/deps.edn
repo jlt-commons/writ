@@ -7,16 +7,19 @@
          jolt-lang/http-client
          {:git/url "https://github.com/jolt-lang/http-client"
           :git/tag "v0.0.14"
-          :git/sha "281689c9b6b54f3b09bb0fd3ca05dba4e54c6953"}
-         net.b12n/raylib
-         {:git/url "https://github.com/jlt-commons/raylib-jlt"
-          :git/sha "2f076ef0a9c3997707e80dd935b64dcbbe00cd56"
-          :deps/root "lib"}}
+          :git/sha "281689c9b6b54f3b09bb0fd3ca05dba4e54c6953"}}
+ ;; raylib loads libraylib when the project starts, so it is only on the
+ ;; aliases that open a window. The tests check the pure cores and never
+ ;; need it.
  :aliases
- {:test      {:extra-paths ["test"]
+ {:raylib    {:extra-deps {net.b12n/raylib
+                           {:git/url "https://github.com/jlt-commons/raylib-jlt"
+                            :git/sha "2f076ef0a9c3997707e80dd935b64dcbbe00cd56"
+                            :deps/root "lib"}}}
+  :test      {:extra-paths ["test"]
               :main-opts   ["-m" "examples-runner"]}
   :pong      {:main-opts ["-m" "pong.main"]}
   :life      {:main-opts ["-m" "life.main"]}
+  :screens   {:main-opts ["-m" "screens.main"]}
   :shortener {:main-opts ["-m" "shortener.server"]}
-  :fetch     {:main-opts ["-m" "fetch.main"]}
-  :screens   {:main-opts ["-m" "screens.main"]}}}
+  :fetch     {:main-opts ["-m" "fetch.main"]}}}

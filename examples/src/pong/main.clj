@@ -1,5 +1,5 @@
 (ns pong.main
-  "Pong in a raylib window (`jolt -M:pong`). W/S or the arrow keys move the
+  "Pong in a raylib window (`jolt -M:raylib:pong`). W/S or the arrow keys move the
   left paddle, P or SPACE pauses, and after a win it starts a new game.
 
   Everything here is effect: reading keys, drawing, the frame loop. The

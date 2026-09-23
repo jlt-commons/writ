@@ -1,5 +1,5 @@
 (ns life.main
-  "The Game of Life in a raylib window (`jolt -M:life`). SPACE sows a new
+  "The Game of Life in a raylib window (`jolt -M:raylib:life`). SPACE sows a new
   random soup, F switches between life.core and life.fast; both meet the
   same spec, so the picture must not change when you switch.
 
