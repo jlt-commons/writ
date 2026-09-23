@@ -25,4 +25,7 @@
 (law smallest-first
   (forall [xs (List Nat)]
     (=> (seq xs) (= (first (isort xs)) (apply min xs)))))
+(law insert-keeps-sorted
+  (forall [x Nat, xs (List Nat)]
+    (=> (ascending? xs) (ascending? (insert x xs)))))
 (law has-fixed-point (exists [xs (List Nat)] (= (isort xs) xs)))

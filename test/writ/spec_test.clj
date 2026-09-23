@@ -13,7 +13,7 @@
 (def ^:private spec-ns 'writ.spec-demo.sort-spec)
 
 (defn- run [target]
-  (spec/check spec-ns {:target target}))
+  (spec/check spec-ns {:target target :seed 42}))
 
 (defn- law-result [report nm]
   (first (filter #(= nm (:law %)) (:laws report))))
@@ -32,7 +32,27 @@
       (is (= :tested (:status (law-result r 'smallest-first))))
       (is (= :witnessed (:status (law-result r 'has-fixed-point)))))
     (testing "a tested law ran on generated inputs"
-      (is (<= 100 (:trials (law-result r 'sorted)))))))
+      (is (= 100 (:trials (law-result r 'sorted))))
+      (is (integer? (:seed (law-result r 'sorted)))))
+    (testing "a witness is shrunk to the simplest one"
+      (is (= {'xs ()} (:witness (law-result r 'has-fixed-point)))))))
+
+(deftest trials-is-the-number-of-tests
+  (let [r (spec/check spec-ns {:trials 300})]
+    (is (= 300 (:trials (law-result r 'permutation))))))
+
+(deftest every-type-has-a-generator-whose-values-conform
+  (let [tenv {'Tree {:arity 0 :params [] :ctors {'Leaf {:fields []}
+                                                 'Node {:fields ['Tree 'Nat 'Tree]}}}
+              'Box {:arity 1 :params ['a] :ctors {'Wrap {:fields ['a]}}}}]
+    (doseq [t '[Nat Int Bool Char String Keyword Symbol Double Unit Any
+                (List Nat) (Vec Int) (Set Keyword) (Map Keyword Nat)
+                (Tuple Nat String) Tree (Box (List Bool))]]
+      (testing (pr-str t)
+        (is (every? #(spec/conforms? t % tenv)
+                    (spec/sample t tenv 50)))))
+    (testing "recursive data stays finite and reaches its recursive case"
+      (is (some vector? (spec/sample 'Tree tenv 50))))))
 
 (deftest check!-returns-the-report-or-throws
   (is (:ok (spec/check! spec-ns)))
@@ -46,14 +66,30 @@
         l (law-result r 'permutation)]
     (is (not (:ok r)))
     (is (= :failed (:status l)))
-    (testing "the counterexample is shrunk to the smallest failing input"
-      (is (= {'x 0 'xs '(0 0)} (:counterexample l))))
-    (testing "the message names the law, the input and both sides"
+    (testing "the counterexample is shrunk to two copies of x"
+      (let [{x 'x xs 'xs} (:counterexample l)]
+        (is (= 2 (count xs)))
+        (is (every? #(= x %) xs))))
+    (testing "the message names the law, the input, both sides and the seed"
       (let [m (:message r)]
         (is (str/includes? m "law `permutation` fails"))
-        (is (str/includes? m "xs = (0 0)"))
+        (is (re-find #"xs = [\[(](\d+) \1[\])]" m))
         (is (str/includes? m "(occurrences x (isort xs)) => 1"))
-        (is (str/includes? m "(occurrences x xs) => 2"))))))
+        (is (str/includes? m "(occurrences x xs) => 2"))
+        (is (str/includes? m ":seed 42"))))))
+
+(deftest a-seed-replays-the-same-failure
+  (let [a (law-result (run 'writ.spec-demo.sort-dedup) 'permutation)
+        b (law-result (run 'writ.spec-demo.sort-dedup) 'permutation)]
+    (is (= 42 (:seed a)))
+    (is (= (:counterexample a) (:counterexample b)))
+    (is (= (:original a) (:original b)))))
+
+(deftest a-random-seed-is-reported
+  (let [l (law-result (spec/check spec-ns {:target 'writ.spec-demo.sort-desc}) 'sorted)]
+    (is (= :failed (:status l)))
+    (is (integer? (:seed l)))
+    (is (= 2 (count (get (:counterexample l) 'xs))))))
 
 (deftest flipped-comparison-breaks-sorted
   (let [r (run 'writ.spec-demo.sort-desc)
@@ -123,3 +159,22 @@
       (is (:ok (spec/check spec-ns)))
       (is (thrown-with-msg? Exception #"expects Nat" (insert "a" ())))
       (finally (spec/unstrument spec-ns)))))
+
+;; --- (List T) is any seq, not only a list ----------------------------------
+
+(deftest list-types-generate-every-kind-of-seq
+  (let [xs (spec/sample '(List Nat) {} 200)]
+    (is (some list? xs))
+    (is (some vector? xs))
+    (is (some #(and (seq? %) (not (list? %))) xs))
+    (is (some nil? xs))))
+
+(deftest code-that-assumes-a-list-is-caught
+  ;; conj prepends to a list but appends to a vector
+  (let [r (run 'writ.spec-demo.sort-conj)
+        l (law-result r 'insert-keeps-sorted)]
+    (is (:ok (:static r)))
+    (is (= :failed (:status l)))
+    (is (vector? (get (:counterexample l) 'xs)))
+    (is (= :tested (:status (law-result r 'sorted)))
+        "isort only ever hands insert its own lists")))

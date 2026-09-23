@@ -15,8 +15,9 @@
 
   * proved     -- writ.norm shows it for every input (no code is run)
   * evaluated  -- a closed law, decided by running the code once
-  * tested     -- a universal law, run against generated inputs; a failure
-                  is shrunk to the smallest input that still breaks it
+  * tested     -- a universal law, run by test.check against inputs generated
+                  from the binders' types; a failure is shrunk to the
+                  smallest input that still breaks it, and its seed replays it
   * witnessed  -- an existential, with the generated value that satisfies it
 
   Tested is not proved: the report says which one each law got.
@@ -28,7 +29,10 @@
             [writ.data :as dt]
             [writ.kind :as kind]
             [writ.law :as lw]
-            [writ.norm :as norm]))
+            [writ.norm :as norm]
+            [clojure.test.check :as tc]
+            [clojure.test.check.generators :as gen]
+            [clojure.test.check.properties :as prop]))
 
 (defn- fail! [& msg]
   (throw (ex-info (str "Writ: " (apply str msg)) {:writ/error true})))
@@ -169,17 +173,15 @@
 (declare conforms?)
 
 (defn- conforms-data?
-  "A data value is :Ctor when nullary, else [:Ctor field ...]."
+  "A data value is a vector headed by its constructor keyword, one element
+  per field: [:Leaf], [:Node l v r]."
   [d args v tenv]
-  (let [c (cond (keyword? v) (symbol (name v))
-                (and (vector? v) (keyword? (first v))) (symbol (name (first v))))
-        info (when c (ctor-info d args c))]
+  (let [info (when (and (vector? v) (keyword? (first v)))
+               (ctor-info d args (symbol (name (first v)))))]
     (boolean
       (and info
-           (if (keyword? v)
-             (empty? (:fields info))
-             (and (= (count (:fields info)) (dec (count v)))
-                  (every? true? (map #(conforms? %1 %2 tenv) (:fields info) (rest v)))))))))
+           (= (count (:fields info)) (dec (count v)))
+           (every? true? (map #(conforms? %1 %2 tenv) (:fields info) (rest v)))))))
 
 (defn conforms?
   "Does value `v` fit type `t`?  Unknown types and type variables pass."
@@ -219,121 +221,86 @@
 
       :else true)))
 
-;; --- generation and shrinking --------------------------------------------
-
-(defn- rng [seed] (atom (mod seed 2147483648)))
-
-(defn- rand-below
-  "A number in [0, n) from a 31-bit LCG, so a seed replays exactly."
-  [r n]
-  (if (<= n 0)
-    0
-    (let [s (swap! r (fn [s] (mod (+ (* s 1103515245) 12345) 2147483648)))]
-      (mod (quot s 65536) n))))
+;; --- generators ---------------------------------------------------------------
+;; Values come from test.check generators built from the spec's types, so a
+;; failure shrinks through test.check's rose trees and a seed replays it.
 
 (defn- mentions? [t nm]
   (boolean (some #{nm} (tree-seq seq? seq (if (seq? t) t (list t))))))
 
-(declare gen)
+(declare type->gen)
 
-(defn- gen-data [d args nm size r tenv]
-  (let [ctors (vec (sort-by str (keys (:ctors d))))
-        base (vec (remove #(some (fn [f] (mentions? f nm)) (:fields (ctor-info d args %))) ctors))
-        pick (if (and (<= size 0) (seq base)) base ctors)
-        c (nth pick (rand-below r (count pick)))
-        fs (:fields (ctor-info d args c))]
-    (if (empty? fs)
-      (keyword (name c))
-      (into [(keyword (name c))] (map #(gen % (dec size) r tenv)) fs))))
+(defn- data-gen
+  "A data value is a vector headed by its constructor keyword: [:Leaf],
+  [:Node l v r].  Recursive fields get half the size, and at size 0 only
+  the constructors that do not recurse are picked, so values stay finite."
+  [d args nm tenv]
+  (let [ctors (sort-by str (keys (:ctors d)))
+        fields (fn [c] (:fields (ctor-info d args c)))
+        base (remove (fn [c] (some #(mentions? % nm) (fields c))) ctors)
+        ctor-gen (fn [c size]
+                   (let [k (keyword (name c))
+                         fs (fields c)]
+                     (if (empty? fs)
+                       (gen/return [k])
+                       (gen/fmap #(into [k] %)
+                                 (apply gen/tuple
+                                        (map #(gen/resize (quot size 2) (type->gen % tenv)) fs))))))]
+    (gen/sized (fn [size]
+                 (let [pick (if (and (<= size 1) (seq base)) base ctors)]
+                   (gen/one-of (mapv #(ctor-gen % size) pick)))))))
 
-(defn gen
-  "A random value of type `t`, no bigger than `size`."
-  [t size r tenv]
-  (let [t (plain t)
-        size (max size 0)
-        n (fn [] (rand-below r (inc size)))
-        many (fn [et] (vec (repeatedly (n) #(gen et size r tenv))))]
+(def ^:private finite-double
+  (gen/double* {:NaN? false :infinite? false}))
+
+(defn type->gen
+  "The test.check generator for values of type `t`."
+  [t tenv]
+  (let [t (plain t)]
     (cond
       (symbol? t)
       (case t
-        Nat (n)
-        Int (- (rand-below r (inc (* 2 size))) size)
-        Bool (zero? (rand-below r 2))
-        Char (char (+ 97 (rand-below r 26)))
-        String (apply str (repeatedly (n) #(char (+ 97 (rand-below r 26)))))
-        Keyword (keyword (str "k" (n)))
-        Symbol (symbol (str "s" (n)))
-        (Float Double) (/ (double (- (rand-below r (inc (* 2 size))) size)) (inc (rand-below r 4)))
-        Unit nil
-        Any (n)
+        Nat gen/nat
+        Int gen/small-integer
+        Bool gen/boolean
+        Char gen/char-alpha
+        String gen/string-alphanumeric
+        Keyword gen/keyword
+        Symbol gen/symbol
+        (Float Double) finite-double
+        Unit (gen/return nil)
+        Any (gen/one-of [gen/small-integer gen/string-alphanumeric gen/keyword
+                         (gen/vector gen/small-integer)])
         (if-let [[d args] (data-decl t tenv)]
-          (gen-data d args t size r tenv)
+          (data-gen d args t tenv)
           (fail! "cannot generate values of type `" t "`: declare it with `data`")))
 
       (seq? t)
-      (let [[h & as] t]
+      (let [[h & as] t
+            el #(type->gen (nth as %) tenv)]
         (case h
-          List (apply list (many (first as)))
-          Vec (many (first as))
-          Set (set (many (first as)))
-          Map (into {} (map (fn [_] [(gen (first as) size r tenv) (gen (second as) size r tenv)]))
-                    (range (n)))
-          (Tuple &) (mapv #(gen % size r tenv) as)
+          ;; a (List T) is any seq Clojure hands around: a list, a vector,
+          ;; a lazy seq or nil.  Shrinking prefers the list.
+          List (let [g (el 0)]
+                 (gen/frequency [[3 (gen/list g)]
+                                 [3 (gen/vector g)]
+                                 [2 (gen/fmap #(map identity %) (gen/list g))]
+                                 [1 (gen/return nil)]]))
+          Vec (gen/vector (el 0))
+          Set (gen/set (el 0))
+          Map (gen/map (el 0) (el 1))
+          (Tuple &) (apply gen/tuple (map #(type->gen % tenv) as))
           -> (fail! "cannot generate functions: quantify over data, not `" (pr-str t) "`")
           (if-let [[d args] (data-decl t tenv)]
-            (gen-data d args h size r tenv)
+            (data-gen d args h tenv)
             (fail! "cannot generate values of type `" (pr-str t) "`"))))
 
       :else (fail! "cannot generate values of type `" (pr-str t) "`"))))
 
-(defn- drop-nth [xs i] (concat (take i xs) (drop (inc i) xs)))
-
-(defn shrinks
-  "Smaller candidates for value `v` of type `t`, simplest first."
-  [t v tenv]
-  (let [t (plain t)
-        seq-shrinks (fn [et xs rebuild]
-                      (concat
-                        (when (seq xs) [(rebuild [])])
-                        (when (> (count xs) 1)
-                          [(rebuild (take (quot (count xs) 2) xs))
-                           (rebuild (drop (quot (count xs) 2) xs))])
-                        (map #(rebuild (drop-nth xs %)) (range (count xs)))
-                        (mapcat (fn [i] (map #(rebuild (concat (take i xs) [%] (drop (inc i) xs)))
-                                             (shrinks et (nth xs i) tenv)))
-                                (range (count xs)))))]
-    (cond
-      (symbol? t)
-      (case t
-        (Nat Any) (if (and (integer? v) (pos? v)) (distinct [0 (quot v 2) (dec v)]) [])
-        Int (cond (zero? v) []
-                  (neg? v) (distinct [0 (- v) (quot v 2) (inc v)])
-                  :else (distinct [0 (quot v 2) (dec v)]))
-        Bool (if v [false] [])
-        String (map #(apply str %) (seq-shrinks 'Char (vec v) vec))
-        (if-let [[d args] (data-decl t tenv)]
-          (if (vector? v)
-            (let [fs (:fields (ctor-info d args (symbol (name (first v)))))]
-              (concat
-                (map keyword (filter #(empty? (:fields (ctor-info d args %))) (sort-by str (keys (:ctors d)))))
-                (keep-indexed (fn [i f] (when (= (plain f) t) (nth v (inc i)))) fs)
-                (mapcat (fn [i] (map #(assoc v (inc i) %) (shrinks (nth fs i) (nth v (inc i)) tenv)))
-                        (range (count fs)))))
-            [])
-          []))
-
-      (seq? t)
-      (let [[h & as] t]
-        (case h
-          List (seq-shrinks (first as) (vec v) #(apply list %))
-          Vec (seq-shrinks (first as) (vec v) vec)
-          Set (map #(disj v %) (sort-by str v))
-          Map (map #(dissoc v %) (sort-by str (keys v)))
-          (Tuple &) (mapcat (fn [i] (map #(assoc v i %) (shrinks (nth as i) (nth v i) tenv)))
-                            (range (count as)))
-          []))
-
-      :else [])))
+(defn sample
+  "`n` generated values of type `t`, for a look at what laws are run on."
+  ([t tenv] (sample t tenv 10))
+  ([t tenv n] (gen/sample (type->gen t tenv) n)))
 
 ;; --- evaluating laws ---------------------------------------------------------
 
@@ -388,7 +355,7 @@
   "A nested quantifier: sampled over a handful of generated values."
   [ctx [q [x t] body] env]
   (let [ctx* (update ctx :vars conj x)
-        vals (map #(gen t (min % 8) (:rng ctx) (:tenv ctx)) (range 20))
+        vals (gen/sample (type->gen t (:tenv ctx)) 20)
         rs (map #(holds ctx* body (assoc env x %)) vals)]
     (if (= "forall" (name q))
       (or (first (filter #(= :fail (:result %)) rs)) {:result :pass})
@@ -443,44 +410,10 @@
       (let [[_ [x t] body] p] (recur body (conj bs [x t])))
       [bs p])))
 
-(defn- replace-num [v k c]
-  (cond (= k v) c
-        (seq? v) (apply list (map #(replace-num % k c) v))
-        (map-entry? v) v
-        (vector? v) (mapv #(replace-num % k c) v)
-        (set? v) (into #{} (map #(replace-num % k c)) v)
-        (map? v) (into {} (map (fn [[a b]] [(replace-num a k c) (replace-num b k c)])) v)
-        :else v))
-
-(defn- joint-shrinks
-  "Every copy of one number lowered together, across all variables: a
-  failure that needs two equal values would stall if each copy shrank
-  alone."
-  [bs env tenv]
-  (let [nums (sort (distinct (filter #(and (integer? %) (pos? %))
-                                     (tree-seq coll? seq (vals env)))))]
-    (for [k nums
-          c (distinct [0 (quot k 2) (dec k)])
-          :let [env* (into {} (map (fn [[x v]] [x (replace-num v k c)])) env)]
-          :when (and (not= env* env)
-                     (every? (fn [[x t]] (conforms? t (get env* x) tenv)) bs))]
-      env*)))
-
-(defn- shrink-env
-  "Greedily replace variables with smaller values that still fail."
-  [ctx bs body env]
-  (loop [env env, steps 0]
-    (let [cands (concat (for [[x t] bs
-                              c (shrinks t (get env x) (:tenv ctx))]
-                          (assoc env x c))
-                        (joint-shrinks bs env (:tenv ctx)))
-          better (when (< steps 2000)
-                   (first (filter #(= :fail (:result (holds ctx body %))) cands)))]
-      (if better (recur better (inc steps)) env))))
-
 (defn- test-law
-  [ctx {:keys [name prop]} {:keys [trials seed]}]
-  (let [[bs body] (leading-foralls prop)]
+  [ctx {:keys [name prop]} {:keys [trials seed max-size]}]
+  (let [[bs body] (leading-foralls prop)
+        qc (fn [p] (tc/quick-check trials p :seed seed :max-size max-size))]
     (cond
       ;; closed: run it once
       (and (empty? bs) (not (quant? body)))
@@ -490,40 +423,45 @@
           {:law name :status :failed :counterexample {}
            :detail (or (:detail r) [[body "the hypothesis does not hold"]])}))
 
-      ;; existential: search for a witness
+      ;; existential: a witness is a counterexample to its negation, so
+      ;; test.check finds it and shrinks it to the simplest one
       (and (empty? bs) (head? body "exists"))
       (let [[_ [x t] inner] body
             ctx* (assoc ctx :vars [x])
-            found (first (for [i (range trials)
-                               :let [v (gen t (quot i 3) (:rng ctx) (:tenv ctx))]
-                               :when (= :pass (:result (holds ctx* inner {x v})))]
-                           [v]))]
-        (if found
-          {:law name :status :witnessed :witness {x (first found)}}
-          {:law name :status :failed :counterexample {}
-           :detail [[body (str "no witness among " trials " generated values")]]}))
+            res (qc (prop/for-all* [(type->gen t (:tenv ctx))]
+                                   (fn [v] (not= :pass (:result (holds ctx* inner {x v}))))))]
+        (if (:pass? res)
+          {:law name :status :failed :counterexample {} :seed (:seed res)
+           :detail [[body (str "no witness among " (:num-tests res) " generated values")]]}
+          {:law name :status :witnessed :seed (:seed res)
+           :witness {x (first (get-in res [:shrunk :smallest]))}}))
 
       :else
-      (let [ctx* (assoc ctx :vars (mapv first bs))
-            run (fn [i]
-                  (let [env (into {} (map (fn [[x t]] [x (gen t (quot i 3) (:rng ctx) (:tenv ctx))])) bs)]
-                    [env (holds ctx* body env)]))]
-        (loop [i 0, discards 0]
-          (if (< i trials)
-            (let [[env r] (run i)]
-              (case (:result r)
-                :pass (recur (inc i) discards)
-                :discard (recur (inc i) (inc discards))
-                :fail (let [small (shrink-env ctx* bs body env)]
-                        {:law name :status :failed
-                         :counterexample small
-                         :original env
-                         :trial (inc i) :seed seed
-                         :detail (:detail (holds ctx* body small))})))
-            (if (= discards trials)
-              {:law name :status :failed :counterexample {}
-               :detail [[body (str "the hypothesis never held in " trials " trials")]]}
-              {:law name :status :tested :trials trials :discarded discards})))))))
+      (let [vars (mapv first bs)
+            ctx* (assoc ctx :vars vars)
+            discards (atom 0)
+            res (qc (prop/for-all* (mapv #(type->gen (second %) (:tenv ctx)) bs)
+                                   (fn [& vals]
+                                     (case (:result (holds ctx* body (zipmap vars vals)))
+                                       :pass true
+                                       :discard (do (swap! discards inc) true)
+                                       false))))]
+        (cond
+          (not (:pass? res))
+          (let [small (zipmap vars (get-in res [:shrunk :smallest]))]
+            {:law name :status :failed
+             :counterexample small
+             :original (zipmap vars (:fail res))
+             :trial (:num-tests res) :seed (:seed res)
+             :detail (:detail (holds ctx* body small))})
+
+          (= @discards (:num-tests res))
+          {:law name :status :failed :counterexample {} :seed (:seed res)
+           :detail [[body (str "the hypothesis never held in " (:num-tests res) " trials")]]}
+
+          :else
+          {:law name :status :tested :trials (:num-tests res) :seed (:seed res)
+           :discarded @discards})))))
 
 ;; --- the target's source -----------------------------------------------------
 
@@ -666,7 +604,7 @@
 
 ;; --- check ---------------------------------------------------------------------
 
-(defn- format-failure [{:keys [law counterexample detail original trial seed]}]
+(defn- format-failure [{:keys [law counterexample detail original trial seed error]}]
   (let [pad (apply max 0 (map (comp count str) (keys counterexample)))]
     (str "law `" law "` fails"
          (if (seq counterexample)
@@ -677,8 +615,10 @@
            "")
          "\n"
          (str/join "\n" (map (fn [[t v]] (str "  " (pr-str t) " => " v)) detail))
+         (when error (str "  " error))
          (when (and original (not= original counterexample))
-           (str "\n  (shrunk from " (pr-str original) ", trial " trial ", seed " seed ")")))))
+           (str "\n  (shrunk from " (pr-str original) ", failing on test " trial ")"))
+         (when seed (str "\n  (replay with {:seed " seed "})")))))
 
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
@@ -692,10 +632,12 @@
 (defn check
   "Check a spec namespace against its target (or opts :target).  Returns a
   report map; :ok says whether everything held and :message explains any
-  failure.  opts: :target, :trials (default 100), :seed (default 42)."
+  failure.  opts: :target, :trials (test.check runs per law, default 100),
+  :seed (default random; each law's report carries the one it used) and
+  :max-size (the largest generated size, default 50)."
   ([spec-ns] (check spec-ns {}))
   ([spec-ns opts]
-   (let [{:keys [trials seed] :or {trials 100 seed 42}} opts
+   (let [{:keys [trials seed max-size] :or {trials 100 max-size 50}} opts
          e (entry spec-ns (:target opts))
          {:keys [target anns data laws]} e
          static (static-check e)
@@ -715,19 +657,26 @@
                                                                       (plain (:ret s)))
                                                        k)))
                                anns)
-             ctx {:ev (evaluator spec-ns) :rng (rng seed) :tenv tenv}
+             ctx {:ev (evaluator spec-ns) :tenv tenv}
              ;; only what this check wrapped is unwrapped after it, so a
              ;; caller's own instrument stays in place
              wrapped (wrap! e)
              results (try
                        (vec (for [{:keys [name prop]} laws
                                   :let [p (desugar prop)]]
-                              (do (lw/check-prop-shape! p)
-                                  (if (try-prove p tenv opaque numeric-fns)
-                                    {:law name :status :proved}
-                                    (test-law ctx {:name name
-                                                   :prop (qualify p #{} publics interns target spec-ns)}
-                                              {:trials trials :seed seed})))))
+                              (try
+                                (lw/check-prop-shape! p)
+                                (if (try-prove p tenv opaque numeric-fns)
+                                  {:law name :status :proved}
+                                  (test-law ctx {:name name
+                                                 :prop (qualify p #{} publics interns target spec-ns)}
+                                            {:trials trials :seed seed :max-size max-size}))
+                                ;; a law that cannot be run (a malformed
+                                ;; proposition, a type with no generator)
+                                ;; fails with the reason, not the whole check
+                                (catch Throwable ex
+                                  {:law name :status :failed :counterexample {} :detail []
+                                   :error (or (ex-message ex) (str ex))}))))
                        (finally (unwrap! wrapped)))
              unq (fn unq [f]
                    (cond (and (symbol? f) (contains? #{(name target) (name spec-ns)} (namespace f)))
