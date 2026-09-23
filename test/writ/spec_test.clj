@@ -192,7 +192,7 @@
 (deftest a-tree-taken-apart-with-case-meets-its-spec
   (let [r (spec/check tree-spec {:seed 42})]
     (is (:ok r) (:message r))
-    (is (= :tested (:status (law-result r 'size-counts))))
+    (is (= :proved (:status (law-result r 'size-counts))))
     (is (= :tested (:status (law-result r 'insert-keeps-order))))
     (is (= :evaluated (:status (law-result r 'insert-into-empty))))))
 
@@ -296,7 +296,7 @@
 (deftest a-spec-that-does-not-pin-a-fn-down-has-gaps
   (let [r (spec/check 'writ.spec-demo.sort-weak-spec {:seed 42})
         gap-fns (set (map :fn (:gaps r)))]
-    (is (every? #(= :tested (:status %)) (:laws r)) "every law holds")
+    (is (every? #(contains? #{:tested :proved} (:status %)) (:laws r)) "every law holds")
     (is (not (:ok r)) "but the spec is too weak to mean anything")
     (is (contains? gap-fns 'isort))
     (testing "the report names the impostor that satisfied every law"
@@ -320,3 +320,94 @@
     (is (:ok r) (:message r))
     (is (= [] (:gaps r)))
     (is (= :tested (:status (law-result r 'holds-a-sorted-set))))))
+
+;; --- adequacy for keyword results and pinned arguments ---------------------
+
+(def ^:private classify-spec 'writ.spec-demo.classify-spec)
+
+(deftest a-keyword-result-is-perturbed
+  (let [ms (spec/impostors 'classify-read {:params '[Int Bool] :ret 'Keyword} '[n e] {} 42)
+        real (fn [n _] (if (pos? n) :data :idle))]
+    (is (some #(= :perturbed (:kind %)) ms))
+    (doseq [m ms :when (= :perturbed (:kind m))]
+      (let [imp ((:make m) real)]
+        (is (keyword? (imp 5 true)) (:desc m))
+        (is (not= (real 5 true) (imp 5 true)) (:desc m))))))
+
+(deftest a-classifier-spec-pins-down-its-fn
+  (let [r (spec/check classify-spec {:seed 42})]
+    (is (:ok r) (:message r))
+    (is (= [] (:gaps r)))
+    (testing "a passing report says what the spec rejected"
+      (is (some #(= :perturbed (:kind %)) (:rejected (first (:rejected r)))))
+      (is (re-find #"`classify-read`: 5 laws, \d+ impostors rejected \(\d+ constant, \d+ perturbed\)"
+                   (:message r))))))
+
+(deftest laws-that-fix-an-argument-leave-the-rest-unspecified
+  (let [r (spec/check 'writ.spec-demo.classify-weak-spec {:seed 42})]
+    (is (every? #(contains? #{:tested :proved} (:status %)) (:laws r)) "every law holds")
+    (is (not (:ok r)))
+    (is (= ['classify-read] (map :fn (:gaps r))))
+    (is (re-find #"when it returns a different value whenever `n` is not one of -127, -2, -1, 0"
+                 (:message r)))))
+
+(deftest an-argument-fixed-to-every-value-of-its-type-is-covered
+  (let [ms (spec/impostors 'f {:params '[Int Bool] :ret 'Keyword} '[n e] {} 42
+                           {0 #{0 1} 1 #{true false}})]
+    (is (= ["returns a different value whenever `n` is not one of 0, 1"]
+           (map :desc (filter #(= :off-pin (:kind %)) ms))))))
+
+;; --- scan: which fns a spec could cover ------------------------------------
+
+(deftest scan-sorts-a-namespace-by-what-writ-can-check
+  (let [{:keys [forms message]} (spec/scan 'writ.spec-demo.scan-mixed)
+        st (into {} (map (juxt :name :status)) forms)
+        why (into {} (map (juxt :name :why)) forms)]
+    (is (= '{classify :ok, shout :no, log! :no, loud-classify :no, Conn :no, total :needs-ann}
+           st))
+    (testing "each rejection carries writ's own reason"
+      (is (re-find #"`\.toUpperCase` is host interop" (why 'shout)))
+      (is (re-find #"`println` in `log!` is effect code" (why 'log!)))
+      (is (re-find #"`defrecord` is not supported" (why 'Conn)))
+      (testing "in the words of the spec workflow, not writ.defn's books"
+        (is (not (re-find #"book|law and proof" (why 'Conn))))
+        (is (re-find #"def and defn" (why 'Conn)))))
+    (testing "a fn that calls a rejected one says which"
+      (is (= "it uses `shout`, which writ cannot check" (why 'loud-classify))))
+    (testing "an unsigned collection is a missing ann, not a rejection"
+      (is (re-find #"must be a finite collection" (why 'total))))
+    (testing "the summary groups them"
+      (is (str/starts-with? message "writ.spec/scan writ.spec-demo.scan-mixed: 1 of 6 forms can be checked, 1 more once signed"))
+      (is (str/includes? message "\n  shout (private): "))
+      (is (str/includes? message "\n  Conn (defrecord): ")))))
+
+(deftest scan-reads-a-namespace-without-its-spec
+  (testing "pure code that needs no types passes as it is"
+    (is (every? #(= :ok (:status %)) (:forms (spec/scan 'writ.spec-demo.tree)))))
+  (testing "a sort over an unsigned list is checkable once signed"
+    (let [st (into {} (map (juxt :name :status)) (:forms (spec/scan 'writ.spec-demo.sort)))]
+      (is (= '{insert :needs-ann, isort :needs-ann} st)))
+    (is (= "it uses `insert`, which needs an `ann` first"
+           (:why (second (:forms (spec/scan 'writ.spec-demo.sort))))))))
+
+(deftest scan-rejects-static-host-members-and-accepts-doseq
+  (let [{:keys [forms]} (spec/scan 'writ.spec-demo.scan-host)
+        st (into {} (map (juxt :name :status)) forms)
+        why (into {} (map (juxt :name :why)) forms)]
+    (testing "System/getenv and System/currentTimeMillis are host interop"
+      (is (= :no (st 'env)))
+      (is (re-find #"`System/getenv` is host interop" (str (why 'env))))
+      (is (= :no (st 'now))))
+    (testing "a doseq is a loop that is not the fn's last form"
+      (is (not (re-find #"tail position" (str (why 'touch-all)))))
+      (testing "and it is missing a type, named in the code's own words"
+        (is (= :needs-ann (st 'touch-all)))
+        (is (re-find #"a macro's loop in `touch-all`, such as a `doseq`" (why 'touch-all)))
+        (is (re-find #"`xs` must be a finite collection" (why 'touch-all)))
+        (is (not (re-find #"G__" (why 'touch-all))))))
+    (testing "a loop's recur that keeps an accumulator first names the fix"
+      (is (re-find #"`recur` in `loop-sum` does not descend" (str (why 'loop-sum))))
+      (is (re-find #"put `ys` first in the `loop` bindings" (str (why 'loop-sum)))))))
+
+(deftest pinned-args-ignore-calls-that-leave-an-argument-out
+  (is (= {0 #{1}} (#'spec/pinned-args '[(f 1 2) (f 1)] 'f 2))))

@@ -15,6 +15,14 @@ directory:
 Implementation and proof stay apart: `main.clj` never mentions a law, and
 `LAWS.clj`/`PROOF.clj` never contain implementation logic.
 
+These books use the older annotated surface, `writ.defn`, not the spec
+namespaces (`writ.spec`) that the top-level README teaches. That matters
+most in `LAWS.clj`. Laws like `(= (status req s) (status req s))` or
+`(= 201 201)` are there because the `w/proof` gate proves identities, and
+they say nothing about what the code does. `writ.spec` rejects exactly that
+shape as vacuous, so don't model a spec's laws on these files. The books
+are being ported to spec namespaces.
+
 ## This is a standalone jolt project
 
 It has its own `deps.edn` and depends on writ through `:local/root ".."`, so it

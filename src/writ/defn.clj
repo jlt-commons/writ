@@ -202,9 +202,16 @@
     (build nm params body)))
 
 (clojure.core/defmacro data [& args]
-  (let [info (dt/parse (cons 'writ.data args))]
-    (swap! dt/registry assoc (:name info) (dt/env info))
-    (list 'clojure.core/def (:name info) (list 'quote info))))
+  (let [info (dt/parse (cons 'writ.data args))
+        env (dt/env info)]
+    ;; registered now, for a `match` later in this file to expand against,
+    ;; and again when the code runs, because a namespace loaded from a
+    ;; compiled cache is never macroexpanded
+    (swap! dt/registry assoc (:name info) env)
+    (list 'do
+          (list 'clojure.core/swap! 'writ.data/registry 'clojure.core/assoc
+                (list 'quote (:name info)) (list 'quote env))
+          (list 'clojure.core/def (:name info) (list 'quote info)))))
 
 (clojure.core/defmacro law [nm prop]
   (list 'clojure.core/def nm (list 'quote prop)))

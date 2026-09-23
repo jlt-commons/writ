@@ -874,7 +874,10 @@
         (is (re-find #"host interop or effect" (str m))))))
   (testing "a call into another namespace still passes"
     (is (nil? (err-msg '(defn f [s] (clojure.string/upper-case s)))))
-    (is (nil? (err-msg '(defn f [s] (str/upper-case s)))))))
+    (is (nil? (err-msg '(defn f [s] (str/upper-case s))))))
+  (testing "a capitalised alias of a namespace is resolved, not taken for a class"
+    (is (nil? (book-err '[(ns book (:require [clojure.string :as S]))
+                          (writ.defn/defn f [s] :- String (S/upper-case s))])))))
 
 ;; --- G40: unknown top-level forms are rejected, not silently skipped ---------
 
@@ -2046,6 +2049,13 @@
                            (if (zero? a) 0 (g b (dec a)))))))
   (is (nil? (err-msg '(defn g {:writ/descend true} [^:many ^Nat a b]
                         (if (zero? a) b (g (dec a) (inc b))))))))
+
+;; An accumulator ahead of the shrinking column is the usual cause, and the
+;; fix is to reorder, so the message says so.
+(deftest descent-order-error-names-the-reorder
+  (is (re-find #"recursive call to `f` does not descend: argument 1 .*put `b` first in the parameters"
+               (err-msg '(defn f {:writ/descend true} [a ^:many ^Nat b]
+                           (if (zero? b) a (f (inc a) (dec b))))))))
 
 ;; --- G93: a shrink needs a guard on its column (Nat or pos?) ----------------
 ;;

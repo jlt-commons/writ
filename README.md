@@ -43,6 +43,10 @@ test/my/sort_test.clj     runs the check
 writ is a test dependency. The spec and the check live on the test
 classpath, so production code never loads writ.
 
+Note the quoting. `(spec my.sort)` is a macro inside the spec, so the
+target namespace goes in unquoted. `(spec/check 'my.sort-spec)` is an
+ordinary fn call, so the spec namespace it checks is quoted.
+
 ```clojure
 ;; deps.edn
 {:aliases
@@ -176,9 +180,9 @@ writ enforces the last two points in the check:
 - **Gaps fail.** Once every law holds, writ swaps each signed public
   function for well-typed stand-ins: a constant, an argument passed
   through, and the real result perturbed (reversed, missing its first
-  element, one more). If some stand-in still satisfies every law, the spec
-  does not pin that function down, and the report says which stand-in got
-  through:
+  element, one more, or another value of the return type). If some
+  stand-in still satisfies every law, the spec does not pin that function
+  down, and the report says which stand-in got through:
 
 ```
 the spec does not pin down `isort`: every law still holds when it always returns ()
@@ -188,6 +192,18 @@ the spec does not pin down `isort`: every law still holds when it always returns
 
 That report is what a spec with only the `sorted` law produces. Adding
 `permutation` closes both gaps.
+
+One more stand-in catches a spec made only of anchors. When every law
+calls a function with the same argument fixed to literals, the laws say
+what it does at those values and nothing else. The stand-in agrees with
+the real function there and returns something different everywhere else.
+For a classifier whose laws only mention the sentinels `-127`, `-2`, `-1`
+and `0`, the report reads:
+
+```
+the spec does not pin down `classify-read`: every law still holds when it returns a different value whenever `n` is not one of -127, -2, -1, 0
+  State what `classify-read` must do, so that a law rejects this.
+```
 
 The stand-ins are a fixed family, so a spec that rejects them all can still
 be too weak. Passing this check is necessary for a good spec, not
@@ -218,6 +234,12 @@ function types `(-> A B R)`. Declared types come from `data`.
 `(List T)` means any seq: a list, a vector, a lazy seq or nil. Generated
 inputs mix all four, so code that only works on one of them fails. `conj`,
 for example, prepends to a list and appends to a vector.
+
+A generated `Int` stays between `-max-size` and `max-size`, so -50 to 50
+by default, and a `Nat` between 0 and `max-size`. A law quantified over
+`Int` therefore never reaches a value like `-127`. When specific values
+matter, such as a return code's sentinels, anchor each one with a law that
+names it: `(law eof-sentinel (forall [e Bool] (= :eof (classify-read -127 e))))`.
 
 ### Data
 
@@ -268,8 +290,9 @@ the spec's own helpers, then to `clojure.core`.
  :static      {:ok true}
  :laws        [{:law sorted :status :tested :trials 100 :seed 1732 :discarded 0} ...]
  :gaps        []                ; fns the laws don't pin down
+ :rejected    [{:fn isort ...}] ; per fn: its laws and the stand-ins they rejected
  :unspecified []                ; public fns with no ann
- :message     "writ.spec: my.sort-spec against my.sort: ok"}
+ :message     "writ.spec: my.sort-spec against my.sort: ok\n  `insert`: ..."}
 ```
 
 It works in three stages, and each runs only if the one before passed.
@@ -285,21 +308,128 @@ It works in three stages, and each runs only if the one before passed.
      failure is shrunk to a small counterexample.
    - `:witnessed`: an `exists`, found by test.check and shrunk to the
      simplest witness.
+   - `:proved`: a law that passed its tests and that the prover also
+     derived from the code's source for every input; see
+     [Proofs](#proofs). `:proof` says how, for example "by induction on
+     xs, splitting on (<= x xs-h)".
 
    A tested law has been tested, not proved; the status keeps the two
-   apart. While laws run, the target's signed fns are instrumented, so a
+   apart. A tested law the prover could not prove carries `:unproved`
+   with the reason. While laws run, the target's signed fns are instrumented, so a
    value of the wrong type fails at the fn that produced it.
 3. **Adequacy.** When every law holds, each signed public fn is swapped for
    stand-ins, and any stand-in that satisfies every law is reported in
-   `:gaps`. See [What a spec should say](#what-a-spec-should-say).
+   `:gaps`. See [What a spec should say](#what-a-spec-should-say). A
+   passing report lists, per fn, how many laws call it and how many
+   stand-ins of each kind they rejected, so a fn that only a couple of
+   constants were tried against stands out:
+
+   ```
+   writ.spec: my.sort-spec against my.sort: ok
+     `insert`: 2 laws, 5 impostors rejected (2 constant, 1 pass-through, 2 perturbed)
+     `isort`: 2 laws, 5 impostors rejected (2 constant, 1 pass-through, 2 perturbed)
+   ```
 
 Options: `:target` checks a different implementation against the same spec,
 `:trials` is the number of test.check runs per law (default 100), `:seed`
 replays a run (default random, reported per law), and `:max-size` is the
 largest generated size (default 50). `:adequacy false` skips the third
-stage, for example while a spec is still being written.
+stage, for example while a spec is still being written, and
+`:prove false` skips the prover.
 
-`check!` does the same but throws with the message when anything fails.
+### Proofs
+
+After a `forall` law passes its tests, writ tries to prove it from the
+code. It translates the law and the target's `defn`s into terms and
+rewrites them to normal form. When that isn't enough, it tries structural
+induction on each quantified variable, with the law at every smaller value
+as a hypothesis:
+
+- a list is nil, empty, or a head and a tail
+- a `Nat` is 0 or p + 1
+- a datatype has one case per constructor
+
+Within a case, an open integer comparison is split into its two outcomes,
+and an equality that holds is substituted away. The sort example's
+`insert-adds` is proved this way, as is the tree's `size-counts`:
+
+```
+writ.spec: my.sort-spec against my.sort: ok
+  law `insert-adds` proved by induction on xs, splitting on (<= x xs-h)
+```
+
+The model follows Typed Clojure's, so the prover keeps the distinctions
+Clojure makes:
+
+- `nil` and `()` are different values, and `seq` is the bridge between
+  them. `rest` is never nil, and `next` can be.
+- Lists, vectors, cons cells and lazy seqs are one kind of value. The ops
+  that tell them apart (`conj`, `peek`, `vector?`, ...) are outside the
+  model, so a law that needs them stays tested.
+- `=` is Clojure's: sequentials compare element by element, `1` never
+  equals `1.0`, and a term equals itself only when no float can be inside,
+  because `NaN` is not `=` to itself.
+- Integers are exact (jolt promotes on overflow). `+` is associative and
+  commutative only on integers. Floats get no algebra.
+
+A proof holds for every input on which the law's terms return a value.
+That is Typed Clojure's notion of soundness, well-typed code returns or
+throws. Since writ also runs every law, an input where a term throws still
+fails the check.
+
+Several things guard the prover itself:
+
+- Each rewrite rule is checked against the runtime by test.check.
+- Random closed terms are normalised and run, to check that the
+  normaliser agrees with jolt.
+- A proof must unfold one of the target's own definitions. One that never
+  looks at the code would say nothing about it.
+- A law that is proved and then refuted by a test value is reported as a
+  writ bug.
+
+The prover covers:
+
+- `seq`, `first`, `rest`, `next`, `second`, `empty?`, `count`, `cons`,
+  `list`, `vector`, `concat`, `filter`, `map` and `nth`
+- `=`, integer arithmetic and comparisons, `if`, `case`, `let` and
+  destructuring
+- fn literals, and the target's and the spec's own `defn`s
+
+Anything else leaves the law tested, with `:unproved` saying why, for
+example "outside the prover: `<=` passed as a value".
+
+### Which fns qualify
+
+Before writing a spec, `(spec/scan 'my.ns)` says which of a namespace's
+top-level forms writ could check. It reads the source without loading it,
+checks each form in order against the ones above it that passed, and gives
+writ's own reason for each one that fails. A fn that fails only because it
+recurses over a collection with no type is listed apart, since an `ann`
+fixes that. A fn that calls a rejected one says which. For a namespace
+that mixes pure code with IO:
+
+```
+writ.spec/scan writ.spec-demo.scan-mixed: 1 of 6 forms can be checked, 1 more once signed
+
+can be checked:
+  classify
+
+can be checked once an `ann` types its collection:
+  total: recursive call to `total` does not descend: argument 1 shrinks `xs` without a guard; ...
+
+cannot be checked:
+  shout (private): `.toUpperCase` is host interop or effect code; writ checks pure data-and-functions code only
+  log!: `println` in `log!` is effect code (...); writ checks pure data-and-functions code only
+  loud-classify: it uses `shout`, which writ cannot check
+  Conn (defrecord): `defrecord` is not supported: in the code a spec covers, writ checks def and defn forms only (...)
+```
+
+The report map has the same in `:forms`, one entry per form with
+`:status` `:ok`, `:needs-ann` or `:no` and a `:why`.
+
+### Other entry points
+
+`check!` does the same as `check` but throws with the message when anything fails.
 `(spec/instrument 'my.sort-spec)` wraps the target's signed fns with runtime
 argument and return checks for use at the REPL, and `unstrument` removes
 them. `(spec/sample '(List Nat) {} 5)` shows what a type generates.
@@ -308,10 +438,12 @@ them. `(spec/sample '(List Nat) {} 5)` shows what a type generates.
 
 These rules apply to the plain implementation.
 
-- **Pure code.** No host interop (`throw`, `new`, `.foo`, `reify`), no
-  effects (I/O, atoms and refs, futures, `eval`, var mutation,
-  randomness), no reflection. Calls into other namespaces pass through
-  unchecked.
+- **Pure code.** No host interop (`throw`, `new`, `.foo`, `reify`, static
+  members such as `System/getenv` or `Math/abs`), no effects (I/O, atoms
+  and refs, futures, `eval`, var mutation, randomness), no reflection.
+  Calls into other namespaces pass through unchecked. writ reads source
+  without loading it, so a qualified name whose qualifier ends in a
+  capitalised segment is taken to be a class.
 - **Top-level forms.** Only `ns`, `comment`, `def` and `defn`. A
   `defmulti`, `defrecord`, `defmacro` or bare expression is rejected
   rather than skipped. Each fn has a single arity.
@@ -326,9 +458,12 @@ These rules apply to the plain implementation.
     value to be non-nil. A truthiness test works, and so does a `case` on
     `(first t)`
 
-  Parameters before the shrinking one pass through unchanged. `rest` only
-  shrinks a collection writ knows is finite, which is one reason to sign
-  the fn.
+  Parameters before the shrinking one pass through unchanged, so an
+  accumulator goes after the collection it walks, in the parameters or
+  the `loop` bindings. `rest` only shrinks a collection writ knows is
+  finite, which is one reason to sign the fn. The loops that `doseq` and
+  similar macros expand to are checked the same way, and the error names
+  the collection they walk.
 - **Arity and calls.** Every call matches its fn's arity, including
   `clojure.core` fns, and nothing that is not a fn is called.
 - **Types.** Arguments fit the signed parameter types, and the body fits
@@ -384,6 +519,9 @@ of forms, and `writ.book/check-files` checks source files as one book.
 ## Modules
 
 - `writ.spec`: spec namespaces, law checking, instrument
+- `writ.prove`: the proof search; `writ.prove.term`, `writ.prove.rewrite`
+  and `writ.prove.translate` hold the terms, the rewrite rules and the
+  translation from Clojure
 - `writ.book`: runs every rule over a namespace's forms
 - `writ.check`: quantities, termination, ordering, effects, arity
 - `writ.types`: type checking and tagged data
@@ -398,8 +536,9 @@ of forms, and `writ.book/check-files` checks source files as one book.
 - `writ.defn`: the annotated surface macros
 - `writ.core`: entry points for the annotated surface
 
-writ.spec depends on `org.clojure/test.check`. The rest of writ has no
-dependencies.
+writ.spec depends on `org.clojure/test.check`, and writ.prove on
+`org.clojure/core.logic`, whose unification matches the rewrite rules. The
+rest of writ has no dependencies.
 
 ## Tests
 

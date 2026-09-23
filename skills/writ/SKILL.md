@@ -62,6 +62,9 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
 - Types: `Nat Int Bool String Char Keyword Symbol Float Double Unit Any`,
   `(List T) (Vec T) (Set T) (Map K V) (Tuple T ...)`, `(-> A R)`, and
   declared data. `(List T)` is any seq: list, vector, lazy seq or nil.
+  A generated `Int` stays within -50..50 and a `Nat` within 0..50 (the
+  default `:max-size`), so a quantified law never reaches a value like
+  `-127`. Anchor such values with a law that names them.
 - A law is built from:
   - `(= a b)`
   - `(and P ...)`
@@ -99,8 +102,11 @@ writ rejects a spec that does not do this:
   and `(= (+ n 0) n)` are vacuous. Rewrite it to say what the code does.
 - A **gap** is reported when every law holds but a trivial stand-in for a
   signed public fn would also satisfy them all. The stand-ins are a
-  constant, an argument passed through, and the real result reversed,
-  missing its first element, or plus one. The fix is a law that the
+  constant, an argument passed through, the real result reversed,
+  missing its first element, plus one, or swapped for another value of the
+  return type, and, when every law fixes an argument to literals, one that
+  agrees with the real fn on those literals and differs everywhere else.
+  The fix is a law that the
   stand-in breaks, and that states intent: add `permutation` so that
   "always returns ()" fails. Never special-case the stand-in in the code.
 
@@ -112,7 +118,8 @@ the laws say everything the problem statement says.
 Plain Clojure, with no writ require and no annotations. writ rejects:
 
 - Effects and interop: I/O, atoms and refs, futures, `eval`, `throw`,
-  `new`, `.method`, `reify`, reflection.
+  `new`, `.method`, `reify`, static members such as `System/getenv` or
+  `Math/abs` (use `abs`), reflection.
 - Top-level forms other than `ns`, `comment`, `def` and `defn`: no
   `defmulti`, `defrecord`, `defmacro`, `declare` or bare expressions.
   Each fn has one arity.
@@ -127,7 +134,9 @@ Plain Clojure, with no writ require and no annotations. writ rejects:
     including a `case` on `(first t)`
 
   Parameters before the shrinking one pass through unchanged, so
-  accumulators go after it.
+  accumulators go after it, in the parameters and in `loop` bindings.
+  `doseq` and `for` expand to such loops; their collection needs a type
+  too.
 - Calls with the wrong arity, and calls to non-fns.
 - Arguments that do not fit a callee's `ann`, or a body that does not fit
   the fn's own return type.
@@ -162,6 +171,7 @@ value anywhere else is rejected.
 (spec/check 'my.sort-spec {:target 'my.sort2})    ; same spec, other impl
 (spec/check! 'my.sort-spec)                       ; throws with the message
 (spec/sample '(List Nat) {} 5)                    ; what a type generates
+(spec/scan 'my.ns)                                ; which fns a spec could cover
 (spec/instrument 'my.sort-spec)                   ; runtime arg/return checks
 ```
 
@@ -176,10 +186,22 @@ Other options are `:trials`, the test.check runs per law (default 100),
 law runs until it is fixed. After that, each law has a `:status`:
 
 - `:vacuous`: true of any implementation; the spec must change.
+- `:proved`: passed its tests, and the prover derived it from the code for
+  every input. `:proof` says how.
 - `:evaluated`: a law with no quantifiers, run once.
 - `:tested`: passed test.check's trials. This is evidence, not proof.
+  `:unproved` says why the prover did not prove it: a form outside its
+  model (`conj`, maps, `loop`, a core fn passed as a value), a lemma it
+  would need, or no proof found. That is not a failure. A law written with
+  modelled forms and the spec's own helpers is more likely to be proved.
 - `:witnessed`: an `exists` law, and a value was found.
 - `:failed`: see the message.
+
+A passing report lists, per signed fn, how many laws call it and how many
+stand-ins of each kind they rejected:
+`` `classify-read`: 5 laws, 3 impostors rejected (2 constant, 1 perturbed) ``.
+Only constants rejected, or no fn laws at all, means the spec barely
+touches that fn even though it passed.
 
 ```
 law `permutation` fails for
@@ -231,6 +253,10 @@ confirm it, then without one.
 - ``cannot find the source of `ns` on the classpath`` - the target file is
   not under a source path.
 - ``is not a spec namespace`` - the namespace has no `(spec target)` form.
+
+- ``writ bug: law `x` was proved (...) but a test refutes it`` - the
+  prover is wrong, not your code. Report it with the seed, and rerun with
+  `{:prove false}` meanwhile.
 
 ### Tagged data
 
@@ -378,8 +404,16 @@ confirm it, then without one.
   ``must be a finite collection`` means `x` has no finite type: sign the fn
   with `ann` in the spec.
 - ``refers to itself as a value`` - a self-reference must be a call head.
-- ``argument N before the shrinking one must be passed unchanged`` - reorder
-  the parameters so the accumulator rides after the shrinking one.
+- ``argument N before the shrinking one must be passed unchanged; put `xs`
+  first in the parameters`` (or ``the `loop` bindings``) - do what it says:
+  the accumulator rides after the shrinking one.
+- ``a macro's loop in `f`, such as a `doseq`, does not descend`` - the loop
+  is the macro's, not yours; the message names the collection it walks.
+  Usually that collection needs a finite type from `ann`.
+- ``is not supported: in the code a spec covers, writ checks def and defn
+  forms only`` - `defrecord`, `defmacro`, `defmulti` and the like cannot sit
+  in the target; `scan` lists them. Move them out, or leave that namespace
+  unspecified.
 - ``takes N type argument(s), got M`` - fix the type's arity.
 - ``expects T for argument N but is passed U`` / ``returns T but its body has
   type U`` / ``has type T, which is not a function`` - the code disagrees
@@ -430,7 +464,9 @@ example books use.
 discipline on top of the rules above. The books in `examples/` are
 written this way, as `main.clj`, `LAWS.clj` and `PROOF.clj` checked
 together by `writ.book/check-files`. They are being ported to spec
-namespaces.
+namespaces. Their `LAWS.clj` files contain identities like
+`(= (status req s) (status req s))`: the `w/proof` gate needs those, and a
+spec namespace rejects them as vacuous. Don't copy them into a spec.
 
 - `(w/defn f [a :- Nat, ^:many b :- Nat] :- Nat body)`: `:-` gives types.
   An unmarked binder is affine: used at most once, with zero allowed.
@@ -466,6 +502,9 @@ broken implementations and the reports they produce.
 ## Source map
 
 - `writ.spec` spec namespaces, law checking with test.check, instrument
+- `writ.prove` proofs of laws from the code: `.term` the value model,
+  `.rewrite` the rules (checked against the runtime), `.translate` Clojure
+  to terms
 - `writ.book` runs every rule over a namespace's forms
 - `writ.check` quantities, termination, ordering, effects, arity
 - `writ.types` types and tagged data, `writ.kind` well-kindedness
