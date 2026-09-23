@@ -7,10 +7,11 @@
             writ.gaps-test
             writ.spec-test
             writ.prove-test
-            writ.evidence-test))
+            writ.evidence-test
+            writ.solve-test))
 
 (def test-namespaces
-  '[writ.check-test writ.book-test writ.gaps-test writ.spec-test writ.prove-test writ.evidence-test])
+  '[writ.check-test writ.book-test writ.gaps-test writ.spec-test writ.prove-test writ.evidence-test writ.solve-test])
 
 (defn -main [& _]
   (let [{:keys [fail error]} (apply t/run-tests test-namespaces)]
