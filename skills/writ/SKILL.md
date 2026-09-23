@@ -62,6 +62,9 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
 - Types: `Nat Int Bool String Char Keyword Symbol Float Double Unit Any`,
   `(List T) (Vec T) (Set T) (Map K V) (Tuple T ...)`, `(-> A R)`, and
   declared data. `(List T)` is any seq: list, vector, lazy seq or nil.
+  A generated `Int` stays within -50..50 and a `Nat` within 0..50 (the
+  default `:max-size`), so a quantified law never reaches a value like
+  `-127`. Anchor such values with a law that names them.
 - A law is built from:
   - `(= a b)`
   - `(and P ...)`
@@ -99,8 +102,11 @@ writ rejects a spec that does not do this:
   and `(= (+ n 0) n)` are vacuous. Rewrite it to say what the code does.
 - A **gap** is reported when every law holds but a trivial stand-in for a
   signed public fn would also satisfy them all. The stand-ins are a
-  constant, an argument passed through, and the real result reversed,
-  missing its first element, or plus one. The fix is a law that the
+  constant, an argument passed through, the real result reversed,
+  missing its first element, plus one, or swapped for another value of the
+  return type, and, when every law fixes an argument to literals, one that
+  agrees with the real fn on those literals and differs everywhere else.
+  The fix is a law that the
   stand-in breaks, and that states intent: add `permutation` so that
   "always returns ()" fails. Never special-case the stand-in in the code.
 
@@ -162,6 +168,7 @@ value anywhere else is rejected.
 (spec/check 'my.sort-spec {:target 'my.sort2})    ; same spec, other impl
 (spec/check! 'my.sort-spec)                       ; throws with the message
 (spec/sample '(List Nat) {} 5)                    ; what a type generates
+(spec/scan 'my.ns)                                ; which fns a spec could cover
 (spec/instrument 'my.sort-spec)                   ; runtime arg/return checks
 ```
 
@@ -180,6 +187,12 @@ law runs until it is fixed. After that, each law has a `:status`:
 - `:tested`: passed test.check's trials. This is evidence, not proof.
 - `:witnessed`: an `exists` law, and a value was found.
 - `:failed`: see the message.
+
+A passing report lists, per signed fn, how many laws call it and how many
+stand-ins of each kind they rejected:
+`` `classify-read`: 5 laws, 3 impostors rejected (2 constant, 1 perturbed) ``.
+Only constants rejected, or no fn laws at all, means the spec barely
+touches that fn even though it passed.
 
 ```
 law `permutation` fails for
@@ -430,7 +443,9 @@ example books use.
 discipline on top of the rules above. The books in `examples/` are
 written this way, as `main.clj`, `LAWS.clj` and `PROOF.clj` checked
 together by `writ.book/check-files`. They are being ported to spec
-namespaces.
+namespaces. Their `LAWS.clj` files contain identities like
+`(= (status req s) (status req s))`: the `w/proof` gate needs those, and a
+spec namespace rejects them as vacuous. Don't copy them into a spec.
 
 - `(w/defn f [a :- Nat, ^:many b :- Nat] :- Nat body)`: `:-` gives types.
   An unmarked binder is affine: used at most once, with zero allowed.

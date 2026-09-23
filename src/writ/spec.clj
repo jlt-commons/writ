@@ -28,10 +28,13 @@
 
   When every law holds, `check` asks whether the laws pin the code down:
   each signed public fn is swapped for well-typed impostors (a constant,
-  an argument passed through, the real result perturbed), and an impostor
-  that still satisfies every law is a gap in the spec.
+  an argument passed through, the real result perturbed, and one that
+  differs off the literals every law fixes an argument to), and an
+  impostor that still satisfies every law is a gap in the spec.  A passing
+  report counts the impostors each fn's laws rejected.
 
-  `instrument` wraps the target's fns with the signatures' runtime checks."
+  `instrument` wraps the target's fns with the signatures' runtime checks,
+  and `scan` says which of a namespace's fns writ could check at all."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [writ.book :as book]
@@ -482,22 +485,60 @@
 
 ;; --- adequacy: does the spec pin the code down? ------------------------------
 
+(defn- other-value
+  "A fn from a result to a different value of type `ret`, or nil when the
+  type has only one value.  Types with no perturbation of their own take
+  the first of a few generated values that differs from the result."
+  [ret tenv seed]
+  (let [h (if (seq? ret) (first ret) ret)]
+    (case h
+      (Nat Int) inc
+      Bool not
+      String #(str % "x")
+      (Unit Any) nil
+      (let [g (type->gen ret tenv)
+            cands (distinct (map #(gen/generate g (* 3 %) (+ seed %)) (range 8)))]
+        (when (next cands)
+          (fn [r] (or (first (remove #(= r %) cands)) r)))))))
+
+(defn- pinned-args
+  "{i #{values}} for each argument position of `f` that every law calls it
+  with a literal at: the laws say what `f` does there and nowhere else.
+  Empty when some law uses `f` as a value rather than calling it, since
+  then its arguments cannot be read off the law."
+  [props f n]
+  (let [forms (mapcat #(tree-seq coll? seq %) props)
+        calls (filter #(and (seq? %) (= f (first %))) forms)
+        lit? #(or (number? %) (string? %) (keyword? %) (char? %) (boolean? %) (nil? %))]
+    (if (or (empty? calls) (not= (count calls) (count (filter #{f} forms))))
+      {}
+      (into {} (for [i (range n)
+                     :let [as (map #(nth % (inc i) ::none) calls)]
+                     :when (every? lit? as)]
+                 [i (set as)])))))
+
 (defn impostors
-  "Well-typed stand-ins for fn `nm` with signature `sig`: {:desc :make},
-  where (make real-fn) is the impostor.  Constants of the return type,
-  each argument of the return type passed through, and the real result
-  perturbed.  A spec that means something rejects every one of them."
-  [nm sig argn tenv seed]
+  "Well-typed stand-ins for fn `nm` with signature `sig`: {:desc :kind
+  :make}, where (make real-fn) is the impostor.  Constants of the return
+  type, each argument of the return type passed through, the real result
+  perturbed, and -- for each argument `pins` fixes to a set of literals --
+  the real result on those literals and a different one everywhere else.
+  A spec that means something rejects every one of them."
+  [nm sig argn tenv seed & [pins]]
   (let [ret (plain (:ret sig))
         g (type->gen ret tenv)
         consts (distinct [(gen/generate g 0 seed) (gen/generate g 5 (inc seed))])
-        wrap (fn [desc f] {:desc desc :make (fn [real] (fn [& args] (f (apply real args))))})]
+        other (other-value ret tenv seed)
+        arg-name #(nth argn % (str "arg" %))
+        wrap (fn [desc f] {:desc desc :kind :perturbed
+                           :make (fn [real] (fn [& args] (f (apply real args))))})]
     (concat
       (for [v consts]
-        {:desc (str "always returns " (pr-str v)) :make (fn [_] (fn [& _] v))})
+        {:desc (str "always returns " (pr-str v)) :kind :constant :make (fn [_] (fn [& _] v))})
       (keep-indexed (fn [i t]
                       (when (= (plain t) ret)
-                        {:desc (str "returns its argument `" (nth argn i (str "arg" i)) "` unchanged")
+                        {:desc (str "returns its argument `" (arg-name i) "` unchanged")
+                         :kind :pass-through
                          :make (fn [_] (fn [& args] (nth args i)))}))
                     (:params sig))
       (let [h (if (seq? ret) (first ret) ret)]
@@ -509,7 +550,23 @@
                 (wrap "returns the real result without its first element" rest)]
           Vec [(wrap "returns the real result reversed" #(vec (reverse %)))
                (wrap "returns the real result without its first element" #(vec (rest %)))]
-          [])))))
+          (when other [(wrap "returns a different value than the real result" other)])))
+      (when other
+        (for [[i vs] (sort-by key pins)
+              :when (not (and (= 'Bool (plain (nth (:params sig) i nil)))
+                              (= #{true false} vs)))
+              :let [shown (str/join ", " (map pr-str (sort-by (fn [v] [(if (number? v) 0 1)
+                                                                       (if (number? v) v 0)
+                                                                       (pr-str v)])
+                                                              vs)))
+                    vs (vec vs)]]
+          {:desc (str "returns a different value whenever `" (arg-name i)
+                      "` is not one of " shown)
+           :kind :off-pin
+           :make (fn [real]
+                   (fn [& args]
+                     (let [r (apply real args)]
+                       (if (some #(= % (nth args i)) vs) r (other r)))))})))))
 
 (declare leading-foralls holds)
 
@@ -536,22 +593,29 @@
 
 (defn- adequacy
   "Swap each signed public fn for its impostors, one at a time, and run
-  every law against each.  Returns the gaps: [{:fn f :survivors [desc]}]."
+  every law against each.  Returns, per fn, [{:fn f :laws n :rejected
+  [impostor] :survivors [desc]}]: a survivor is a gap in the spec."
   [ctx target fns anns props trials seed]
   (vec (for [nm fns
              :let [v (ns-resolve (the-ns target) nm)
                    real @v
                    sig (get anns nm)
                    argn (vec (take (count (:params sig)) (first (:arglists (meta v)))))
-                   survivors (vec (for [imp (impostors nm sig argn (:tenv ctx) seed)
-                                        :when (try
-                                                (alter-var-root v (constantly ((:make imp) real)))
-                                                (every? #(holds-sampled? ctx % trials seed) props)
-                                                (catch Throwable _ false)
-                                                (finally (alter-var-root v (constantly real))))]
-                                    (:desc imp)))]
-             :when (seq survivors)]
-         {:fn nm :survivors survivors})))
+                   qnm (symbol (name target) (name nm))
+                   pins (pinned-args props qnm (count (:params sig)))
+                   survives? (fn [imp]
+                               (try
+                                 (alter-var-root v (constantly ((:make imp) real)))
+                                 (every? #(holds-sampled? ctx % trials seed) props)
+                                 (catch Throwable _ false)
+                                 (finally (alter-var-root v (constantly real)))))
+                   {survived true rejected false}
+                   (group-by (comp boolean survives?)
+                             (impostors nm sig argn (:tenv ctx) seed pins))]]
+         {:fn nm
+          :laws (count (filter #(some #{qnm} (tree-seq coll? seq %)) props))
+          :rejected (mapv #(dissoc % :make) rejected)
+          :survivors (mapv :desc survived)})))
 
 ;; --- the target's source -----------------------------------------------------
 
@@ -625,6 +689,74 @@
         {:ok true :defns defns}))
     (catch Throwable e
       {:ok false :error (or (ex-message e) (str e))})))
+
+(defn- form-name [f]
+  (when (and (seq? f) (symbol? (second f))) (second f)))
+
+(defn scan
+  "Which of `target`'s top-level forms writ could check, before any spec is
+  written.  Reads the source from the classpath without loading it, and
+  checks each form in order against the forms above it that passed.
+  Returns {:target t :forms [{:name :head :private? :status :why}]}, with
+  :status :ok, :needs-ann (it fails only because a collection it recurses
+  over has no type, which an `ann` gives it) or :no, and :message, a
+  summary to read."
+  [target]
+  (let [forms (book/read-forms (source-url target))
+        nsf (filterv #(head? % "ns") forms)
+        body (remove #(or (head? % "ns") (head? % "comment")) forms)
+        rows (loop [fs body, kept [], blocked {}, out []]
+               (if-let [f (first fs)]
+                 (let [nm (form-name f)
+                       dep (first (keep #(when (symbol? %)
+                                           (let [s (symbol (name %))]
+                                             (when (and (not= nm s) (contains? blocked s)) s)))
+                                        (tree-seq coll? seq (rest f))))
+                       [status why]
+                       (if dep
+                         [(get blocked dep)
+                          (str "it uses `" dep "`, which "
+                               (if (= :needs-ann (get blocked dep))
+                                 "needs an `ann` first"
+                                 "writ cannot check"))]
+                         (try
+                           (binding [ck/*affine* false
+                                     ck/*descend-all* true
+                                     ty/*tagged* true]
+                             (book/check-book (vec (concat nsf kept [f]))))
+                           [:ok nil]
+                           (catch Throwable e
+                             (let [m (str/replace (or (ex-message e) (str e)) #"^Writ: " "")]
+                               [(if (str/includes? m "must be a finite collection") :needs-ann :no)
+                                m]))))]
+                   (recur (rest fs)
+                          (if (= :ok status) (conj kept f) kept)
+                          (if (and nm (not= :ok status)) (assoc blocked nm status) blocked)
+                          (conj out (cond-> {:name nm :head (first f) :status status
+                                             :private? (boolean (or (head? f "defn-")
+                                                                    (and nm (:private (meta nm)))))}
+                                      why (assoc :why why)))))
+                 out))
+        label (fn [{:keys [name head private?]}]
+                (str (or name head)
+                     (when-not (contains? #{"defn" "defn-" "def"} (clojure.core/name head))
+                       (str " (" head ")"))
+                     (when private? " (private)")))
+        group (fn [k title]
+                (when-let [rs (seq (filter #(= k (:status %)) rows))]
+                  (str "\n\n" title
+                       (apply str (for [r rs]
+                                    (str "\n  " (label r)
+                                         (when (:why r) (str ": " (:why r)))))))))
+        n (fn [k] (count (filter #(= k (:status %)) rows)))]
+    {:target target
+     :forms rows
+     :message (str "writ.spec/scan " target ": " (n :ok) " of " (count rows)
+                   " forms can be checked"
+                   (when (pos? (n :needs-ann)) (str ", " (n :needs-ann) " more once signed"))
+                   (group :ok "can be checked:")
+                   (group :needs-ann "can be checked once an `ann` types its collection:")
+                   (group :no "cannot be checked:"))}))
 
 (defn- tenv-of [data]
   (into {} (map (fn [f] (let [d (dt/parse f)] [(:name d) (dt/env d)]))) data))
@@ -713,8 +845,15 @@
 
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
-  [{:keys [ok target spec static laws gaps unspecified]}]
+  [{:keys [ok target spec static laws gaps unspecified rejected]}]
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
+       (when ok
+         (apply str (for [{f :fn n :laws imps :rejected} rejected]
+                      (str "\n  `" f "`: " n (if (= 1 n) " law, " " laws, ")
+                           (count imps) " impostors rejected ("
+                           (str/join ", " (for [[k c] (sort-by key (frequencies (map :kind imps)))]
+                                            (str c " " (name k))))
+                           ")"))))
        (when-not (:ok static) (str "\n\n" (:error static)))
        (apply str (map #(str "\n\n" (format-failure %)) (filter #(= :failed (:status %)) laws)))
        (apply str (map #(str "\n\nlaw `" (:law %) "` is vacuous: " (:why %)
@@ -801,13 +940,16 @@
                                      r))
                            results)
              sound? (not-any? #(contains? #{:failed :vacuous} (:status %)) results)
-             gaps (if (and sound? (not= false (:adequacy opts)))
-                    (adequacy ctx target
-                              (sort (filter #(contains? publics %) (keys anns)))
-                              anns (keep :prop results) trials (or seed 42))
-                    [])
+             per-fn (if (and sound? (not= false (:adequacy opts)))
+                      (adequacy ctx target
+                                (sort (filter #(contains? publics %) (keys anns)))
+                                anns (keep :prop results) trials (or seed 42))
+                      [])
+             gaps (vec (for [{f :fn s :survivors} per-fn :when (seq s)]
+                         {:fn f :survivors s}))
              results (mapv #(dissoc % :prop) results)
              r (assoc base :laws results :gaps gaps
+                           :rejected (mapv #(select-keys % [:fn :laws :rejected]) per-fn)
                            :ok (and sound? (empty? gaps)))]
          (assoc r :message (format-report r)))))))
 
