@@ -832,6 +832,26 @@
     (is (some? m))
     (is (re-find #"host interop or effect" m))))
 
+;; A static member lowers to a plain qualified ref, `System/getProperty`, the
+;; same shape as a call into another namespace, which passes unchecked.  So
+;; `.exists` was rejected while `System/getenv` and `System/currentTimeMillis`
+;; were certified pure.  A namespace segment that starts with a capital letter
+;; names a host class, not a Clojure namespace.
+(deftest static-member-interop-is-rejected
+  (doseq [form ['(defn f [] (System/getProperty "os.name"))
+                '(defn f [] (System/currentTimeMillis))
+                '(defn f [k] (System/getenv k))
+                '(defn f [x] (Math/abs x))
+                '(defn f [x] (java.lang.Math/abs x))
+                '(defn f [] Math/PI)]]
+    (testing (pr-str (last form))
+      (let [m (err-msg form)]
+        (is (some? m))
+        (is (re-find #"host interop or effect" (str m))))))
+  (testing "a call into another namespace still passes"
+    (is (nil? (err-msg '(defn f [s] (clojure.string/upper-case s)))))
+    (is (nil? (err-msg '(defn f [s] (str/upper-case s)))))))
+
 ;; --- G40: unknown top-level forms are rejected, not silently skipped ---------
 
 (deftest unknown-top-level-forms-are-rejected

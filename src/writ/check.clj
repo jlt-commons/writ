@@ -919,6 +919,9 @@
                          "pure data-and-functions code only"))]
     (walk-ast raw-ast
       (fn [n]
+        (when (and (ref? n) (l/host-member? (:name n)))
+          (fail! "`" (:name n) "` is host interop or effect code; "
+                 "writ checks pure data-and-functions code only"))
         (when (and (ref? n) (l/effect-head? (:name n) bound))
           (if (contains? l/interop-names (symbol (name (:name n))))
             (fail! "`" (:name n) "` is host interop or effect code; "
