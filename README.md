@@ -308,9 +308,14 @@ It works in three stages, and each runs only if the one before passed.
      failure is shrunk to a small counterexample.
    - `:witnessed`: an `exists`, found by test.check and shrunk to the
      simplest witness.
+   - `:proved`: a law that passed its tests and that the prover also
+     derived from the code's source for every input; see
+     [Proofs](#proofs). `:proof` says how, for example "by induction on
+     xs, splitting on (<= x xs-h)".
 
    A tested law has been tested, not proved; the status keeps the two
-   apart. While laws run, the target's signed fns are instrumented, so a
+   apart. A tested law the prover could not prove carries `:unproved`
+   with the reason. While laws run, the target's signed fns are instrumented, so a
    value of the wrong type fails at the fn that produced it.
 3. **Adequacy.** When every law holds, each signed public fn is swapped for
    stand-ins, and any stand-in that satisfies every law is reported in
@@ -329,7 +334,69 @@ Options: `:target` checks a different implementation against the same spec,
 `:trials` is the number of test.check runs per law (default 100), `:seed`
 replays a run (default random, reported per law), and `:max-size` is the
 largest generated size (default 50). `:adequacy false` skips the third
-stage, for example while a spec is still being written.
+stage, for example while a spec is still being written, and
+`:prove false` skips the prover.
+
+### Proofs
+
+After a `forall` law passes its tests, writ tries to prove it from the
+code. It translates the law and the target's `defn`s into terms and
+rewrites them to normal form. When that isn't enough, it tries structural
+induction on each quantified variable, with the law at every smaller value
+as a hypothesis:
+
+- a list is nil, empty, or a head and a tail
+- a `Nat` is 0 or p + 1
+- a datatype has one case per constructor
+
+Within a case, an open integer comparison is split into its two outcomes,
+and an equality that holds is substituted away. The sort example's
+`insert-adds` is proved this way, as is the tree's `size-counts`:
+
+```
+writ.spec: my.sort-spec against my.sort: ok
+  law `insert-adds` proved by induction on xs, splitting on (<= x xs-h)
+```
+
+The model follows Typed Clojure's, so the prover keeps the distinctions
+Clojure makes:
+
+- `nil` and `()` are different values, and `seq` is the bridge between
+  them. `rest` is never nil, and `next` can be.
+- Lists, vectors, cons cells and lazy seqs are one kind of value. The ops
+  that tell them apart (`conj`, `peek`, `vector?`, ...) are outside the
+  model, so a law that needs them stays tested.
+- `=` is Clojure's: sequentials compare element by element, `1` never
+  equals `1.0`, and a term equals itself only when no float can be inside,
+  because `NaN` is not `=` to itself.
+- Integers are exact (jolt promotes on overflow). `+` is associative and
+  commutative only on integers. Floats get no algebra.
+
+A proof holds for every input on which the law's terms return a value.
+That is Typed Clojure's notion of soundness, well-typed code returns or
+throws. Since writ also runs every law, an input where a term throws still
+fails the check.
+
+Several things guard the prover itself:
+
+- Each rewrite rule is checked against the runtime by test.check.
+- Random closed terms are normalised and run, to check that the
+  normaliser agrees with jolt.
+- A proof must unfold one of the target's own definitions. One that never
+  looks at the code would say nothing about it.
+- A law that is proved and then refuted by a test value is reported as a
+  writ bug.
+
+The prover covers:
+
+- `seq`, `first`, `rest`, `next`, `second`, `empty?`, `count`, `cons`,
+  `list`, `vector`, `concat`, `filter`, `map` and `nth`
+- `=`, integer arithmetic and comparisons, `if`, `case`, `let` and
+  destructuring
+- fn literals, and the target's and the spec's own `defn`s
+
+Anything else leaves the law tested, with `:unproved` saying why, for
+example "outside the prover: `<=` passed as a value".
 
 ### Which fns qualify
 
@@ -447,6 +514,9 @@ of forms, and `writ.book/check-files` checks source files as one book.
 ## Modules
 
 - `writ.spec`: spec namespaces, law checking, instrument
+- `writ.prove`: the proof search; `writ.prove.term`, `writ.prove.rewrite`
+  and `writ.prove.translate` hold the terms, the rewrite rules and the
+  translation from Clojure
 - `writ.book`: runs every rule over a namespace's forms
 - `writ.check`: quantities, termination, ordering, effects, arity
 - `writ.types`: type checking and tagged data
@@ -461,8 +531,9 @@ of forms, and `writ.book/check-files` checks source files as one book.
 - `writ.defn`: the annotated surface macros
 - `writ.core`: entry points for the annotated surface
 
-writ.spec depends on `org.clojure/test.check`. The rest of writ has no
-dependencies.
+writ.spec depends on `org.clojure/test.check`, and writ.prove on
+`org.clojure/core.logic`, whose unification matches the rewrite rules. The
+rest of writ has no dependencies.
 
 ## Tests
 

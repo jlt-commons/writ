@@ -2,6 +2,10 @@
   "The prover: its rules agree with the runtime, its model keeps the
   distinctions Clojure makes, and it proves laws from the code."
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.java.io]
+            [writ.book]
+            [writ.spec :as spec]
+            [writ.prove :as prover]
             [writ.prove.term :as t]
             [writ.prove.rewrite :as rw]))
 
@@ -50,3 +54,63 @@
     (is (= [:lit false] (norm ctx [:call '< 'a 'a]))))
   (testing "untyped operands stay as they are"
     (is (= [:call '+ 'x 'y] (norm [:call '+ 'x 'y])))))
+
+;; --- phase 1: laws proved from the code ---------------------------------------
+
+(defn- law-result [report nm]
+  (first (filter #(= nm (:law %)) (:laws report))))
+
+(deftest insert-adds-is-proved-by-induction
+  (let [r (spec/check 'writ.spec-demo.sort-spec {:seed 42})
+        l (law-result r 'insert-adds)]
+    (is (:ok r) (:message r))
+    (is (= :proved (:status l)) (pr-str l))
+    (is (re-find #"by induction on xs, splitting on" (str (:proof l))))
+    (testing "a proved law was still run"
+      (is (= 100 (:trials l))))))
+
+(deftest a-tree-law-is-proved-by-induction-on-the-datatype
+  (let [r (spec/check 'writ.spec-demo.tree-spec {:seed 42})
+        l (law-result r 'size-counts)]
+    (is (:ok r) (:message r))
+    (is (= :proved (:status l)) (pr-str l))
+    (is (re-find #"by induction on t" (str (:proof l))))))
+
+(deftest laws-outside-the-model-stay-tested-with-a-reason
+  (let [r (spec/check 'writ.spec-demo.sort-spec {:seed 42})]
+    (is (= :tested (:status (law-result r 'smallest-first))))
+    (is (string? (:unproved (law-result r 'smallest-first))))))
+
+(deftest a-false-law-is-never-proved
+  (testing "insert-adds is false when insert drops duplicates"
+    (let [r (spec/check 'writ.spec-demo.sort-spec {:seed 42 :target 'writ.spec-demo.sort-dedup})]
+      (is (= :failed (:status (law-result r 'insert-adds))))
+      (is (not-any? :prover-bug (:laws r)))))
+  (testing "on every broken sort, no law is both proved and refuted"
+    (doseq [target '[writ.spec-demo.sort-desc writ.spec-demo.sort-conj writ.spec-demo.sort-identity]]
+      (let [r (spec/check 'writ.spec-demo.sort-spec {:seed 42 :target target})]
+        (is (not-any? :prover-bug (:laws r)) (str target)))))
+  (testing "insert-adds still holds when the order is flipped, and is proved"
+    (let [r (spec/check 'writ.spec-demo.sort-spec {:seed 42 :target 'writ.spec-demo.sort-desc})]
+      (is (= :proved (:status (law-result r 'insert-adds)))))))
+
+(deftest proving-can-be-turned-off
+  (let [r (spec/check 'writ.spec-demo.sort-spec {:seed 42 :prove false})]
+    (is (= :tested (:status (law-result r 'insert-adds))))))
+
+(deftest the-prover-reads-the-code-it-proves
+  (require 'writ.spec-demo.sort)
+  (let [[defs] (prover/definitions [['writ.spec-demo.sort
+                                     (writ.book/read-forms (clojure.java.io/resource "writ/spec_demo/sort.clj"))]])
+        f (get defs 'writ.spec-demo.sort/insert)]
+    (testing "a translated definition computes what the fn computes"
+      (doseq [[x xs] [[3 '(1 2 5)] [0 []] [9 [1 9 12]] [4 nil]]]
+        (is (= ((resolve 'writ.spec-demo.sort/insert) x xs)
+               (t/evaluate (:body f) {'x x 'xs xs})))))
+    (is (:recursive? f))))
+
+(deftest a-fact-can-settle-a-comparison-false
+  ;; from 0 <= x - h - 1 (h < x), 0 <= h - x (x <= h) must come out false
+  (let [ctx (rw/assume (rw/context {:types '{x Nat h Nat}})
+                       [:le [:lin -1 '[[h -1] [x 1]]]] true)]
+    (is (false? (rw/decide ctx [:le [:lin 0 '[[h 1] [x -1]]]])))))
