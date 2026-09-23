@@ -469,9 +469,9 @@
       (case need
         :empty (str "`" c "` must first be tested non-empty (a `seq` or `empty?` test)")
         :nil (str "`" c "` must first be tested non-nil (a truthiness, `some?` or `seq` test)")
-        :finite (str "`" c "` must be a finite collection: annotate it (List T), "
-                     "(Vec T), (Set T), (Map K V) or a datatype -- a lazy seq may "
-                     "never run out")))))
+        :finite (str "`" c "` must be a finite collection: give it the type (List T), "
+                     "(Vec T), (Set T), (Map K V) or a datatype -- with `ann` in a "
+                     "spec, or an annotation -- a lazy seq may never run out")))))
 
 (defn- check-descent!
   "Bend's descent law at one self-call or recur: the arguments before the

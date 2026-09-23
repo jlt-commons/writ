@@ -1,170 +1,199 @@
 ---
 name: writ
-description: Use when writing, annotating, or reviewing Clojure that is checked by writ, the zero-dependency jolt static checker for Bend's rules. Also when writing LAWS.clj / PROOF.clj spec files or example books, or when fixing any "Writ:" compile error (quantities, termination, descent, kinds, match discipline, law gate, def ordering).
+description: Use when writing or fixing Clojure checked by writ -- a spec namespace (writ.spec: spec/ann/data/law) and the plain implementation it constrains -- or when reading a writ.spec report or any "Writ:" error (purity, termination, ordering, arity, types, tagged data, failing laws). Also for the annotated writ.defn surface (w/defn, ^:many, w/match, w/law, w/proof) used by the example books.
 ---
 
 # writ
 
-writ checks ordinary Clojure against Bend's static rules. It is a library, not
-a language. Annotations ride on metadata, every `w/...` macro expands to a
-plain `clojure.core` form, and the checks run at compile time, so a rejection
-is a compile error starting with `Writ:`. It runs on jolt (Clojure on Scheme,
-no JVM) and has no dependencies.
+writ checks plain Clojure against a contract that lives beside it. The
+implementation never mentions writ. A spec namespace names it, signs its
+public fns with types and states laws about their behaviour.
+`(writ.spec/check 'my.spec)` runs Bend's static rules over the
+implementation's source using those types, then runs the laws. It returns
+a report that names what is wrong. writ runs on jolt; writ.spec uses
+test.check.
 
-## The surface
+## Who owns what
 
-```clojure
-(ns my.app
-  (:require [writ.defn :as w]))
+- The spec (`spec`, `ann`, `data`, `law`) is the contract. Usually a person
+  writes it. Do not weaken a law, loosen an `ann`, or delete either to get a
+  check to pass. If the spec looks wrong, say so and ask.
+- The implementation is yours. Change it until `check` reports `:ok`.
+- A report that fails is the next thing to fix. Read the whole message: it
+  names the rule or law, the input, and the values.
 
-(w/data NatList Nil (Cons Nat NatList))
-
-(w/defn ^{:writ/descend true} sum [xs :- NatList] :- Nat
-  (w/match xs :- NatList
-    (Nil 0)
-    ((Cons h t) (+ h (sum t)))))
-```
-
-- `w/defn` is `defn` plus annotations. `:-` separates a name from its type,
-  and a leading `:- Type` after the parameters is the return type.
-- Quantities ride on metadata. Unmarked is affine, so at most one use (zero
-  uses is fine, that is weakening). `^:many` (or `^:omega`, `^:reusable`) is
-  reusable. `^:zero` (or `^:erased`) is erased and must never be used.
-  `^{:q :omega}` is the explicit form.
-- `(w/data Name [type-params?] Ctor (Ctor2 Field ...) ...)` declares a type.
-  Ground types are built in: Nat Bool Unit Int String Char Float Double
-  Keyword Symbol Any. Built-in type constructors: `(List T)`, `(Tuple T ...)`
-  and `(& T ...)`, the last being a multi-value return.
-- `w/match` arms pair a pattern with a body. A nullary constructor is bare,
-  `(Nil body)`. A valued one binds its fields, `((Cons h t) body)`. Values are
-  `[:Ctor f1 f2]` vectors.
-
-## The rules
-
-**Quantities cover every binder.** Parameters, `let` and `loop` locals, `fn`
-parameters and pattern binders all carry a quantity. A value reached twice
-needs `^:many` on the binder it flows from: `(let [^:many h (f x)] (+ h h))`,
-`((Cons ^:many c t) ...)`. A local may not shadow a parameter, and one
-pattern cannot bind one name for two fields. Branches join, so a use in each
-`if`/match arm is one use per path. Sequential uses add. Collection literals
-(`[...]`, `{...}`, `#{...}`) are walked like any expression, so a double use
-inside one counts. Sibling scopes may reuse a name (two `fn`s may each bind
-`t`); only shadowing a parameter or duplicating within one form is rejected.
-
-**Termination is mandatory.** Any recursion, `loop`/`recur` included, needs
-`^{:writ/descend true}` on the defn. Arguments are read left to right: each
-passes its OWN column unchanged until one is a strict part of its own
-column (destructured, matched, or `dec`/`rest`/`next`/`first`/`nth`/2-arg
-`get` of it). A shrink counts only under a test on that column: `dec` needs
-`pos?` (any integer) or `zero?`/`(= x 0)` on a `Nat`; `rest`/`drop` need
-`seq`/`empty?`; `next` and element reads need it non-nil (truthiness,
-`some?`, a `w/match` arm). A lookup with a default is not a shrink, and a
-book fn named `dec` is not `dec`. The fn's own name may appear only as a
-call head. `recur` is judged against its own loop frame. Accumulators ride
-after the shrinking argument. A `dec` chain needs a guard at each depth
-(`(inc (dec (dec n)))` is n-1 under guards on n and n-1). `rest`/`next`
-shrink only a column typed as a finite collection (String, List, Vec, Set,
-Map, a datatype); infinite seqs are their own type and never fit one.
-`w/match` also takes Nat `(0 ..) ((inc p) ..)`, Bool `(true ..) (false ..)`
-and `(List T)` `([] ..) ([h & t] ..)`. `recur` must be in tail position,
-and a defn body is an implicit loop: a tail `recur` there rebinds the
-parameters, so a parameter that both feeds a test and rides into the `recur`
-carries `^:many`, like a loop local.
-
-**Defs reference earlier defs only.** No forward references and no mutual
-recursion — in calls AND value positions. Qualified symbols, `clojure.core`
-names, `:refer`'d names and
-local `fn`s are external, not book-local, so they are fine.
-
-**Kinds make reuse sound.** A `^:many` binder needs a type of kind Data,
-proven: a `^:many` param carries a Data annotation (`:- Nat`, or `^Nat` on a
-plain defn), a `^:many` local an annotation or an init whose type writ infers
-as Data. `Any`, type parameters and unknown names are not Data. A closure
-capturing an affine binder cannot be passed to a core higher-order fn
-(`map`, `reduce`, ...), and an overlapping destructure (`{a :a b :a}`, `:as`
-beside fields) copies its source, so the source must be `^:many`. A
-function type is Type. A datatype with a function field anywhere is Type,
-transitively, and kind flows through type parameters: `(Box Nat)` is Data,
-`(Box (-> Nat Nat))` is Type.
-
-**Data is taken apart, not built.** A constructor or a datatype name in
-code is rejected (`w/data` defines no constructor fns); values come from
-outside the book and are consumed by `match`. `:-` annotations work inside
-`fn` params too, and a param's type may name only earlier params.
-
-**Match discipline.** The scrutinee must be a parameter, a pattern binder or
-an `fn` parameter, never a computed value or a `let` local (a let/loop/
-when-let/for... that rebinds the name takes it out of scope). A known
-scrutinee type must equal the match type. The type is a declared name or a
-parametric application like `(Box Nat)`. Every constructor appears exactly
-once and each pattern binds that constructor's field count, unless a
-lowercase catch-all arm (`(x ..)`, `(_ ..)`) comes last. Pattern binders are
-symbols (`_` may repeat); nest a second match to look deeper. A field's
-declared quantity (`(MkP ^:many Nat)`, `^:zero`) is the binder's default.
-An empty type is matched with no arms. `first`/`nth`/destructuring on a
-data-typed value is rejected: take it apart with `match`.
-
-**Erasure and type variables.** Types are checked dead (BendTT 2.4), so an
-erased binder may appear in a type but not in running code. Clojure has no
-erasure, so a `^:zero` local's init and an argument to a `^:zero` param still
-run and still count. Generic defns declare type variables in the attr-map,
-`{:writ/forall [a, b :- Data]}`: no runtime argument, kind Type unless
-declared Data.
-
-**The law gate.** A law states a proposition over `=`, `and`, `=>`, `forall`
-and `exists`. A proof discharges it with `refl`, `(pair p ...)`, `(fn [h] body)`
-for `=>` and `forall`, or `(witness t pf)` for `exists`. Shapes are exact:
-`(= a b)`, `(=> P Q)`, `(forall [x T] P)`. `refl` holds when both sides are
-convertible up to alpha: `let`/applied `fn` on value arguments (strict: a
-throwing init is never dropped), `if`/`case` on a literal, arithmetic and
-comparison on literals, and `(+ x 0)`/`(* x 1)` only when `x` is a number
-(a `forall [x Nat]` binder, or a call to a book fn returning a number). A
-throwing term equals nothing; fn values are never refl-equal. Law terms are
-name/arity/effect checked like code and may not loop. A witness must fit its
-domain. There is no induction and nothing about your own functions. Every law is
-discharged by exactly one proof, a law may be cited as a lemma only after its
-own proof, and a proof is never citable.
-
-## Books: main, LAWS, PROOF
-
-Keep implementation and spec apart, one directory per book:
-
-- `main.clj` holds the implementation (`w/data`, `w/defn`).
-- `LAWS.clj` holds the laws (`w/law` only, no implementation).
-- `PROOF.clj` holds the proofs plus a `verify` that runs the whole book:
+## A spec
 
 ```clojure
-(defn verify []
-  (writ.book/check-files
-    "my/app/main.clj"
-    "my/app/LAWS.clj"
-    "my/app/PROOF.clj"))
+(ns my.sort-spec
+  (:require [writ.spec :refer [spec data ann law]]))
+
+(spec my.sort)                                   ; the namespace it constrains
+
+(ann insert [Nat (List Nat) -> (List Nat)])      ; one per public fn
+(ann isort  [(List Nat) -> (List Nat)])
+
+(defn ascending? [xs] (or (empty? xs) (apply <= xs)))   ; spec-side helper
+
+(law sorted (forall [xs (List Nat)] (ascending? (isort xs))))
+(law insert-empty (= (insert 3 ()) (list 3)))
 ```
 
-It returns `{:ok true}` or throws. `examples/theory_discipline` exercises the
-whole rule surface in one book, and `examples/README.md` describes the rest.
+- `(spec ns)` comes first.
+- `(ann f [A B -> R])`: the parameter count must match the fn, which has a
+  single arity. A private helper that recurses over a collection needs an
+  `ann` too, or writ cannot tell the collection is finite.
+- `(data Tree Leaf (Node Tree Nat Tree))`, or `(data Box [a] (Wrap a))`
+  with type parameters.
+- Types: `Nat Int Bool String Char Keyword Symbol Float Double Unit Any`,
+  `(List T) (Vec T) (Set T) (Map K V) (Tuple T ...)`, `(-> A R)`, and
+  declared data. `(List T)` is any seq: list, vector, lazy seq or nil.
+- A law is built from:
+  - `(= a b)`
+  - `(and P ...)`
+  - `(=> P Q)`; a case where `P` does not hold is skipped
+  - `(forall [x T, y U] P)`
+  - `(exists [x T] P)`
+  - any expression, which holds when it is truthy
 
-## Running
+  A free name refers first to the target's public fns, then to the spec's
+  helpers, then to clojure.core. Laws cannot quantify over fn types,
+  because no generator exists for them.
 
-In your own project, add `writ/writ` to `:deps` and require `writ.defn`. The
-checks fire when the macros expand, so requiring the namespace is the check.
+## The implementation
 
-In this repo:
+Plain Clojure, with no writ require and no annotations. writ rejects:
 
-```sh
-rm -rf ~/.jolt/aot-cache .jolt   # the AOT cache can serve stale namespaces
-jolt -M:test                      # engine suite
-cd examples && jolt -M:test       # every book, end to end
+- Effects and interop: I/O, atoms and refs, futures, `eval`, `throw`,
+  `new`, `.method`, `reify`, reflection.
+- Top-level forms other than `ns`, `comment`, `def` and `defn`: no
+  `defmulti`, `defrecord`, `defmacro`, `declare` or bare expressions.
+  Each fn has one arity.
+- A reference to a definition further down. There is no mutual recursion,
+  so put helpers first.
+- Recursion that does not provably descend. Each recursive call or `recur`
+  must pass a strict part of one parameter, under a test on it:
+  - `(rest xs)` or `(next xs)` under `(seq xs)` or `(empty? xs)`, and only
+    on a collection typed finite, which the `ann` provides
+  - `(dec n)` under `(pos? n)`, or `(zero? n)` on a `Nat`
+  - fields from destructuring or `first`/`nth` under a non-nil test,
+    including a `case` on `(first t)`
+
+  Parameters before the shrinking one pass through unchanged, so
+  accumulators go after it.
+- Calls with the wrong arity, and calls to non-fns.
+- Arguments that do not fit a callee's `ann`, or a body that does not fit
+  the fn's own return type.
+
+### Data values
+
+A spec data value is a vector headed by its constructor keyword. Build it
+as a literal and take it apart with `case` on the tag:
+
+```clojure
+(defn insert [x t]
+  (case (first t)
+    :Leaf [:Node [:Leaf] x [:Leaf]]
+    :Node (let [[_ l v r] t]
+            (cond (< x v) [:Node (insert x l) v r]
+                  (> x v) [:Node l v (insert x r)]
+                  :else t))))
 ```
 
-When a test run disagrees with a direct `jolt -e` of the same code, clear the
-AOT cache before debugging the code. That is a known jolt issue, not a writ
-bug.
+The `case` must list every constructor, or carry a default, and name no
+others. A clause destructures only its constructor's fields. A literal
+`[:Node ...]` carries exactly the declared fields, of fitting types. Read
+the tag with `case (first t)` only: `first`, `second` or `nth` of a data
+value anywhere else is rejected.
+
+## Running the check
+
+```clojure
+(require '[writ.spec :as spec])
+(spec/check 'my.sort-spec)                        ; report map
+(spec/check 'my.sort-spec {:seed 42})             ; replay a failure
+(spec/check 'my.sort-spec {:target 'my.sort2})    ; same spec, other impl
+(spec/check! 'my.sort-spec)                       ; throws with the message
+(spec/sample '(List Nat) {} 5)                    ; what a type generates
+(spec/instrument 'my.sort-spec)                   ; runtime arg/return checks
+```
+
+In a test: `(let [r (spec/check 'my.sort-spec)] (is (:ok r) (:message r)))`.
+Other options are `:trials`, the test.check runs per law (default 100), and
+`:max-size`, the largest generated size (default 50).
+
+## Reading a report
+
+`:static` fails first. A static failure is a single `Writ:` message, and no
+law runs until it is fixed. After that, each law has a `:status`:
+
+- `:proved`: shown for every input by writ.norm; nothing was run.
+- `:evaluated`: a law with no quantifiers, run once.
+- `:tested`: passed test.check's trials. This is evidence, not proof.
+- `:witnessed`: an `exists` law, and a value was found.
+- `:failed`: see the message.
+
+```
+law `permutation` fails for
+  x  = 9
+  xs = [9 9]
+  (occurrences x (isort xs)) => 1
+  (occurrences x xs) => 2
+  (shrunk from {x 9, xs [0 6 13 ...]}, failing on test 20)
+  (replay with {:seed 42})
+```
+
+The counterexample is already shrunk. Work out why the implementation
+gives the left-hand value for that input: here, a duplicate is dropped.
+Each line under a predicate law shows what one argument evaluated to. A
+vector in `xs` means the input was a vector: the code must accept any seq.
+While laws run, the target's fns are instrumented, so a line like
+`` `insert` returns (List Nat), but returned ... `` points at the fn that
+produced a badly typed value. After a fix, rerun with the same `:seed` to
+confirm it, then without one.
 
 ## Fixing rejections
 
-- `` `f` is recursive: mark it ^{:writ/descend true} `` - add the attr map, or
-  rewrite without recursion.
+### Spec and law failures
+
+- ``law `x` fails for ...`` - the implementation is wrong for that input;
+  see [Reading a report](#reading-a-report).
+- ``the hypothesis never held in N trials`` - no generated input satisfied
+  the `=>` premise, so the law tested nothing. Tell the spec's owner.
+- ``no witness among N generated values`` - the `exists` law found no
+  value. Either the implementation is wrong, or the witness is too rare to
+  generate.
+- ``cannot generate values of type `T` `` - the law quantifies over a
+  function type or an undeclared name.
+- ``the spec gives `f` a signature, but `ns` defines no fn `f` `` - define
+  `f`, or check its spelling. The spec names the API.
+- ``` `ann f` gives N parameter type(s) but `f` takes M ``` - match the
+  signature. The spec is the contract.
+- ``` `f` is multi-arity; `ann` gives a single signature ``` - write one
+  arity.
+- ``` `f` argument N (x) expects T, got v ``` / ``` `f` returns T, but
+  returned v ``` - an instrumented call saw a value outside the signature.
+- ``cannot find the source of `ns` on the classpath`` - the target file is
+  not under a source path.
+- ``is not a spec namespace`` - the namespace has no `(spec target)` form.
+
+### Tagged data
+
+- ``the `case` on `t` (Tree) does not handle :Leaf`` - add the clause, or a
+  default.
+- ``:Nod is not a constructor of Tree (Leaf, Node)`` - fix the keyword.
+- ``Node takes 3 field(s) but is built with 2`` - build `[:Node l v r]`.
+- ``field N of Node expects T but is given U`` - that field has the wrong
+  value. Check the field order in the `data` declaration.
+- ``field N of C expects a, which field M made T, but is given U`` - a type
+  parameter was given two different types.
+- ``Node has 3 field(s), but `t` is read at position 4`` - destructure at
+  most the tag plus the fields.
+- ``has data type Tree; take it apart with `(case (first t) ...)` `` - read
+  a data value only through a `case` on its tag.
+
+### Structural rules (plain and annotated code)
+
 - ``` `declare`/`defonce`/`defmulti`/`defrecord`/... is not supported in a book ``` -
   a book checks def, defn, data, law and proof forms only; rewrite the value
   as a plain def or defn.
@@ -179,8 +208,8 @@ bug.
   book is never compiled, so writ checks it.
 - ``` `.` / `.foo` is host interop or effect code ``` - pure
   data-and-functions code only; rewrite without interop.
-- ``` `set!` mutates a var ``` - writ checks pure code; an affine value cannot
-  be mutated. Rewrite without mutation.
+- ``` `set!` mutates a var ``` - writ checks pure code. Rewrite without
+  mutation.
 - ``` `recur` in `f` must be in tail position ``` - recur only compiles in
   tail position; move it to the tail or use a named self-call.
 - ``` `recur` in `f` rebinds N value(s) but is passed M ``` - the frame
@@ -268,18 +297,12 @@ bug.
 - ``` a type parameter in `P` must be a simple symbol ``` - `(data P
   [a] ...)` binds type parameters; like any binder they are simple
   symbols, so [1 2], [foo/bar] and [a.b] are rejected.
-- ``` a match arm must be `(pattern result)` ``` - each arm is exactly
-  a pattern and its result; a bare symbol, a 1-element or 3-element arm
-  is a shape error, as is a `match` with no arms at all.
 - ``` Wrong number of args to quote, had: N ``` - quote takes exactly
   one form; jolt evaluates (quote a b) without complaint but the JVM
   compiler rejects it, so writ enforces the JVM contract.
 - ``` cond requires an even number of forms ``` - cond (and cond-> /
   cond->>) takes test/expr pairs; a dangling test with no expr is a
   shape error.
-- ``` `:-` in `f` must be followed by a return type ``` / ``` `:-` in `f`
-  must be followed by a type ``` - a dangling annotation arrow; the type
-  after `:-` is missing, so the annotation would silently vanish.
 - ``` `1` in `f` is not a function ``` - numbers, strings, characters,
   booleans and nil can never be called.
 - ``` `x` in `g` is not a function; a constant defined in this book
@@ -297,9 +320,30 @@ bug.
   of a DIFFERENT parameter does not count.
 - ``shrinks `x` without a guard`` - test the column first: `(if (zero? x) ..)`
   on a Nat, `(pos? x)`, `(seq xs)`, `(empty? xs)`, or a truthiness test.
+  ``must be a finite collection`` means `x` has no finite type: sign the fn
+  with `ann` in the spec.
 - ``refers to itself as a value`` - a self-reference must be a call head.
 - ``argument N before the shrinking one must be passed unchanged`` - reorder
   the parameters so the accumulator rides after the shrinking one.
+- ``takes N type argument(s), got M`` - fix the type's arity.
+- ``expects T for argument N but is passed U`` / ``returns T but its body has
+  type U`` / ``has type T, which is not a function`` - the code disagrees
+  with the types in its `ann` (or annotation). Fix the code, not the `ann`.
+- ``is defined later or is not a known name`` - move the def earlier, or
+  qualify the name.
+### Annotated surface only (writ.defn)
+
+These come from `w/defn`, `w/match`, `w/law` and `w/proof`, which the
+example books use.
+
+- `` `f` is recursive: mark it ^{:writ/descend true} `` - add the attr map, or
+  rewrite without recursion.
+- ``` a match arm must be `(pattern result)` ``` - each arm is exactly
+  a pattern and its result; a bare symbol, a 1-element or 3-element arm
+  is a shape error, as is a `match` with no arms at all.
+- ``` `:-` in `f` must be followed by a return type ``` / ``` `:-` in `f`
+  must be followed by a type ``` - a dangling annotation arrow; the type
+  after `:-` is missing, so the annotation would silently vanish.
 - ``is used more than once but is declared affine`` - add `^:many` to that
   binder. It may be a parameter, a local, or a pattern binder.
 - ``is used once but is declared erased`` - drop `^:zero`, or stop using the
@@ -310,7 +354,6 @@ bug.
 - ``shadows a parameter`` / ``duplicate binder`` - rename the local.
 - ``the scrutinee of a `match` must be a parameter or a pattern binder`` -
   match a bound name, not the computed value.
-- ``takes N type argument(s), got M`` - fix the type's arity.
 - ``is reusable (^:many) but its type is not Data`` - drop `^:many`, or
   instantiate the type at Data arguments.
 - ``is reusable (^:many) but has no type`` / ``no type writ can infer`` -
@@ -319,25 +362,59 @@ bug.
   - mark the captured binder `^:many`, or pass it as an argument.
 - ``destructured into overlapping binders`` - read each key once, or make the
   source `^:many`.
-- ``expects T for argument N but is passed U`` / ``returns T but its body has
-  type U`` / ``has type T, which is not a function`` - the annotation and the
-  code disagree.
 - ``law `x` is not filled: no proof discharges it`` - add the proof.
 - ``discharges no law`` - the proof names a law that is not declared.
 - ``re-proves law`` - delete the duplicate proof, a law is discharged once.
 - ``cites law `x` before it is proved`` - move that proof after `x`'s own
   proof.
 - ``duplicate law name`` - rename one of them.
-- ``is defined later or is not a known name`` - move the def earlier, or
-  qualify the name.
+
+## The annotated surface
+
+`writ.defn` puts the annotations in the code and adds Bend's full
+discipline on top of the rules above. The books in `examples/` are
+written this way, as `main.clj`, `LAWS.clj` and `PROOF.clj` checked
+together by `writ.book/check-files`. They are being ported to spec
+namespaces.
+
+- `(w/defn f [a :- Nat, ^:many b :- Nat] :- Nat body)`: `:-` gives types.
+  An unmarked binder is affine: used at most once, with zero allowed.
+  `^:many` makes it reusable, which requires a Data type. `^:zero` makes it
+  erased, never used. Quantities cover every binder, locals and pattern
+  binders included. Branches join, and sequential uses add.
+- Recursion needs `^{:writ/descend true}` on the defn.
+- Type variables go in the attr-map: `{:writ/forall [a, b :- Data]}`.
+- `w/data` values are `:Nil` or `[:Cons h t]`, and only `w/match` takes
+  them apart. It is exhaustive; a trailing lowercase arm catches the rest.
+  The scrutinee must be a parameter or pattern binder. It also matches
+  `Nat`, `Bool` and `(List T)`.
+- Every `(w/law name prop)` needs exactly one `(w/proof name law term)`.
+  The terms are `refl`, `(pair ..)`, `(fn [x] ..)` and `(witness t pf)`.
+  `refl` needs both sides convertible under writ.norm, which has no
+  induction and does not unfold your own fns. It can only prove identities;
+  checking behaviour is what writ.spec is for.
+
+## In this repo
+
+```sh
+rm -rf ~/.jolt/aot-cache .jolt   # the AOT cache can serve stale namespaces
+jolt -M:test                      # engine suite
+cd examples && jolt -M:test       # every example book
+```
+
+When a test run disagrees with a direct `jolt -e` of the same code, clear the
+AOT cache before debugging. That is a known jolt issue, not a writ bug.
+
+`test/writ/spec_demo/` holds worked specs, a sort and a tree, each with
+broken implementations and the reports they produce.
 
 ## Source map
 
-- `writ.ann` metadata vocabulary, `writ.quant` the quantity lattice
+- `writ.spec` spec namespaces, law checking with test.check, instrument
+- `writ.book` runs every rule over a namespace's forms
+- `writ.check` quantities, termination, ordering, effects, arity
+- `writ.types` types and tagged data, `writ.kind` well-kindedness
 - `writ.lower` the AST, `writ.uses` occurrence analysis
-- `writ.check` quantities, termination, ordering
-- `writ.kind` well-kindedness and the Data/Type lattice, `writ.demand` the
-  erased-in-type rule
-- `writ.match` match discipline, `writ.norm` conversion behind `refl`
-- `writ.law` propositions, proofs and the gate, `writ.book` book orchestration
-- `writ.defn` the surface macros, `writ.core` public entry points
+- `writ.match` `w/match`, `writ.norm` conversion behind `refl`,
+  `writ.law` propositions and the proof gate
+- `writ.defn` the annotated macros, `writ.core` its entry points
