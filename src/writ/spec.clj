@@ -79,7 +79,8 @@
 (defn -register! [spec-ns k v]
   (swap! registry update spec-ns
          (fn [e] (case k
-                   :target {:target v :data [] :anns {} :laws [] :calls [] :machines []}
+                   :target (merge {:target (first v) :data [] :anns {} :laws [] :calls [] :machines []}
+                                  (second v))
                    :data (update e :data conj v)
                    :calls (update e :calls (fnil conj []) v)
                    :machine (update e :machines (fnil conj []) v)
@@ -87,12 +88,34 @@
                    :law (update e :laws conj v))))
   nil)
 
+(def levels
+  "What a law's evidence may be, strongest first.  A law is proved when the
+  prover proves it, when it is closed and evaluates to true, or when an
+  existential has a witness; tested when it only ran on generated inputs."
+  [:proved :tested])
+
+(defn- check-level! [where lv]
+  (when-not (some #{lv} levels)
+    (fail! where ": :require must be :proved or :tested, had: " (pr-str lv))))
+
 (defmacro spec
-  "Name the namespace this spec constrains.  Comes first."
-  [target]
-  (when-not (simple-sym? target)
-    (fail! "`spec` names a namespace symbol, had: `" (pr-str target) "`"))
-  `(-register! '~(ns-name *ns*) :target '~target))
+  "Name the namespace this spec constrains.  Comes first.
+
+    (spec my.sort)                     ; laws may be proved or only tested
+    (spec my.sort {:require :proved})  ; every law must be proved
+
+  Under {:require :proved} a law that is only tested fails the check,
+  unless the law itself says why it cannot be proved yet."
+  ([target] `(spec ~target {}))
+  ([target opts]
+   (when-not (simple-sym? target)
+     (fail! "`spec` names a namespace symbol, had: `" (pr-str target) "`"))
+   (when-not (map? opts)
+     (fail! "`spec " target "` takes an options map after the namespace, had: " (pr-str opts)))
+   (when-let [bad (seq (remove #{:require} (keys opts)))]
+     (fail! "`spec " target "` has unknown options: " (pr-str bad) "; it takes :require"))
+   (when (contains? opts :require) (check-level! (str "`spec " target "`") (:require opts)))
+   `(-register! '~(ns-name *ns*) :target '~[target opts])))
 
 (defmacro data
   "Declare a datatype the target's values use, as writ.defn/data."
@@ -152,12 +175,41 @@
     (fail! "`machine " nm "` has unknown keys: " (pr-str bad)))
   `(-register! '~(ns-name *ns*) :machine '~[nm m]))
 
+(defn- law-opts!
+  "Check a law's options: :require sets the evidence it needs, and
+  :require :tested needs :because, the reason it cannot be proved yet."
+  [nm opts]
+  (let [where (str "`law " nm "`")]
+    (when-let [bad (seq (remove #{:require :because} (keys opts)))]
+      (fail! where " has unknown options: " (pr-str bad) "; it takes :require and :because"))
+    (when (contains? opts :require) (check-level! where (:require opts)))
+    (when (and (= :tested (:require opts)) (not (and (string? (:because opts))
+                                                     (not (str/blank? (:because opts))))))
+      (fail! where " is let off proof with {:require :tested}, so it needs :because, a "
+             "string saying why it cannot be proved yet"))
+    (when (and (contains? opts :because) (not= :tested (:require opts)))
+      (fail! where ": :because goes with :require :tested, the reason a law is only tested"))
+    opts))
+
 (defmacro law
-  "State a law about the target's behaviour."
-  [nm prop]
-  (when-not (simple-sym? nm)
-    (fail! "a `law` name must be a simple symbol: `" (pr-str nm) "`"))
-  `(-register! '~(ns-name *ns*) :law '~{:name nm :prop prop}))
+  "State a law about the target's behaviour.
+
+    (law sorted (forall [xs (List Nat)] (ascending? (isort xs))))
+    (law sorted {:require :proved} (forall ...))   ; this law must be proved
+    (law fast {:require :tested :because \"...\"} (forall ...))
+
+  The options map is optional.  It overrides the spec's :require for this
+  one law; letting a law off proof takes a reason, shown in every report."
+  ([nm prop] `(law ~nm {} ~prop))
+  ([nm opts prop]
+   (when-not (simple-sym? nm)
+     (fail! "a `law` name must be a simple symbol: `" (pr-str nm) "`"))
+   (when-not (map? opts)
+     (fail! "`law " nm "` takes (law name prop) or (law name {options} prop), had a "
+            (pr-str opts) " where the options go"))
+   (law-opts! nm opts)
+   `(-register! '~(ns-name *ns*) :law '~(cond-> {:name nm :prop prop}
+                                          (seq opts) (assoc :opts opts)))))
 
 ;; --- propositions ----------------------------------------------------------
 
@@ -1179,10 +1231,17 @@
 
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
-  [{:keys [ok target spec static laws gaps unspecified rejected calls machines]}]
+  [{:keys [ok target spec static laws gaps unspecified rejected calls machines proof]}]
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
+       (when (and proof (pos? (:laws proof)))
+         (str "\n  " (:proved proof) " of " (:laws proof) " laws proved"
+              (when (= :proved (:require proof)) " (the spec requires proof)")
+              (when-let [ts (seq (filter #(= :test (:evidence %)) laws))]
+                (str "; tested, not proved: " (str/join ", " (map :law ts))))))
        (apply str (for [{l :law p :proof st :status} laws :when (= :proved st)]
                     (str "\n  law `" l "` proved " p)))
+       (apply str (for [{l :law b :because} laws :when b]
+                    (str "\n  law `" l "` is only tested: " b)))
        (when ok
          (apply str (for [{f :fn n :laws imps :rejected} rejected]
                       (str "\n  `" f "`: " n (if (= 1 n) " law, " " laws, ")
@@ -1223,6 +1282,14 @@
                            (if (seq gs) (str "exactly " (str/join ", " gs)) "nothing outside clojure.core")
                            ". Call through the layers the spec names instead of around them."))))
        (apply str (map #(str "\n\n" (format-failure %)) (filter #(= :failed (:status %)) laws)))
+       (apply str (for [{l :law why :unproved st :status need :require} laws :when (= :unproved st)]
+                    (str "\n\nlaw `" l "` is tested, not proved, and the "
+                         (if need "law" "spec") " requires proof"
+                         "\n  the prover: " (or why "no proof found")
+                         "\n  Prove it: state it in terms the prover models, or state the lemma"
+                         "\n  it needs as a law of its own.  If it cannot be proved yet, say why"
+                         "\n  on the law, and every report will show it:"
+                         "\n  (law " l " {:require :tested :because \"...\"} ...)")))
        (apply str (map #(str "\n\nlaw `" (:law %) "` is vacuous: " (:why %)
                              ". A law must say what the code does.")
                        (filter #(= :vacuous (:status %)) laws)))
@@ -1296,13 +1363,39 @@
               (mapv #(dissoc % :unproved-final) rs2)
               (recur [rs2 lemmas2]))))))))
 
+(def ^:private evidence-of
+  {:proved :proof, :evaluated :proof, :witnessed :proof, :tested :test})
+
+(defn- require-evidence
+  "Mark each law with the evidence it got (:proof or :test) and what it
+  needed.  A law that needs proof and was only tested is :unproved."
+  [results laws level]
+  (let [opts (into {} (map (juxt :name :opts)) laws)]
+    (mapv (fn [r]
+            (let [o (get opts (:law r))
+                  need (or (:require o) level)
+                  ev (evidence-of (:status r))
+                  r (cond-> (merge r (select-keys o [:require :because]))
+                      ev (assoc :evidence ev))]
+              (if (and (= :proved need) (= :test ev))
+                (assoc r :status :unproved)
+                r)))
+          results)))
+
+(defn- proof-coverage [results level]
+  {:require level
+   :proved (count (filter #(= :proof (:evidence %)) results))
+   :tested (count (filter #(= :test (:evidence %)) results))
+   :laws (count results)})
+
 (defn check
   "Check a spec namespace against its target (or opts :target).  Returns a
   report map; :ok says whether everything held and :message explains any
   failure.  opts: :target, :trials (test.check runs per law, default 100),
   :seed (default random; each law's report carries the one it used) and
   :max-size (the largest generated size, default 50), :adequacy (false
-  skips the gap check) and :prove (false skips the prover)."
+  skips the gap check), :prove (false skips the prover) and :require
+  (:proved or :tested, in place of the spec's own)."
   ([spec-ns] (check spec-ns {}))
   ([spec-ns opts]
    (let [{:keys [trials seed max-size] :or {trials 100 max-size 50}} opts
@@ -1356,7 +1449,10 @@
                                   {:law name :status :failed :counterexample {} :detail []
                                    :error (or (ex-message ex) (str ex))}))))
                        (finally (unwrap! wrapped)))
-             results (prove-laws results opts target spec-ns tenv anns)
+             level (or (:require opts) (:require e) :tested)
+             _ (check-level! "`check`" level)
+             results (-> (prove-laws results opts target spec-ns tenv anns)
+                         (require-evidence laws level))
              unq (fn unq [f]
                    (cond (and (symbol? f) (contains? #{(name target) (name spec-ns)} (namespace f)))
                          (symbol (name f))
@@ -1383,9 +1479,11 @@
              call-results (check-calls e (book/read-forms (source-url target)))
              machine-results (mapv #(check-machine % e target) (:machines e))
              r (assoc base :laws results :gaps gaps :calls call-results
+                           :proof (proof-coverage results level)
                            :machines (mapv #(dissoc % :shown :step) machine-results)
                            :rejected (mapv #(select-keys % [:fn :laws :rejected]) per-fn)
                            :ok (and sound? (empty? gaps)
+                                    (not-any? #(= :unproved (:status %)) results)
                                     (every? #(= :ok (:status %)) call-results)
                                     (every? #(= :ok (:status %)) machine-results)))]
          (assoc r :message (format-report (assoc r :machines machine-results))))))))

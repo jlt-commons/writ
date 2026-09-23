@@ -22,8 +22,9 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
 
 ## Who owns what
 
-- The spec (`spec`, `ann`, `data`, `law`) is the contract. Usually a person
-  writes it. Do not weaken a law, loosen an `ann`, or delete either to get a
+- The spec (`spec`, `ann`, `data`, `law`) is the contract. A person or an
+  agent may write it; once written, it is the contract. Do not weaken a
+  law, loosen an `ann`, lower a `:require`, or delete any of them to get a
   check to pass. If the spec looks wrong, say so and ask.
 - The implementation is yours. Change it until `check` reports `:ok`.
 - If you are asked to write the spec, write the intent: see
@@ -54,7 +55,8 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
                    (= (occurrences x (insert x xs)) (inc (occurrences x xs)))))
 ```
 
-- `(spec ns)` comes first.
+- `(spec ns)` comes first; `(spec ns {:require :proved})` makes every law
+  need a proof, not just passing tests. Prefer it for new specs.
 - `(ann f [A B -> R])`: the parameter count must match the fn, which has a
   single arity. A private helper that recurses over a collection needs an
   `ann` too, or writ cannot tell the collection is finite.
@@ -254,7 +256,17 @@ law runs until it is fixed. After that, each law has a `:status`:
   A law written with modelled forms and the spec's own helpers is more
   likely to be proved.
 - `:witnessed`: an `exists` law, and a value was found.
+- `:unproved`: the spec (`(spec ns {:require :proved})`) or the law
+  (`{:require :proved}`) requires proof, and the law is only tested. Get
+  it proved: restate it with forms the prover models, or add the lemma it
+  needs as its own law. Only if it truly cannot be proved yet, mark the
+  law `{:require :tested :because "why"}`; the reason shows in every
+  report.
 - `:failed`: see the message.
+
+Each law also has `:evidence`, `:proof` (proved, evaluated, witnessed) or
+`:test`, and the report's `:proof` counts them:
+`{:require :tested :proved 6 :tested 1 :laws 7}`.
 
 A passing report lists, per signed fn, how many laws call it and how many
 stand-ins of each kind they rejected:

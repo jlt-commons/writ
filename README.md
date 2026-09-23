@@ -437,7 +437,9 @@ machine alone pins its step fn down. `(spec/mermaid 'my.spec {:machine
  :spec        my.sort-spec
  :target      my.sort
  :static      {:ok true}
- :laws        [{:law sorted :status :tested :trials 100 :seed 1732 :discarded 0} ...]
+ :laws        [{:law sorted :status :proved :evidence :proof ...}
+               {:law smallest-first :status :tested :evidence :test :trials 100 ...} ...]
+ :proof       {:require :tested :proved 6 :tested 1 :laws 7}
  :gaps        []                ; fns the laws don't pin down
  :rejected    [{:fn isort ...}] ; per fn: its laws and the stand-ins they rejected
  :calls       [{:fn handle :calls [normalize respond] :status :ok} ...]
@@ -466,7 +468,10 @@ It works in three stages, and each runs only if the one before passed.
 
    A tested law has been tested, not proved; the status keeps the two
    apart. A tested law the prover could not prove carries `:unproved`
-   with the reason. While laws run, the target's signed fns are instrumented, so a
+   with the reason. Each law's `:evidence` is `:proof` (proved,
+   evaluated or witnessed) or `:test`, and `:proof` in the report counts
+   them. When the spec requires proof, a law that is only tested gets
+   `:status :unproved` and fails; see [Requiring proof](#requiring-proof). While laws run, the target's signed fns are instrumented, so a
    value of the wrong type fails at the fn that produced it.
 3. **Adequacy.** When every law holds, each signed public fn is swapped for
    stand-ins, and any stand-in that satisfies every law is reported in
@@ -493,7 +498,45 @@ Options: `:target` checks a different implementation against the same spec,
 replays a run (default random, reported per law), and `:max-size` is the
 largest generated size (default 50). `:adequacy false` skips the third
 stage, for example while a spec is still being written, and
-`:prove false` skips the prover.
+`:prove false` skips the prover. `:require` sets the evidence every law
+needs, in place of the spec's own.
+
+### Requiring proof
+
+A tested law has passed some trials; a proved one holds for every input.
+By default a spec accepts either, and the report says which each law got:
+
+```
+writ.spec: my.sort-spec against my.sort: ok
+  6 of 7 laws proved; tested, not proved: smallest-first
+```
+
+A spec can require proof. Then a law that is only tested fails:
+
+```clojure
+(spec my.sort {:require :proved})
+```
+
+```
+law `smallest-first` is tested, not proved, and the spec requires proof
+  the prover: no proof found
+  ...
+```
+
+A single law can ask for more or less than the spec. Letting a law off
+proof takes a reason, and every report shows it, so an unproved law can't
+go unnoticed:
+
+```clojure
+(law sorted {:require :proved} ...)                      ; in a spec that allows tests
+(law smallest-first
+  {:require :tested :because "the prover has no model of min over a list yet"}
+  (forall [xs (List Nat)] ...))
+```
+
+A closed law that evaluates to true, and an `exists` law with a witness,
+count as proved: running pure, terminating code on fixed inputs decides
+them.
 
 ### Proofs
 
