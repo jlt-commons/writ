@@ -27,7 +27,6 @@
     (is (:ok r) (:message r))
     (is (= 'writ.spec-demo.sort (:target r)))
     (testing "each law says how it was discharged"
-      (is (= :proved (:status (law-result r 'add-zero))))
       (is (= :evaluated (:status (law-result r 'insert-empty))))
       (is (= :tested (:status (law-result r 'sorted))))
       (is (= :tested (:status (law-result r 'permutation))))
@@ -37,7 +36,9 @@
       (is (= 100 (:trials (law-result r 'sorted))))
       (is (integer? (:seed (law-result r 'sorted)))))
     (testing "a witness is shrunk to the simplest one"
-      (is (= {'xs ()} (:witness (law-result r 'has-fixed-point)))))))
+      (is (= {'xs ()} (:witness (law-result r 'has-fixed-point)))))
+    (testing "the spec pins down every fn it signs"
+      (is (= [] (:gaps r))))))
 
 (deftest trials-is-the-number-of-tests
   (let [r (spec/check spec-ns {:trials 300})]
@@ -273,3 +274,49 @@
     (is (re-find #"`p`: field 2 of MkPair expects a, which field 1 made Nat, but is given String"
                  (tagged-err '[(data Pair [a] (MkPair a a))
                                (defn p [] [:MkPair 1 "x"])])))))
+
+;; --- the spec must say what the code means --------------------------------
+
+(deftest a-law-true-of-any-implementation-is-vacuous
+  (let [r (spec/check 'writ.spec-demo.sort-vacuous-spec {:seed 42})
+        st #(:status (law-result r %))]
+    (is (not (:ok r)))
+    (testing "a law writ.norm proves without the code"
+      (is (= :vacuous (st 'sort-refl)))
+      (is (re-find #"law `sort-refl` is vacuous: writ.norm proves it without looking at the implementation"
+                   (:message r))))
+    (testing "a law that never calls the code"
+      (is (= :vacuous (st 'add-zero)))
+      (is (= :vacuous (st 'count-self)))
+      (is (re-find #"law `add-zero` is vacuous: it calls no fn of writ.spec-demo.sort"
+                   (:message r))))
+    (testing "a law about the code still runs"
+      (is (= :tested (st 'sorted))))))
+
+(deftest a-spec-that-does-not-pin-a-fn-down-has-gaps
+  (let [r (spec/check 'writ.spec-demo.sort-weak-spec {:seed 42})
+        gap-fns (set (map :fn (:gaps r)))]
+    (is (every? #(= :tested (:status %)) (:laws r)) "every law holds")
+    (is (not (:ok r)) "but the spec is too weak to mean anything")
+    (is (contains? gap-fns 'isort))
+    (testing "the report names the impostor that satisfied every law"
+      (is (re-find #"the spec does not pin down `isort`: every law still holds when it always returns"
+                   (:message r))))))
+
+(deftest adequacy-can-be-skipped
+  (is (:ok (spec/check 'writ.spec-demo.sort-weak-spec {:seed 42 :adequacy false}))))
+
+(deftest impostors-are-well-typed
+  (let [ms (spec/impostors 'isort {:params '[(List Nat)] :ret '(List Nat)} '[xs] {} 42)]
+    (is (some #(= "returns its argument `xs` unchanged" (:desc %)) ms))
+    (is (some #(re-find #"^always returns" (:desc %)) ms))
+    (is (some #(re-find #"reversed" (:desc %)) ms))
+    (doseq [m ms]
+      (is (spec/conforms? '(List Nat) (((:make m) (fn [xs] (sort xs))) [3 1 2]) {})
+          (:desc m)))))
+
+(deftest the-tree-spec-pins-down-its-fns
+  (let [r (spec/check tree-spec {:seed 42})]
+    (is (:ok r) (:message r))
+    (is (= [] (:gaps r)))
+    (is (= :tested (:status (law-result r 'holds-a-sorted-set))))))

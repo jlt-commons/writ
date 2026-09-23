@@ -9,11 +9,15 @@
     (ann isort [(List Nat) -> (List Nat)])       ; a public fn's signature
     (law sorted (forall [xs (List Nat)] (ascending? (isort xs))))
 
-  The implementation is plain Clojure and never mentions writ.  `check`
-  reads its source and runs writ's static rules over it with the types the
-  spec gives, then discharges each law:
+  A spec is the problem statement: the laws say what the code means, in
+  the spec's own terms, not how it works.  The implementation is plain
+  Clojure and never mentions writ.  `check` reads its source and runs
+  writ's static rules over it with the types the spec gives, then checks
+  the spec itself and each law:
 
-  * proved     -- writ.norm shows it for every input (no code is run)
+  * vacuous    -- the law holds whatever the code does (writ.norm proves it
+                  without the code, or it calls no target fn): it fails,
+                  because it says nothing about the code
   * evaluated  -- a closed law, decided by running the code once
   * tested     -- a universal law, run by test.check against inputs generated
                   from the binders' types; a failure is shrunk to the
@@ -21,6 +25,12 @@
   * witnessed  -- an existential, with the generated value that satisfies it
 
   Tested is not proved: the report says which one each law got.
+
+  When every law holds, `check` asks whether the laws pin the code down:
+  each signed public fn is swapped for well-typed impostors (a constant,
+  an argument passed through, the real result perturbed), and an impostor
+  that still satisfies every law is a gap in the spec.
+
   `instrument` wraps the target's fns with the signatures' runtime checks."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
@@ -326,6 +336,12 @@
               :else f))]
     (walk form bound)))
 
+(defn- calls-target?
+  "Does a qualified law mention any fn of the target namespace?"
+  [qp target]
+  (boolean (some #(and (symbol? %) (= (name target) (namespace %)))
+                 (tree-seq coll? seq qp))))
+
 (defn- evaluator
   "Compile and cache term fns: (ev vars term env) runs `term` with the
   variables bound from env."
@@ -463,6 +479,79 @@
           :else
           {:law name :status :tested :trials (:num-tests res) :seed (:seed res)
            :discarded @discards})))))
+
+;; --- adequacy: does the spec pin the code down? ------------------------------
+
+(defn impostors
+  "Well-typed stand-ins for fn `nm` with signature `sig`: {:desc :make},
+  where (make real-fn) is the impostor.  Constants of the return type,
+  each argument of the return type passed through, and the real result
+  perturbed.  A spec that means something rejects every one of them."
+  [nm sig argn tenv seed]
+  (let [ret (plain (:ret sig))
+        g (type->gen ret tenv)
+        consts (distinct [(gen/generate g 0 seed) (gen/generate g 5 (inc seed))])
+        wrap (fn [desc f] {:desc desc :make (fn [real] (fn [& args] (f (apply real args))))})]
+    (concat
+      (for [v consts]
+        {:desc (str "always returns " (pr-str v)) :make (fn [_] (fn [& _] v))})
+      (keep-indexed (fn [i t]
+                      (when (= (plain t) ret)
+                        {:desc (str "returns its argument `" (nth argn i (str "arg" i)) "` unchanged")
+                         :make (fn [_] (fn [& args] (nth args i)))}))
+                    (:params sig))
+      (let [h (if (seq? ret) (first ret) ret)]
+        (case h
+          (Nat Int) [(wrap "returns one more than the real result" inc)]
+          Bool [(wrap "returns the opposite of the real result" not)]
+          String [(wrap "returns the real result with a character appended" #(str % "x"))]
+          List [(wrap "returns the real result reversed" reverse)
+                (wrap "returns the real result without its first element" rest)]
+          Vec [(wrap "returns the real result reversed" #(vec (reverse %)))
+               (wrap "returns the real result without its first element" #(vec (rest %)))]
+          [])))))
+
+(declare leading-foralls holds)
+
+(defn- holds-sampled?
+  "Does `prop` hold on `n` deterministic samples?  Existentials never
+  reject an impostor; a law's own failure is what adequacy looks for."
+  [ctx prop n seed]
+  (let [[bs body] (leading-foralls prop)]
+    (cond
+      (and (empty? bs) (not (quant? body)))
+      (not= :fail (:result (holds (assoc ctx :vars []) body {})))
+
+      (empty? bs) true
+
+      :else
+      (let [vars (mapv first bs)
+            ctx* (assoc ctx :vars vars)
+            gens (mapv #(type->gen (second %) (:tenv ctx)) bs)]
+        (every? (fn [i]
+                  (not= :fail (:result (holds ctx* body
+                                              (zipmap vars (map #(gen/generate % (mod i 30) (+ seed i))
+                                                                gens))))))
+                (range n))))))
+
+(defn- adequacy
+  "Swap each signed public fn for its impostors, one at a time, and run
+  every law against each.  Returns the gaps: [{:fn f :survivors [desc]}]."
+  [ctx target fns anns props trials seed]
+  (vec (for [nm fns
+             :let [v (ns-resolve (the-ns target) nm)
+                   real @v
+                   sig (get anns nm)
+                   argn (vec (take (count (:params sig)) (first (:arglists (meta v)))))
+                   survivors (vec (for [imp (impostors nm sig argn (:tenv ctx) seed)
+                                        :when (try
+                                                (alter-var-root v (constantly ((:make imp) real)))
+                                                (every? #(holds-sampled? ctx % trials seed) props)
+                                                (catch Throwable _ false)
+                                                (finally (alter-var-root v (constantly real))))]
+                                    (:desc imp)))]
+             :when (seq survivors)]
+         {:fn nm :survivors survivors})))
 
 ;; --- the target's source -----------------------------------------------------
 
@@ -624,10 +713,20 @@
 
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
-  [{:keys [ok target spec static laws unspecified]}]
+  [{:keys [ok target spec static laws gaps unspecified]}]
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
        (when-not (:ok static) (str "\n\n" (:error static)))
        (apply str (map #(str "\n\n" (format-failure %)) (filter #(= :failed (:status %)) laws)))
+       (apply str (map #(str "\n\nlaw `" (:law %) "` is vacuous: " (:why %)
+                             ". A law must say what the code does.")
+                       (filter #(= :vacuous (:status %)) laws)))
+       (apply str (map (fn [{f :fn [s & more] :survivors}]
+                         (str "\n\nthe spec does not pin down `" f "`: every law still holds when it "
+                              s
+                              (when (seq more)
+                                (apply str (map #(str "\n  or when it " %) more)))
+                              "\n  State what `" f "` must do, so that a law rejects this."))
+                       gaps))
        (when (seq unspecified)
          (str "\n\nnot in the spec (no signature): " (str/join ", " unspecified)))))
 
@@ -636,7 +735,8 @@
   report map; :ok says whether everything held and :message explains any
   failure.  opts: :target, :trials (test.check runs per law, default 100),
   :seed (default random; each law's report carries the one it used) and
-  :max-size (the largest generated size, default 50)."
+  :max-size (the largest generated size, default 50) and :adequacy (false
+  skips the gap check)."
   ([spec-ns] (check spec-ns {}))
   ([spec-ns opts]
    (let [{:keys [trials seed max-size] :or {trials 100 max-size 50}} opts
@@ -649,7 +749,7 @@
                                               :when (and (not private?) (not (contains? anns nm)))]
                                           nm)))}]
      (if-not (:ok static)
-       (let [r (assoc base :ok false :laws [])]
+       (let [r (assoc base :ok false :laws [] :gaps [])]
          (assoc r :message (format-report r)))
        (let [tenv (tenv-of data)
              publics (set (keys (ns-publics (the-ns target))))
@@ -668,11 +768,21 @@
                                   :let [p (desugar prop)]]
                               (try
                                 (lw/check-prop-shape! p)
-                                (if (try-prove p tenv opaque numeric-fns)
-                                  {:law name :status :proved}
-                                  (test-law ctx {:name name
-                                                 :prop (qualify p #{} publics interns target spec-ns)}
-                                            {:trials trials :seed seed :max-size max-size}))
+                                (let [qp (qualify p #{} publics interns target spec-ns)]
+                                  (cond
+                                    (not (calls-target? qp target))
+                                    {:law name :status :vacuous
+                                     :why (str "it calls no fn of " target)}
+
+                                    (try-prove p tenv opaque numeric-fns)
+                                    {:law name :status :vacuous
+                                     :why (str "writ.norm proves it without looking at the "
+                                               "implementation, so any code satisfies it")}
+
+                                    :else
+                                    (assoc (test-law ctx {:name name :prop qp}
+                                                     {:trials trials :seed seed :max-size max-size})
+                                           :prop qp)))
                                 ;; a law that cannot be run (a malformed
                                 ;; proposition, a type with no generator)
                                 ;; fails with the reason, not the whole check
@@ -690,8 +800,15 @@
                                      (update r :detail (fn [d] (mapv (fn [[t v]] [(unq t) v]) d)))
                                      r))
                            results)
-             r (assoc base :laws results
-                           :ok (not-any? #(= :failed (:status %)) results))]
+             sound? (not-any? #(contains? #{:failed :vacuous} (:status %)) results)
+             gaps (if (and sound? (not= false (:adequacy opts)))
+                    (adequacy ctx target
+                              (sort (filter #(contains? publics %) (keys anns)))
+                              anns (keep :prop results) trials (or seed 42))
+                    [])
+             results (mapv #(dissoc % :prop) results)
+             r (assoc base :laws results :gaps gaps
+                           :ok (and sound? (empty? gaps)))]
          (assoc r :message (format-report r)))))))
 
 (defn check!

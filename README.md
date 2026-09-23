@@ -1,15 +1,22 @@
 # writ
 
-writ checks plain Clojure against a contract that lives beside it. The code
-never mentions writ. A separate spec namespace gives the public functions
-their signatures and states laws about how they behave, and writ tells you
-exactly where the code breaks them.
+writ checks plain Clojure against a spec of what the code is for. The spec
+is the problem statement written so a machine can check it: signatures for
+the public functions, and laws that say what their results mean. It lives
+in its own namespace, and the code never mentions writ.
 
-It is built for code an LLM writes. A person writes the spec: what the API
-is and what must hold of it. The agent writes the implementation. writ is
-the gate between them, and its report says what to fix: the rule that was
-broken, or the law that failed, the smallest input that fails it, and the
-value each side produced.
+It is built for code an LLM writes. A person writes the spec, which is the
+intent. The agent writes the implementation. writ is the gate between
+them. Its report says what to fix: the rule that was broken, or the law
+that failed, the smallest input that fails it, and the value each side
+produced.
+
+A spec is not a test suite. Tests pin down examples: this input gives that
+output. A spec states what must hold for every input: the output is
+ordered, and it has the same elements as the input. That is the meaning of
+a sort, not a sample of it. writ also checks the spec itself. It rejects a
+law that any implementation would satisfy, and it reports a function the
+laws don't pin down, naming a trivial stand-in that would pass.
 
 The static rules come from [Bend](https://github.com/HigherOrderCO/Bend):
 pure code only, recursion that provably terminates, definitions in order,
@@ -28,7 +35,7 @@ test/my/sort_test.clj     runs the check
 ```
 
 1. Write the spec. It names the namespace it constrains, signs the public
-   fns and states the laws. This is the part a person owns.
+   fns and states what they mean. This is the part a person owns.
 2. The agent writes the implementation as ordinary Clojure.
 3. Run the check. If it fails, hand the report back to the agent and repeat.
 4. Keep the check in the test suite, so it gates every change.
@@ -52,11 +59,6 @@ The implementation:
 ```clojure
 (ns my.sort)
 
-(defn occurrences [x xs]
-  (if (seq xs)
-    (+ (if (= x (first xs)) 1 0) (occurrences x (rest xs)))
-    0))
-
 (defn insert [x xs]
   (if (seq xs)
     (if (<= x (first xs))
@@ -78,17 +80,27 @@ The spec:
 
 (spec my.sort)
 
-(ann occurrences [Nat (List Nat) -> Nat])
 (ann insert      [Nat (List Nat) -> (List Nat)])
 (ann isort       [(List Nat) -> (List Nat)])
 
 (defn ascending? [xs]
   (or (empty? xs) (apply <= xs)))
 
-(law sorted      (forall [xs (List Nat)] (ascending? (isort xs))))
+(defn occurrences [x xs]
+  (count (filter #(= x %) xs)))
+
+;; a sort puts its input in order...
+(law sorted (forall [xs (List Nat)] (ascending? (isort xs))))
+
+;; ...and keeps every element, duplicates included
 (law permutation (forall [x Nat, xs (List Nat)]
                    (= (occurrences x (isort xs)) (occurrences x xs))))
-(law insert-empty (= (insert 3 ()) (list 3)))
+
+;; insert keeps an ordered list ordered, and adds exactly one x
+(law insert-keeps-sorted (forall [x Nat, xs (List Nat)]
+                           (=> (ascending? xs) (ascending? (insert x xs)))))
+(law insert-adds (forall [x Nat, xs (List Nat)]
+                   (= (occurrences x (insert x xs)) (inc (occurrences x xs)))))
 ```
 
 The check:
@@ -124,6 +136,62 @@ Writ: recursive call to `isort` does not descend: no argument is a
 structurally smaller part of its own parameter (destructure it, or use
 dec/rest/next of it under a test)
 ```
+
+## What a spec should say
+
+Start from the problem, not the code. Ask what makes an answer right, and
+write that down in the problem's own terms.
+
+- **Characterise the result.** A sort's output is ordered and is a
+  permutation of its input. Together those two laws are the whole meaning
+  of sorting, and nothing else satisfies both.
+- **Compare with a model.** When there is an obvious reference, say the
+  code agrees with it: a search tree built from `xs` lists
+  `(sort (distinct xs))`. The model can be slow or naive, because it only
+  runs in the check.
+- **Relate operations.** Say what the pieces do together: decoding an
+  encoded value gives the value back, `insert` adds exactly one element,
+  `pop` undoes `push`.
+- **Keep invariants.** Say what every operation preserves: an ordered list
+  stays ordered, a balanced tree stays balanced.
+- **Use the spec's own vocabulary.** Measure results with helpers defined
+  in the spec (`ascending?`, `occurrences`), never with the
+  implementation's fns. A law that checks the code with the code is
+  circular: if both are wrong in the same way, it still passes.
+
+What a spec should not be:
+
+- A list of examples. A law with no quantifier is fine as an anchor, but
+  on its own it is only a test.
+- A restatement of the types. `ann` already covers those.
+- A restatement of the code, or a law that is true of anything. writ
+  rejects these as vacuous.
+
+writ enforces the last two points in the check:
+
+- **Vacuous laws fail.** A law that calls no function of the target, or
+  that `writ.norm` proves without looking at the implementation, holds for
+  any code, so it says nothing about this code. Examples are
+  `(= (isort xs) (isort xs))` and `(= (+ n 0) n)`.
+- **Gaps fail.** Once every law holds, writ swaps each signed public
+  function for well-typed stand-ins: a constant, an argument passed
+  through, and the real result perturbed (reversed, missing its first
+  element, one more). If some stand-in still satisfies every law, the spec
+  does not pin that function down, and the report says which stand-in got
+  through:
+
+```
+the spec does not pin down `isort`: every law still holds when it always returns ()
+  or when it returns the real result without its first element
+  State what `isort` must do, so that a law rejects this.
+```
+
+That report is what a spec with only the `sorted` law produces. Adding
+`permutation` closes both gaps.
+
+The stand-ins are a fixed family, so a spec that rejects them all can still
+be too weak. Passing this check is necessary for a good spec, not
+sufficient.
 
 ## Writing a spec
 
@@ -199,19 +267,19 @@ the spec's own helpers, then to `clojure.core`.
  :target      my.sort
  :static      {:ok true}
  :laws        [{:law sorted :status :tested :trials 100 :seed 1732 :discarded 0} ...]
+ :gaps        []                ; fns the laws don't pin down
  :unspecified []                ; public fns with no ann
  :message     "writ.spec: my.sort-spec against my.sort: ok"}
 ```
 
-It works in two stages.
+It works in three stages, and each runs only if the one before passed.
 
 1. **Static.** writ reads the target's source from the classpath, puts the
    `ann` types on its `defn`s and checks it (see below). If this fails,
    `:static` carries the error and no law runs.
-2. **Laws.** Each law is discharged one of four ways, and `:status` says
-   which:
-   - `:proved`: `writ.norm` shows it holds for every input, without
-     running anything. This covers identities such as `(+ n 0)` = `n`.
+2. **Laws.** Each law gets a `:status`:
+   - `:vacuous`: it holds whatever the code does, so it fails; see
+     [What a spec should say](#what-a-spec-should-say).
    - `:evaluated`: a law with no quantifiers, decided by running it once.
    - `:tested`: a `forall`, run by test.check on generated inputs. A
      failure is shrunk to a small counterexample.
@@ -221,11 +289,15 @@ It works in two stages.
    A tested law has been tested, not proved; the status keeps the two
    apart. While laws run, the target's signed fns are instrumented, so a
    value of the wrong type fails at the fn that produced it.
+3. **Adequacy.** When every law holds, each signed public fn is swapped for
+   stand-ins, and any stand-in that satisfies every law is reported in
+   `:gaps`. See [What a spec should say](#what-a-spec-should-say).
 
 Options: `:target` checks a different implementation against the same spec,
 `:trials` is the number of test.check runs per law (default 100), `:seed`
 replays a run (default random, reported per law), and `:max-size` is the
-largest generated size (default 50).
+largest generated size (default 50). `:adequacy false` skips the third
+stage, for example while a spec is still being written.
 
 `check!` does the same but throws with the message when anything fails.
 `(spec/instrument 'my.sort-spec)` wraps the target's signed fns with runtime

@@ -1,23 +1,23 @@
 ---
 name: writ
 description: >-
-  Use when writing or fixing Clojure checked by writ -- a spec namespace
-  (writ.spec: spec/ann/data/law) and the plain implementation it constrains --
-  or when reading a writ.spec report or any "Writ:" error (purity,
-  termination, ordering, arity, types, tagged data, failing laws). Also for
-  the annotated writ.defn surface (w/defn, ^:many, w/match, w/law, w/proof)
-  used by the example books.
+  Use when writing a writ spec -- the problem statement as checkable laws
+  about what code means (writ.spec: spec/ann/data/law) -- or the plain Clojure
+  implementation it constrains, or when reading a writ.spec report or any
+  "Writ:" error (purity, termination, ordering, arity, types, tagged data,
+  failing, vacuous or gapped laws). Also for the annotated writ.defn surface
+  (w/defn, ^:many, w/match, w/law, w/proof) used by the example books.
 ---
 
 # writ
 
-writ checks plain Clojure against a contract that lives beside it. The
-implementation never mentions writ. A spec namespace names it, signs its
-public fns with types and states laws about their behaviour.
-`(writ.spec/check 'my.spec)` runs Bend's static rules over the
-implementation's source using those types, then runs the laws. It returns
-a report that names what is wrong. writ runs on jolt; writ.spec uses
-test.check.
+writ checks plain Clojure against a spec of what the code is for. A spec
+namespace is the problem statement in checkable form: it signs the public
+fns and states laws about what their results mean. The implementation never
+mentions writ. `(writ.spec/check 'my.spec)` runs Bend's static rules over
+the implementation's source using those types, runs the laws, and then
+checks that the laws actually pin the code down. It returns a report that
+names what is wrong. writ runs on jolt; writ.spec uses test.check.
 
 ## Who owns what
 
@@ -25,6 +25,8 @@ test.check.
   writes it. Do not weaken a law, loosen an `ann`, or delete either to get a
   check to pass. If the spec looks wrong, say so and ask.
 - The implementation is yours. Change it until `check` reports `:ok`.
+- If you are asked to write the spec, write the intent: see
+  [What a spec should say](#what-a-spec-should-say).
 - A report that fails is the next thing to fix. Read the whole message: it
   names the rule or law, the input, and the values.
 
@@ -39,10 +41,16 @@ test.check.
 (ann insert [Nat (List Nat) -> (List Nat)])      ; one per public fn
 (ann isort  [(List Nat) -> (List Nat)])
 
-(defn ascending? [xs] (or (empty? xs) (apply <= xs)))   ; spec-side helper
+(defn ascending? [xs] (or (empty? xs) (apply <= xs)))   ; the spec's own
+(defn occurrences [x xs] (count (filter #(= x %) xs)))  ; vocabulary
 
-(law sorted (forall [xs (List Nat)] (ascending? (isort xs))))
-(law insert-empty (= (insert 3 ()) (list 3)))
+(law sorted      (forall [xs (List Nat)] (ascending? (isort xs))))
+(law permutation (forall [x Nat, xs (List Nat)]
+                   (= (occurrences x (isort xs)) (occurrences x xs))))
+(law insert-keeps-sorted (forall [x Nat, xs (List Nat)]
+                           (=> (ascending? xs) (ascending? (insert x xs)))))
+(law insert-adds (forall [x Nat, xs (List Nat)]
+                   (= (occurrences x (insert x xs)) (inc (occurrences x xs)))))
 ```
 
 - `(spec ns)` comes first.
@@ -65,6 +73,39 @@ test.check.
   A free name refers first to the target's public fns, then to the spec's
   helpers, then to clojure.core. Laws cannot quantify over fn types,
   because no generator exists for them.
+
+## What a spec should say
+
+A spec says what makes an answer right, in the problem's terms, for every
+input. It is not a set of examples (that is a test) and not a description
+of the algorithm (that is the code).
+
+- **Characterise the result.** For a sort: the output is ordered and is a
+  permutation of the input. Nothing else satisfies both.
+- **Compare with a model.** Where a simple reference exists, say the code
+  agrees with it: `(= (to-list (build xs)) (sort (distinct xs)))`. The
+  model may be slow; it only runs in the check.
+- **Relate operations.** Round trips (`decode` after `encode`), inverses
+  (`pop` after `push`), and exact effects (`insert` adds one `x`).
+- **Keep invariants.** Say what every operation preserves.
+- **Measure with the spec's own helpers.** Never use the implementation's
+  fns to judge its results. A law that checks the code with the code is
+  circular.
+
+writ rejects a spec that does not do this:
+
+- A law is `:vacuous`, and fails, when it calls no fn of the target or
+  when writ.norm proves it without the code. `(= (isort xs) (isort xs))`
+  and `(= (+ n 0) n)` are vacuous. Rewrite it to say what the code does.
+- A **gap** is reported when every law holds but a trivial stand-in for a
+  signed public fn would also satisfy them all. The stand-ins are a
+  constant, an argument passed through, and the real result reversed,
+  missing its first element, or plus one. The fix is a law that the
+  stand-in breaks, and that states intent: add `permutation` so that
+  "always returns ()" fails. Never special-case the stand-in in the code.
+
+Rejecting every stand-in is necessary, not sufficient. Still ask whether
+the laws say everything the problem statement says.
 
 ## The implementation
 
@@ -125,15 +166,16 @@ value anywhere else is rejected.
 ```
 
 In a test: `(let [r (spec/check 'my.sort-spec)] (is (:ok r) (:message r)))`.
-Other options are `:trials`, the test.check runs per law (default 100), and
-`:max-size`, the largest generated size (default 50).
+Other options are `:trials`, the test.check runs per law (default 100),
+`:max-size`, the largest generated size (default 50), and
+`:adequacy false`, which skips the gap check while a spec is being drafted.
 
 ## Reading a report
 
 `:static` fails first. A static failure is a single `Writ:` message, and no
 law runs until it is fixed. After that, each law has a `:status`:
 
-- `:proved`: shown for every input by writ.norm; nothing was run.
+- `:vacuous`: true of any implementation; the spec must change.
 - `:evaluated`: a law with no quantifiers, run once.
 - `:tested`: passed test.check's trials. This is evidence, not proof.
 - `:witnessed`: an `exists` law, and a value was found.
@@ -162,6 +204,13 @@ confirm it, then without one.
 
 ### Spec and law failures
 
+- ``law `x` is vacuous: it calls no fn of ns`` / ``writ.norm proves it
+  without looking at the implementation`` - the law is true of any code.
+  Restate it as a claim about what the target's fns return.
+- ``the spec does not pin down `f`: every law still holds when it ...`` -
+  the named stand-in satisfies the spec. Add a law about `f`'s meaning
+  that the stand-in breaks. If you own only the implementation, report the
+  gap to the spec's owner; the code is not at fault.
 - ``law `x` fails for ...`` - the implementation is wrong for that input;
   see [Reading a report](#reading-a-report).
 - ``the hypothesis never held in N trials`` - no generated input satisfied
