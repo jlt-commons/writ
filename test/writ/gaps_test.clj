@@ -2047,6 +2047,13 @@
   (is (nil? (err-msg '(defn g {:writ/descend true} [^:many ^Nat a b]
                         (if (zero? a) b (g (dec a) (inc b))))))))
 
+;; An accumulator ahead of the shrinking column is the usual cause, and the
+;; fix is to reorder, so the message says so.
+(deftest descent-order-error-names-the-reorder
+  (is (re-find #"recursive call to `f` does not descend: argument 1 .*put `b` first in the parameters"
+               (err-msg '(defn f {:writ/descend true} [a ^:many ^Nat b]
+                           (if (zero? b) a (f (inc a) (dec b))))))))
+
 ;; --- G93: a shrink needs a guard on its column (Nat or pos?) ----------------
 ;;
 ;; Bend: a column shrinks only in a match arm that refined it

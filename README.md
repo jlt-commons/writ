@@ -421,7 +421,7 @@ cannot be checked:
   shout (private): `.toUpperCase` is host interop or effect code; writ checks pure data-and-functions code only
   log!: `println` in `log!` is effect code (...); writ checks pure data-and-functions code only
   loud-classify: it uses `shout`, which writ cannot check
-  Conn (defrecord): `defrecord` is not supported in a book; ...
+  Conn (defrecord): `defrecord` is not supported: in the code a spec covers, writ checks def and defn forms only (...)
 ```
 
 The report map has the same in `:forms`, one entry per form with
@@ -438,10 +438,12 @@ them. `(spec/sample '(List Nat) {} 5)` shows what a type generates.
 
 These rules apply to the plain implementation.
 
-- **Pure code.** No host interop (`throw`, `new`, `.foo`, `reify`), no
-  effects (I/O, atoms and refs, futures, `eval`, var mutation,
-  randomness), no reflection. Calls into other namespaces pass through
-  unchecked.
+- **Pure code.** No host interop (`throw`, `new`, `.foo`, `reify`, static
+  members such as `System/getenv` or `Math/abs`), no effects (I/O, atoms
+  and refs, futures, `eval`, var mutation, randomness), no reflection.
+  Calls into other namespaces pass through unchecked. writ reads source
+  without loading it, so a qualified name whose qualifier ends in a
+  capitalised segment is taken to be a class.
 - **Top-level forms.** Only `ns`, `comment`, `def` and `defn`. A
   `defmulti`, `defrecord`, `defmacro` or bare expression is rejected
   rather than skipped. Each fn has a single arity.
@@ -456,9 +458,12 @@ These rules apply to the plain implementation.
     value to be non-nil. A truthiness test works, and so does a `case` on
     `(first t)`
 
-  Parameters before the shrinking one pass through unchanged. `rest` only
-  shrinks a collection writ knows is finite, which is one reason to sign
-  the fn.
+  Parameters before the shrinking one pass through unchanged, so an
+  accumulator goes after the collection it walks, in the parameters or
+  the `loop` bindings. `rest` only shrinks a collection writ knows is
+  finite, which is one reason to sign the fn. The loops that `doseq` and
+  similar macros expand to are checked the same way, and the error names
+  the collection they walk.
 - **Arity and calls.** Every call matches its fn's arity, including
   `clojure.core` fns, and nothing that is not a fn is called.
 - **Types.** Arguments fit the signed parameter types, and the body fits

@@ -118,7 +118,8 @@ the laws say everything the problem statement says.
 Plain Clojure, with no writ require and no annotations. writ rejects:
 
 - Effects and interop: I/O, atoms and refs, futures, `eval`, `throw`,
-  `new`, `.method`, `reify`, reflection.
+  `new`, `.method`, `reify`, static members such as `System/getenv` or
+  `Math/abs` (use `abs`), reflection.
 - Top-level forms other than `ns`, `comment`, `def` and `defn`: no
   `defmulti`, `defrecord`, `defmacro`, `declare` or bare expressions.
   Each fn has one arity.
@@ -133,7 +134,9 @@ Plain Clojure, with no writ require and no annotations. writ rejects:
     including a `case` on `(first t)`
 
   Parameters before the shrinking one pass through unchanged, so
-  accumulators go after it.
+  accumulators go after it, in the parameters and in `loop` bindings.
+  `doseq` and `for` expand to such loops; their collection needs a type
+  too.
 - Calls with the wrong arity, and calls to non-fns.
 - Arguments that do not fit a callee's `ann`, or a body that does not fit
   the fn's own return type.
@@ -401,8 +404,16 @@ confirm it, then without one.
   ``must be a finite collection`` means `x` has no finite type: sign the fn
   with `ann` in the spec.
 - ``refers to itself as a value`` - a self-reference must be a call head.
-- ``argument N before the shrinking one must be passed unchanged`` - reorder
-  the parameters so the accumulator rides after the shrinking one.
+- ``argument N before the shrinking one must be passed unchanged; put `xs`
+  first in the parameters`` (or ``the `loop` bindings``) - do what it says:
+  the accumulator rides after the shrinking one.
+- ``a macro's loop in `f`, such as a `doseq`, does not descend`` - the loop
+  is the macro's, not yours; the message names the collection it walks.
+  Usually that collection needs a finite type from `ann`.
+- ``is not supported: in the code a spec covers, writ checks def and defn
+  forms only`` - `defrecord`, `defmacro`, `defmulti` and the like cannot sit
+  in the target; `scan` lists them. Move them out, or leave that namespace
+  unspecified.
 - ``takes N type argument(s), got M`` - fix the type's arity.
 - ``expects T for argument N but is passed U`` / ``returns T but its body has
   type U`` / ``has type T, which is not a function`` - the code disagrees
