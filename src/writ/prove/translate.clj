@@ -14,13 +14,13 @@
 (def core-fns
   "The clojure.core fns the prover models."
   '#{seq first rest next second empty? count cons list vector vec concat
-     filter map not = < <= > >= + - * inc dec zero? pos? neg? nth identity apply
-     reduce integer?})
+     filter map not = not= < <= > >= + - * inc dec zero? pos? neg? nth identity apply
+     reduce integer? max min abs every? some quot mod rem contains? boolean})
 
 (def value-fns
   "The clojure.core fns that may be passed as values: the modelled ones,
   and pure predicates the prover keeps opaque."
-  (into core-fns '#{odd? even? max min not= nil? some? true? false?}))
+  (into core-fns '#{odd? even? nil? some? true? false?}))
 
 (defn outside!
   "Signal a form the prover does not model."
@@ -28,6 +28,36 @@
   (throw (ex-info (str "outside the prover: " what) {::outside what})))
 
 (defn outside-reason [ex] (::outside (ex-data ex)))
+
+(defn- scalar? [x]
+  (or (nil? x) (number? x) (string? x) (keyword? x) (char? x) (boolean? x)))
+
+(defn- constant
+  "The value of a def the name refers to, when it is plain data the prover
+  can hold: a scalar, or a sequential or set of them.  Code is pure, so a
+  def's value is fixed once its namespace is loaded; nil otherwise."
+  [ctx s]
+  (let [v (try (if (namespace s)
+                 (resolve s)
+                 (some-> (:ns ctx) find-ns (ns-resolve s)))
+               (catch Throwable _ nil))]
+    (when (and (var? v) (bound? v) (not (:dynamic (meta v))))
+      (let [x @v]
+        (when (or (scalar? x)
+                  (and (or (sequential? x) (set? x)) (every? scalar? x)))
+          [x])))))
+
+(defn- member-set
+  "The set of scalars a contains? tests against, when the AST names one: a
+  set literal, or a def holding one."
+  [ctx env ast]
+  (case (:op ast)
+    :lit (when (and (set? (:val ast)) (every? scalar? (:val ast))) (:val ast))
+    :set (when (every? #(and (= :lit (:op %)) (scalar? (:val %))) (:items ast))
+           (set (map :val (:items ast))))
+    :ref (when-not (or (contains? env (:name ast)) (contains? (:own ctx) (:name ast)))
+           (when-let [[x] (constant ctx (:name ast))] (when (set? x) x)))
+    nil))
 
 (defn- fresh [ctx base]
   (symbol (str base "%" (swap! (:counter ctx) inc))))
@@ -55,6 +85,19 @@
             (if default (term-of ctx env default) [:bottom])
             (reverse clauses))))
 
+(defn- invoke-term [ctx env f args]
+  (case (:op f)
+    :ref (let [[k v] (call-head ctx env (:name f))]
+           (case k
+             :local (into [:ap v] args)
+             :own (into [:app v] args)
+             :core (if (= 'contains? v)
+                     (outside! "contains? on anything but a set of literals")
+                     (into [:call v] args))
+             (outside! (str "`" (:name f) "`"))))
+    :fn (into [:ap (term-of ctx env f)] args)
+    (outside! "calling a computed value")))
+
 (defn term-of
   "The term for a lowered AST node.  env maps local names to terms."
   [ctx env ast]
@@ -73,7 +116,11 @@
                  [:cfn (symbol (name s))]
                  (or (contains? (:own ctx) s) (call-head ctx env s))
                  (outside! (str "`" s "` passed as a value"))
-                 :else (outside! (str "the name `" s "`"))))
+                 :else (if-let [[x] (constant ctx s)]
+                         (if (set? x)
+                           (outside! (str "the set `" s "` outside contains?"))
+                           (t/value->term x))
+                         (outside! (str "the name `" s "`")))))
     :if [:if (term-of ctx env (:test ast)) (term-of ctx env (:then ast)) (term-of ctx env (:else ast))]
     :do (term-of ctx env (:ret ast))
     :let (let [env* (reduce (fn [e [b init]]
@@ -109,16 +156,17 @@
              (into [:app q] (concat (map #(term-of ctx env %) (:args ast)) fr))
              (outside! "recur outside a loop"))
     :invoke (let [f (:fn ast)
-                  args (mapv #(term-of ctx env %) (:args ast))]
-              (case (:op f)
-                :ref (let [[k v] (call-head ctx env (:name f))]
-                       (case k
-                         :local (into [:ap v] args)
-                         :own (into [:app v] args)
-                         :core (into [:call v] args)
-                         (outside! (str "`" (:name f) "`"))))
-                :fn (into [:ap (term-of ctx env f)] args)
-                (outside! "calling a computed value")))
+                  members (when (and (= :ref (:op f)) (= 2 (count (:args ast)))
+                                     (= [:core 'contains?] (call-head ctx env (:name f))))
+                            (member-set ctx env (first (:args ast))))]
+              (if members
+                ;; membership in a set of scalars is an = against each, in
+                ;; an order fixed by the values so a term is always the same
+                (let [x (term-of ctx env (second (:args ast)))]
+                  (reduce (fn [else m] [:if [:call '= x (t/lit m)] [:lit true] else])
+                          [:lit false] (reverse (sort-by pr-str members))))
+                (invoke-term ctx env f (mapv #(term-of ctx env %) (:args ast)))))
+
     :vec (t/seq-term (mapv #(term-of ctx env %) (:items ast)))
     :case (case-term ctx env ast)
     (outside! (str "`" (name (:op ast)) "`"))))
@@ -150,7 +198,7 @@
           [q (try
                (when-not (and (vector? params) (every? symbol? params) (not (some #{'&} params)))
                  (outside! (str "the parameters of `" name "`")))
-               (let [b (lower-term (assoc ctx :current q :recur-target [q []]) params
+               (let [b (lower-term (assoc ctx :current q :recur-target [q []] :ns ns-sym) params
                                   (if (= 1 (count body)) (first body) (cons 'do body)))]
                  {:params params :body b
                   :recursive? (boolean (some #(and (= :app (t/head %)) (= q (second %)))

@@ -158,6 +158,8 @@
     (contains? numeric f)
     (cond
       (some #(contains? '#{Float Double} %) args) 'Double
+      ;; integers are exact (they promote), so an integer's abs is a Nat
+      (and (= 'abs f) (= 1 (count args)) (contains? '#{Nat Int} (first args))) 'Nat
       (and (contains? numeric-nat f) (seq args) (every? #(= 'Nat %) args)) 'Nat
       (every? #(contains? '#{Nat Int} %) args) 'Int
       ;; a number either way (or a throw): Data, width unknown

@@ -326,3 +326,38 @@
             r (prover/prove-law law)]
         (is (:proved r) (str nm))
         (is (= {:ok true} (writ.prove.check/check-proof opts goal (:trace r))) (str nm))))))
+
+;; --- constants and more of clojure.core ------------------------------------------
+
+(deftest named-constants-and-core-fns-are-proved
+  (let [r (spec/check 'writ.spec-demo.court-spec {:seed 42})]
+    (is (:ok r) (:message r))
+    (doseq [l '[a-paddle-stays-on-the-court up-moves-two-rows-away-from-the-wall
+                a-tick-moves-at-most-two-rows up-and-down-part-ways
+                every-key-keeps-the-paddle-on some-key-moves-it-up
+                safe-means-get-head-or-put distance-is-the-gap]]
+      (is (= :proved (:status (law-result r l))) (str l ": " (pr-str (law-result r l)))))
+    (testing "a law over two Ints rejects a constant distance: each variable gets its own samples"
+      (is (= [] (:gaps r))))))
+
+(deftest an-open-clamp-is-refuted-not-proved
+  (let [r (spec/check 'writ.spec-demo.court-spec {:seed 42 :target 'writ.spec-demo.court-open})]
+    (is (= :failed (:status (law-result r 'a-paddle-stays-on-the-court))))
+    (is (not-any? :prover-bug (:laws r)))))
+
+(deftest a-constant-is-its-value
+  (require 'writ.spec-demo.court)
+  (let [[defs] (prover/definitions [['writ.spec-demo.court
+                                     (writ.book/read-forms (clojure.java.io/resource "writ/spec_demo/court.clj"))]])]
+    (doseq [[y k] [[-5 [:Up]] [0 [:Down]] [40 [:Down]] [37 [:Idle]] [100 [:Up]]]]
+      (is (= ((resolve 'writ.spec-demo.court/move) y k)
+             (t/evaluate (:body (get defs 'writ.spec-demo.court/move)) {'y y 'key k}))))
+    (is (= true (t/evaluate (:body (get defs 'writ.spec-demo.court/safe?)) {'method :head})))
+    (is (= false (t/evaluate (:body (get defs 'writ.spec-demo.court/safe?)) {'method :post})))))
+
+(deftest literal-arithmetic-is-computed
+  (is (= [:lit 4] (norm [:call 'quot [:lit 9] [:lit 2]])))
+  (is (= [:lit 2] (norm [:call 'mod [:lit -3] [:lit 5]])))
+  (is (= [:lit -3] (norm [:call 'rem [:lit -3] [:lit 5]])))
+  (testing "a division by zero is left alone, not folded"
+    (is (= [:call 'quot [:lit 1] [:lit 0]] (norm [:call 'quot [:lit 1] [:lit 0]])))))

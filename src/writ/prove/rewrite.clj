@@ -100,6 +100,29 @@
     [apply-gt-more    [:call apply [:cfn >] [:sq [:econs ?a [:econs ?b ?E]]]]
                        [:if [:call > ?a ?b] [:call apply [:cfn >] [:sq [:econs ?b ?E]]] [:lit false]]]
     [apply-gt-elems   [:call apply [:cfn >] [:sq [:elems ?v]]]   [:call apply [:cfn >] ?v]]
+    ;; not=, max, min and abs, as the comparisons clojure.core makes
+    [not=-def      [:call not= ?x ?y]                   [:call not [:call = ?x ?y]]]
+    [boolean-def   [:call boolean ?x]                   [:if ?x [:lit true] [:lit false]]]
+    [max-def       [:call max ?a ?b]                    [:if [:call > ?a ?b] ?a ?b]]
+    [min-def       [:call min ?a ?b]                    [:if [:call < ?a ?b] ?a ?b]]
+    [abs-def       [:call abs ?a]                       [:if [:call neg? ?a] [:call - ?a] ?a]]
+    ;; a comparison of three is two, the second only if the first holds
+    [le3           [:call <= ?a ?b ?c]                  [:if [:call <= ?a ?b] [:call <= ?b ?c] [:lit false]]]
+    [lt3           [:call < ?a ?b ?c]                   [:if [:call < ?a ?b] [:call < ?b ?c] [:lit false]]]
+    [ge3           [:call >= ?a ?b ?c]                  [:if [:call >= ?a ?b] [:call >= ?b ?c] [:lit false]]]
+    [gt3           [:call > ?a ?b ?c]                   [:if [:call > ?a ?b] [:call > ?b ?c] [:lit false]]]
+    [eq3           [:call = ?a ?b ?c]                   [:if [:call = ?a ?b] [:call = ?b ?c] [:lit false]]]
+    ;; every? and some walk the list
+    [every-nil     [:call every? ?f [:nil]]             [:lit true]]
+    [every-empty   [:call every? ?f [:sq [:enil]]]      [:lit true]]
+    [every-cons    [:call every? ?f [:sq [:econs ?h ?E]]]
+                   [:if [:ap ?f ?h] [:call every? ?f [:sq ?E]] [:lit false]]]
+    [every-elems   [:call every? ?f [:sq [:elems ?v]]]  [:call every? ?f ?v]]
+    [some-nil      [:call some ?f [:nil]]               [:nil]]
+    [some-empty    [:call some ?f [:sq [:enil]]]        [:nil]]
+    [some-cons     [:call some ?f [:sq [:econs ?h ?E]]]
+                   [:if [:ap ?f ?h] [:ap ?f ?h] [:call some ?f [:sq ?E]]]]
+    [some-elems    [:call some ?f [:sq [:elems ?v]]]    [:call some ?f ?v]]
     ;; apply + sums; of nothing it is 0
     [apply-sum-nil     [:call apply [:cfn +] [:nil]]                [:lit 0]]
     [apply-sum-empty   [:call apply [:cfn +] [:sq [:enil]]]         [:lit 0]]
@@ -362,12 +385,15 @@
              (:ctors (get-in ctx [:tenv ty])))
      :else false)))
 
+(declare boolean-term?)
+
 (defn float-free?
   "Can this term's value hold no float?  Then two syntactically equal
   terms are =; with a NaN inside, Clojure's = says they are not."
   [ctx x]
   (cond
     (int-term? ctx x) true
+    (boolean-term? x) true
     (symbol? x) (float-free-type? ctx (get-in ctx [:types x]))
     :else
     (case (head x)
@@ -522,6 +548,9 @@
                  [:sq (reduce (fn [e v] [:eapp [:elems v] e])
                               [:elems (last args)] (reverse (butlast args)))])
         identity (when (= 1 n) a)
+        (quot mod rem) (when (and (= 2 n) (all-num-lits? args) (integer? (second a))
+                                  (integer? (second b)) (not (zero? (second b))))
+                         [:lit ((case f quot quot mod mod rem rem) (second a) (second b))])
         integer? (when (= 1 n)
                    (cond (int-term? ctx a) [:lit true]
                          (or (= :nil (head a)) (= :sq (head a))
@@ -686,7 +715,7 @@
         (:lemmas ctx)))
 
 (def ^:private boolean-fns
-  '#{= not= not < <= > >= empty? zero? pos? neg? even? odd? nil? some? true? false?})
+  '#{= not= not < <= > >= empty? zero? pos? neg? even? odd? nil? some? true? false? every? boolean})
 
 (defn- boolean-term?
   "Does t return true or false, never another value?  Only then is an

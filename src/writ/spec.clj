@@ -703,10 +703,15 @@
       (let [vars (mapv first bs)
             ctx* (assoc ctx :vars vars)
             gens (mapv #(type->gen (second %) (:tenv ctx)) bs)]
+        ;; each variable its own seed: with one seed, two variables of a
+        ;; type get the same value every time, and a law relating them
+        ;; never sees them differ
         (every? (fn [i]
                   (not= :fail (:result (holds ctx* body
-                                              (zipmap vars (map #(gen/generate % (mod i 30) (+ seed i))
-                                                                gens))))))
+                                              (zipmap vars (map-indexed
+                                                             (fn [j g] (gen/generate g (mod i 30)
+                                                                                     (+ seed i (* 7919 j))))
+                                                             gens))))))
                 (range n))))))
 
 (defn- adequacy
