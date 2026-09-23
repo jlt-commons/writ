@@ -311,7 +311,11 @@
               :else nil)
       (rest pop next nnext butlast first second last peek ffirst)
       (when (= n 1) [(get shrink-needs h) a])
-      (nth get) (when (= n 2) [#{:nil} a])
+      ;; a literal nil default cannot hand the column back: the read is
+      ;; an element or nil, both below a non-nil column
+      (nth get) (when (or (= n 2) (and (= n 3) (= :lit (:op (nth args 2)))
+                                       (nil? (lit-val (nth args 2)))))
+                  [#{:nil} a])
       drop (when (and (= n 2) (pos-int-lit? a)) [#{:empty :finite} b])
       nthrest (when (and (= n 2) (pos-int-lit? b)) [#{:empty :finite} a])
       nthnext (when (and (= n 2) (pos-int-lit? b)) [#{:nil :finite} a])
@@ -420,6 +424,24 @@
       (if (or (ref? test) (origin test info stop))
         [(one :nonnil (col test)) #{}]
         none))))
+
+(defn- case-clause-facts
+  "Facts a `case` clause proves: when its test constants are all non-nil,
+  the scrutinee is non-nil there, and so is the column an element read
+  like (first x) took it from -- (first nil) is nil."
+  [ast clause info stop]
+  (let [test (:test clause)
+        consts (if (seq? test) test [test])
+        scrut (:scrut ast)
+        col (fn [e] (:col (origin e info stop)))]
+    (if (and (seq consts) (every? some? consts))
+      (into #{}
+            (comp (remove nil?) (map (fn [c] [:nonnil c])))
+            [(col scrut)
+             (when (contains? '#{first second last peek nth get ffirst}
+                              (core-head scrut info))
+               (col (first (:args scrut))))])
+      #{})))
 
 (defn- proven? [need c facts info]
   (if (vector? need)
@@ -630,6 +652,10 @@
           tries* (if (:writ/try? ast) (inc tries) tries)
           go (fn [c ls tail? fs] (when (map? c) (walk-term c ls ctx tail? tries* fs)))]
       (case (:op ast)
+        :case (do (go (:scrut ast) loops false facts)
+                  (doseq [cl (:clauses ast)]
+                    (go (:body cl) loops-t tail? (into facts (case-clause-facts ast cl info stop))))
+                  (go (:default ast) loops-t tail? facts))
         :if (do (go (:test ast) loops false facts)
                 (go (:then ast) loops-t tail? (into facts ft))
                 (go (:else ast) loops-t tail? (into facts fe)))

@@ -202,6 +202,52 @@ A book is one namespace: a name qualified with the book's own ns (or an
 alias of it, or `:refer`red from it) is a book name and obeys book order, and
 a book def may not redefine a name its ns form refers in.
 
+## Specs
+
+`writ.spec` keeps the contract out of the code. The implementation is plain
+Clojure that never mentions writ; a spec namespace names it, signs its
+public fns and states laws about their behaviour.
+
+```clojure
+(ns my.sort-spec
+  (:require [writ.spec :refer [spec data ann law]]))
+
+(spec my.sort)
+
+(ann isort [(List Nat) -> (List Nat)])
+
+(law sorted (forall [xs (List Nat)] (ascending? (isort xs))))
+(law permutation (forall [x Nat, xs (List Nat)]
+                   (= (occurrences x (isort xs)) (occurrences x xs))))
+```
+
+`(writ.spec/check 'my.sort-spec)` runs the static rules over `my.sort`'s
+source with those types (no quantity annotations; every recursive fn must
+descend), then discharges each law: `:proved` by writ.norm, `:evaluated`
+when it has no quantifiers, `:tested` by
+[test.check](https://github.com/clojure/test.check) on inputs generated
+from the binders' types, `:witnessed` for an `exists`. A failing law comes
+back shrunk to a small counterexample, with the value of each side and the
+seed that replays it. `(List T)` inputs mix lists, vectors, lazy seqs and
+nil. `instrument` wraps the target's fns with runtime checks of the same
+signatures.
+
+A spec `data` value is a vector headed by its constructor keyword,
+`[:Leaf]` or `[:Node l v r]`, and plain code takes it apart with `case`:
+
+```clojure
+(case (first t)
+  :Leaf 0
+  :Node (let [[_ l _ r] t] (+ 1 (size l) (size r))))
+```
+
+The case must name only constructors and cover them all (or have a
+default), a clause may destructure only its constructor's fields, and a
+literal `[:Node ...]` must carry exactly the fields `Node` declares.
+
+writ.spec depends on `org.clojure/test.check`; the rest of writ has no
+dependencies.
+
 ## Checking a book
 
 `writ.core/check-book` takes the forms of a namespace, collects its data, laws

@@ -8,7 +8,9 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [writ.core :as wc]
-            [writ.spec :as spec]))
+            [writ.spec :as spec]
+            [writ.book]
+            [writ.types]))
 
 (def ^:private spec-ns 'writ.spec-demo.sort-spec)
 
@@ -178,3 +180,56 @@
     (is (vector? (get (:counterexample l) 'xs)))
     (is (= :tested (:status (law-result r 'sorted)))
         "isort only ever hands insert its own lists")))
+
+;; --- data types, taken apart in plain Clojure -----------------------------
+
+(def ^:private tree-spec 'writ.spec-demo.tree-spec)
+
+(defn- tree-run [target]
+  (spec/check tree-spec {:target target :seed 42}))
+
+(deftest a-tree-taken-apart-with-case-meets-its-spec
+  (let [r (spec/check tree-spec {:seed 42})]
+    (is (:ok r) (:message r))
+    (is (= :tested (:status (law-result r 'size-counts))))
+    (is (= :tested (:status (law-result r 'insert-keeps-order))))
+    (is (= :evaluated (:status (law-result r 'insert-into-empty))))))
+
+(deftest a-case-on-the-tag-must-cover-every-constructor
+  (let [r (tree-run 'writ.spec-demo.tree-missing-case)]
+    (is (not (:ok r)))
+    (is (re-find #"`size`.*does not handle :Leaf" (get-in r [:static :error])))))
+
+(deftest a-case-clause-must-name-a-constructor
+  (let [r (tree-run 'writ.spec-demo.tree-typo)]
+    (is (not (:ok r)))
+    (is (re-find #":Nod is not a constructor of Tree" (get-in r [:static :error])))))
+
+(deftest a-built-value-has-its-constructor-s-fields
+  (let [r (tree-run 'writ.spec-demo.tree-bad-build)]
+    (is (not (:ok r)))
+    (is (re-find #"Node takes 3 field\(s\) but is built with 2" (get-in r [:static :error])))))
+
+(deftest destructuring-stops-at-the-constructor-s-fields
+  (let [r (tree-run 'writ.spec-demo.tree-overread)]
+    (is (not (:ok r)))
+    (is (re-find #"Node has 3 field\(s\)" (get-in r [:static :error])))))
+
+(deftest a-wrong-tree-insert-fails-with-a-tree-counterexample
+  (let [r (tree-run 'writ.spec-demo.tree-mirror)
+        l (law-result r 'insert-keeps-order)]
+    (is (:ok (:static r)))
+    (is (= :failed (:status l)))
+    (is (spec/conforms? 'Tree (get (:counterexample l) 't)
+                        {'Tree {:arity 0 :params [] :ctors {'Leaf {:fields []}
+                                                           'Node {:fields '[Tree Nat Tree]}}}}))
+    (is (re-find #"\(to-list \(insert x t\)\) =>" (:message r)))))
+
+(deftest outside-a-case-the-tag-is-not-read
+  (let [err (fn [src]
+              (try (writ.book/check-book src) nil
+                   (catch Throwable e (ex-message e))))]
+    (binding [writ.types/*tagged* true]
+      (is (re-find #"take it apart with `\(case \(first t\) \.\.\.\)`"
+                   (err '[(data Tree Leaf (Node Tree Nat Tree))
+                          (defn f [^{:writ/type Tree} t] (second t))]))))))

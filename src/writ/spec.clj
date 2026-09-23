@@ -30,6 +30,7 @@
             [writ.kind :as kind]
             [writ.law :as lw]
             [writ.norm :as norm]
+            [writ.types :as ty]
             [clojure.test.check :as tc]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
@@ -529,7 +530,8 @@
                          forms)
             [nsf others] [(filter #(head? % "ns") forms*) (remove #(head? % "ns") forms*)]]
         (binding [ck/*affine* false
-                  ck/*descend-all* true]
+                  ck/*descend-all* true
+                  ty/*tagged* true]
           (book/check-book (vec (concat nsf data others))))
         {:ok true :defns defns}))
     (catch Throwable e

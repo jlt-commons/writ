@@ -19,6 +19,15 @@
 (defn- fail! [& msg]
   (throw (ex-info (str "Writ: " (apply str msg)) {:writ/error true})))
 
+(def ^:dynamic *tagged*
+  "When true, data values are tagged vectors -- [:Leaf], [:Node l v r] --
+  taken apart in plain Clojure: (case (first t) :Leaf .. :Node (let [[_ l
+  v r] t] ..)).  The case must name only constructors and cover them all
+  (or carry a default), a clause reads only its constructor's fields, and
+  a literal [:Ctor ..] carries exactly the fields Ctor declares.
+  writ.spec checks plain code with this on."
+  false)
+
 (def data
   "An inferred type known to be Data but otherwise unspecified (a
   collection of Data, a quoted form)."
@@ -230,6 +239,107 @@
       not (let [[t e] (guard-refs a)] [e t])
       [#{} #{}])))
 
+;; --- tagged data (*tagged*) --------------------------------------------------
+
+(defn- data-type-of
+  "[type-name args] when `t` names a declared datatype."
+  [t tenv]
+  (cond
+    (and (symbol? t) (contains? tenv t) (not (:tvar (get tenv t)))) [t []]
+    (and (seq? t) (contains? tenv (first t))) [(first t) (vec (rest t))]
+    :else nil))
+
+(defn- ctor-fields
+  "Constructor `c`'s field types with its type's parameters instantiated."
+  [tenv tname args c]
+  (let [d (get tenv tname)
+        m (zipmap (:params d) args)
+        sub (fn sub [x] (cond (symbol? x) (get m x x)
+                              (seq? x) (apply list (map sub x))
+                              :else x))]
+    (mapv sub (:fields (get (:ctors d) c)))))
+
+(defn- ctor-owner
+  "The declared type that has constructor `c`, or nil."
+  [tenv c]
+  (first (keep (fn [[tn d]] (when (and (map? d) (contains? (:ctors d) c)) tn)) tenv)))
+
+(defn- ctor-list [tenv tname]
+  (sort-by str (keys (:ctors (get tenv tname)))))
+
+(defn- tag-scrut
+  "The ref `x` when a case scrutinee is (first x), else nil."
+  [scrut]
+  (when (and (= :invoke (:op scrut))
+             (= :ref (:op (:fn scrut)))
+             (= 'first (symbol (name (:name (:fn scrut)))))
+             (contains? #{nil "clojure.core"} (namespace (:name (:fn scrut))))
+             (= 1 (count (:args scrut)))
+             (= :ref (:op (first (:args scrut)))))
+    (:name (first (:args scrut)))))
+
+(defn- case-tests [test]
+  (if (seq? test) (vec test) [test]))
+
+(declare walk)
+
+(defn- walk-tag-case
+  "(case (first x) :Ctor body ...) over a tagged data value."
+  [ctx env ast x t]
+  (let [{:keys [nm tenv]} ctx
+        [tname _] (data-type-of t tenv)
+        ctors (ctor-list tenv tname)
+        shown (str "(" (clojure.string/join ", " ctors) ")")
+        src (display (get (::origin env) x x))
+        seen (atom #{})
+        bodies (for [{:keys [test body]} (:clauses ast)]
+                 (let [ks (case-tests test)
+                       cs (mapv (fn [k]
+                                  (let [c (when (keyword? k) (symbol (name k)))]
+                                    (when-not (and c (contains? (set ctors) c))
+                                      (fail! "`" nm "`: " (pr-str k) " is not a constructor of "
+                                             tname " " shown))
+                                    c))
+                                ks)]
+                   (swap! seen into cs)
+                   (walk ctx (if (= 1 (count cs))
+                               (assoc-in env [::ctor x] {:type t :ctor (first cs)})
+                               env)
+                         body)))
+        ts (doall bodies)
+        missing (remove @seen ctors)]
+    (when (and (seq missing) (nil? (:default ast)))
+      (fail! "`" nm "`: the `case` on `" src "` (" (show t) ") does not handle "
+             (clojure.string/join ", " (map #(str ":" %) missing))
+             "; add a clause for it, or a default"))
+    (reduce (fn [acc b] (join acc b tenv))
+            (cond-> (vec ts) (:default ast) (conj (walk ctx env (:default ast)))))))
+
+(defn- tagged-read
+  "A positional read of a tagged data value.  Inside a case clause that
+  fixed its constructor, (nth x i) reads field i (0 is the tag); anywhere
+  else the encoding is off limits."
+  [ctx env s a ats]
+  (let [{:keys [nm tenv]} ctx
+        x (:name a)
+        src (display (get (::origin env) x x))
+        refined (get-in env [::ctor x])
+        f (symbol (name s))
+        idx (let [i (second (:args ats))] i)]
+    (if (and refined (= 'nth f))
+      (let [i (:val idx)
+            [tname args] (data-type-of (:type refined) tenv)
+            fs (ctor-fields tenv tname args (:ctor refined))]
+        (cond
+          (not (integer? i)) nil
+          (zero? i) 'Keyword
+          (<= i (count fs)) (nth fs (dec i))
+          :else (fail! "`" nm "`: " (:ctor refined) " has " (count fs) " field(s), but `"
+                       src "` is read at position " i "; destructure at most "
+                       (inc (count fs)) " element(s), the tag first")))
+      (fail! "`" src "` in `" nm "` has data type " (show (:type refined (get env x)))
+             "; take it apart with `(case (first " src ") ...)`, not `" f "`"))))
+
 (defn- walk [ctx env ast]
   (let [{:keys [nm tenv sigs]} ctx
         w (fn [e a] (walk ctx e a))]
@@ -240,8 +350,21 @@
                                  (get sigs (:name ast)))]
                  (apply list '-> (concat (map #(or % 'Any) (:params s))
                                          [(or (:ret s) 'Any)]))))
-      (:vec :set) (let [ts (mapv #(w env %) (:items ast))]
-                    (when (every? #(data? % tenv) ts) data))
+      :vec (let [items (:items ast)
+                 ts (mapv #(w env %) items)
+                 k (when (and *tagged* (= :lit (:op (first items))) (keyword? (:val (first items))))
+                     (symbol (name (:val (first items)))))
+                 owner (when k (ctor-owner tenv k))]
+             (if owner
+               (let [d (get tenv owner)
+                     fs (:fields (get (:ctors d) k))
+                     n (dec (count items))]
+                 (when (not= n (count fs))
+                   (fail! "`" nm "`: " k " takes " (count fs) " field(s) but is built with " n))
+                 (if (empty? (:params d)) owner data))
+               (when (every? #(data? % tenv) ts) data)))
+      :set (let [ts (mapv #(w env %) (:items ast))]
+             (when (every? #(data? % tenv) ts) data))
       :map (let [ts (mapv #(w env %) (concat (:keys ast) (:vals ast)))]
              (when (every? #(data? % tenv) ts) data))
       :do (do (doseq [s (:stmts ast)] (w env s)) (w env (:ret ast)))
@@ -249,10 +372,17 @@
                 pos (fn [e xs] (update e ::pos (fnil into #{}) xs))]
             (w env (:test ast))
             (join (w (pos env pt) (:then ast)) (w (pos env pe) (:else ast)) tenv))
-      :case (do (w env (:scrut ast))
+      :case (if-let [x (and *tagged* (tag-scrut (:scrut ast)))]
+              (if (data-type-of (get env x) tenv)
+                (walk-tag-case ctx env ast x (get env x))
+                (do (w env (:scrut ast))
+                    (reduce (fn [acc b] (join acc (w env b) tenv))
+                            (map #(w env (:body %)) (cond-> (vec (:clauses ast))
+                                                      (:default ast) (conj {:body (:default ast)}))))))
+              (do (w env (:scrut ast))
                 (reduce (fn [acc b] (join acc (w env b) tenv))
                         (map #(w env (:body %)) (cond-> (vec (:clauses ast))
-                                                  (:default ast) (conj {:body (:default ast)})))))
+                                                  (:default ast) (conj {:body (:default ast)}))))))
       (:let :loop)
       (let [env* (reduce (fn [e [b init]]
                            (let [it (w e init)
@@ -260,10 +390,15 @@
                              (when (and bt it (not (compat? bt it tenv)))
                                (fail! "`" (display b) "` in `" nm "` is declared "
                                       (show bt) " but bound to " (show it)))
-                             (let [t (or bt it)]
+                             (let [t (or bt it)
+                                   src (when (= :ref (:op init)) (:name init))]
                                (check-reusable! nm b t tenv)
                                (cond-> (assoc e b t)
-                                 (:writ/temp (meta b)) (update ::temps (fnil conj #{}) b)))))
+                                 (:writ/temp (meta b)) (update ::temps (fnil conj #{}) b)
+                                 ;; a destructure temp aliases its source
+                                 (and src (get-in e [::ctor src]))
+                                 (assoc-in [::ctor b] (get-in e [::ctor src]))
+                                 src (assoc-in [::origin b] (get-in e [::origin src] src))))))
                          env (:bindings ast))]
         (w env* (:body ast)))
       :fn (let [ps (remove nil? (:params ast))
@@ -309,6 +444,16 @@
                     (fail! "`" (display s) "` expects " (show pt) " for argument "
                            (inc i) " but is passed " (show at))))
                 ret)
+
+              (and *tagged*
+                   (contains? seq-readers (symbol (name s)))
+                   (or (nil? (namespace s)) (= "clojure.core" (namespace s)))
+                   (not (contains? (:shadow ctx) s))
+                   (let [a (first (:args ast))]
+                     (and (map? a) (= :ref (:op a))
+                          (or (get-in env [::ctor (:name a)])
+                              (data-type-of (first ats) tenv)))))
+              (tagged-read ctx env s (first (:args ast)) ast)
 
               (and (contains? seq-readers (symbol (name s)))
                    (or (nil? (namespace s)) (= "clojure.core" (namespace s)))
