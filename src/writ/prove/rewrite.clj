@@ -545,6 +545,9 @@
      (nil? m) nil
      (and (symbol? pat) (contains? vs pat))
      (if (contains? m pat) (when (= (get m pat) x) m) (assoc m pat x))
+     ;; fn literals match up to the names of their parameters
+     (and (= :fn (head pat)) (= :fn (head x)) (= (count (second pat)) (count (second x))))
+     (match-term (t/subst (nth pat 2) (zipmap (second pat) (second x))) (nth x 2) vs m)
      (and (vector? pat) (vector? x) (= (count pat) (count x)))
      (reduce (fn [m [p y]] (or (match-term p y vs m) (reduced nil))) m (map vector pat x))
      (= pat x) m
@@ -583,9 +586,23 @@
                    (contains? '#{< <= > >= =} (second (nth t 2)))))
     false))
 
+(defn- lift-if
+  "A core fn call with an if among its arguments, as an if of two calls:
+  a call runs its arguments first, so the test runs either way.  Only the
+  first such argument is lifted; normalising the branches lifts the rest."
+  [x]
+  (when (= :call (head x))
+    (let [args (vec (drop 2 x))
+          i (first (keep-indexed (fn [i a] (when (= :if (head a)) i)) args))]
+      (when i
+        (let [[_ c a b] (nth args i)
+              with (fn [v] (into [:call (second x)] (assoc args i v)))]
+          [:if c (with a) (with b)])))))
+
 (defn- step [ctx x]
   (or (ih-rewrite ctx x)
       (lemma-rewrite ctx x)
+      (lift-if x)
       (when (and (contains? (:facts ctx) x) (not (contains? #{:le :ieq} (head x)))
                  (boolean-term? x) (boolean? (get (:facts ctx) x)))
         [:lit (get (:facts ctx) x)])

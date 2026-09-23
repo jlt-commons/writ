@@ -63,6 +63,8 @@
     (= :fn (head t)) (let [[_ ps body] t] (apply disj (vars body) ps))
     (= :lin (head t)) (into #{} (mapcat (fn [[a _]] (vars a))) (nth t 2))
     (contains? #{:lit :cfn} (head t)) #{}
+    ;; a call's head is the name of a fn, not a variable
+    (contains? #{:call :app} (head t)) (into #{} (mapcat vars) (drop 2 t))
     :else (into #{} (mapcat vars) (rest t))))
 
 (defn subst
@@ -86,11 +88,15 @@
                        [:fn (mapv #(get ren % %) ps) (subst body (merge m* ren))])
     (= :lin (head t)) (let [[_ c pairs] t]
                         [:lin c (mapv (fn [[a k]] [(subst a m) k]) pairs)])
+    (contains? #{:call :app} (head t)) (into [(first t) (second t)] (map #(subst % m)) (drop 2 t))
     :else (into [(first t)] (map #(subst % m)) (rest t))))
 
 (defn subterms [t]
   (tree-seq (fn [x] (and (vector? x) (not (lit? x)) (not= :cfn (head x))))
-            (fn [x] (if (= :lin (head x)) (map first (nth x 2)) (rest x)))
+            (fn [x] (case (head x)
+                      :lin (map first (nth x 2))
+                      (:call :app) (drop 2 x)
+                      (rest x)))
             t))
 
 ;; --- meaning ---------------------------------------------------------------

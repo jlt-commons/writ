@@ -225,6 +225,51 @@
   (let [ps (mapv #(prove-goal opts % hyps 8) goals)]
     (when (every? some? ps) ps)))
 
+(defn- replace-term [t from to]
+  (cond (= t from) to
+        (and (vector? t) (not (contains? #{:lit :cfn} (head t))))
+        (if (= :lin (head t))
+          [:lin (second t) (mapv (fn [[a k]] [(replace-term a from to) k]) (nth t 2))]
+          (into [(head t)] (map #(replace-term % from to)) (rest t)))
+        :else t))
+
+(declare by-induction)
+
+(defn- by-generalizing
+  "Prove an induction case by using an equality hypothesis the other way
+  round, then generalising the recursive call it brought in to a fresh
+  variable, and proving that more general goal by induction on it.  The
+  goal holds for every value of the variable, so for the call's value
+  too: generalising is always sound, only sometimes too strong."
+  [opts {:keys [hyps goals]} smaller-vars]
+  (when-not (:generalized? opts)
+    (let [ctx (rw/context (dissoc opts :ih))
+          n* #(rw/normalize ctx %)
+          ;; an equality keeps its shape, each side normalised, so the
+          ;; induction on the new variable gets an equation to rewrite by
+          n (fn [g] (if (and (= :call (head g)) (= '= (second g)) (= 4 (count g)))
+                      [:call '= (n* (nth g 2)) (n* (nth g 3))]
+                      (n* g)))]
+      (first
+        (for [{:keys [lhs rhs hyp]} (:ih opts)
+              :when (and (nil? hyp) (not= [:lit true] rhs))
+              :let [goals* (mapv #(replace-term (n %) rhs lhs) goals)
+                    calls (for [gl goals*, x (t/subterms gl)
+                                :when (and (= :app (head x))
+                                           (get-in opts [:rets (second x)])
+                                           (some (set smaller-vars) (t/vars x)))]
+                            x)]
+              call (distinct calls)
+              :let [ys (symbol (str "gen" (count (t/vars call))))
+                    ty (get-in opts [:rets (second call)])
+                    g* {:hyps (mapv #(replace-term (n %) call ys) hyps)
+                        :goals (mapv #(replace-term % call ys) goals*)}
+                    opts* (-> opts (assoc :generalized? true :ih [])
+                              (update :types assoc ys ty))
+                    p (or (prove-all opts* g*) (by-induction opts* g* ys ty))]
+              :when p]
+          {:by :generalizing :on (t/show call) :as ys :proof p})))))
+
 (defn- by-induction [opts g v ty]
   (when-let [cs (cases v ty (:tenv opts))]
     (let [steps (for [c cs]
@@ -234,7 +279,8 @@
                         opts* (assoc opts* :ih (ih-for opts* g v (:smaller c)))
                         gi {:hyps (instance (:hyps g) v (:value c))
                             :goals (instance (:goals g) v (:value c))}]
-                    [c (prove-all opts* gi)]))]
+                    [c (or (prove-all opts* gi)
+                           (by-generalizing opts* gi (keys (:types c))))]))]
       (when (every? (comp some? second) steps)
         {:by :induction :on v
          :cases (mapv (fn [[c p]] {:case (:desc c) :proof p}) steps)}))))
@@ -257,7 +303,11 @@
     (str (if on (str "by induction on " on) "by rewriting")
          (when (seq cs) (str ", splitting on " (str/join " and " cs)))
          (when-let [vs (seq (case-vars trace))]
-           (str ", with cases on " (str/join " and " vs))))))
+           (str ", with cases on " (str/join " and " vs)))
+         (when-let [gs (seq (distinct (keep (fn [x] (when (and (map? x) (= :generalizing (:by x)))
+                                                       (:on x)))
+                                           (tree-seq coll? seq trace))))]
+           (str ", generalising " (str/join " and " (map pr-str gs)))))))
 
 (defn- lemma-rules
   "An earlier proved law as rewrite rules: each equality rewrites its left
@@ -289,7 +339,7 @@
   defs are the translated definitions; target the implementation's ns;
   lemmas are the laws proved before it, as {:name :prop}.
   Returns {:proved true :trace :summary :lemmas} or {:proved false :reason}."
-  [{:keys [prop defs tenv target own fuel lemmas]}]
+  [{:keys [prop defs tenv target own fuel lemmas rets]}]
   (try
     (let [[bs body] (split-foralls prop)
           vars (mapv first bs)
@@ -299,6 +349,7 @@
           lemmas-used (atom #{})
           opts {:defs defs :tenv tenv :types (into {} (map (fn [[x ty]] [x (plain ty)])) bs)
                 :unfolded unfolded :fuel (or fuel 20000) :lemmas-used lemmas-used
+                :rets (or rets {})
                 :lemmas (vec (mapcat #(lemma-rules % defs tenv own) lemmas))}
           attempt (fn [f] (reset! unfolded #{}) (reset! lemmas-used #{})
                     (let [r (f)] [r @unfolded]))

@@ -65,7 +65,7 @@
         l (law-result r 'insert-adds)]
     (is (:ok r) (:message r))
     (is (= :proved (:status l)) (pr-str l))
-    (is (re-find #"by induction on xs, splitting on" (str (:proof l))))
+    (is (re-find #"by induction on xs" (str (:proof l))))
     (testing "a proved law was still run"
       (is (= 100 (:trials l))))))
 
@@ -206,3 +206,20 @@
       (is (not= :proved (:status (law-result r 'insert-keeps-sorted))))
       (is (not= :proved (:status (law-result r 'sorted))))
       (is (not-any? :prover-bug (:laws r))))))
+
+(deftest a-fn-name-is-not-a-variable
+  (is (= '#{x} (t/vars [:call 'count [:app 'my/f 'x]])))
+  (is (= [:call 'count [:lit 1]] (t/subst [:call 'count 'count] '{count [:lit 1]}))))
+
+(deftest a-call-on-an-if-is-an-if-of-calls
+  (let [ctx {:types '{a Nat b Nat}}
+        c [:call '<= 'a 'b]
+        n (norm ctx [:call 'count [:if c (t/value->term [1 2]) (t/value->term [1])]])]
+    (is (= :if (first n)))
+    (is (= [:lit 2] (nth n 2)))
+    (is (= [:lit 1] (nth n 3)))))
+
+(deftest permutation-is-proved-by-generalising-the-recursive-call
+  (let [l (law-result (spec/check 'writ.spec-demo.sort-spec {:seed 42}) 'permutation)]
+    (is (= :proved (:status l)) (pr-str l))
+    (is (re-find #"generalising \(isort xs-t\)" (:proof l)))))

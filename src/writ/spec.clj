@@ -1243,7 +1243,7 @@
   "Try to prove each law that ran.  A tested law the prover proves becomes
   :proved; a law it cannot prove keeps :tested with the reason.  A law
   that is proved yet refuted by a value (not a throw) is a writ bug."
-  [results opts target spec-ns tenv]
+  [results opts target spec-ns tenv anns]
   (if (= false (:prove opts))
     results
     (let [defs (delay (prover/definitions
@@ -1257,7 +1257,10 @@
       (let [attempt (fn [r lemmas]
                       (try (let [[ds own] @defs]
                              (prover/prove-law {:prop (:prop r) :defs ds :tenv tenv
-                                                :target target :own own :lemmas lemmas}))
+                                                :target target :own own :lemmas lemmas
+                                                :rets (into {} (for [[nm sig] anns]
+                                                                 [(symbol (str target) (str nm))
+                                                                  (plain (:ret sig))]))}))
                            (catch Throwable e
                              {:proved false :reason (str "the prover failed: " (ex-message e))})))
             open? (fn [r] (and (:prop r) (contains? #{:tested :failed} (:status r))
@@ -1353,7 +1356,7 @@
                                   {:law name :status :failed :counterexample {} :detail []
                                    :error (or (ex-message ex) (str ex))}))))
                        (finally (unwrap! wrapped)))
-             results (prove-laws results opts target spec-ns tenv)
+             results (prove-laws results opts target spec-ns tenv anns)
              unq (fn unq [f]
                    (cond (and (symbol? f) (contains? #{(name target) (name spec-ns)} (namespace f)))
                          (symbol (name f))
