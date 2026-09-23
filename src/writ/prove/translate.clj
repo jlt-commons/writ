@@ -4,8 +4,10 @@
   Definitions and law terms are lowered by writ.lower (so cond, when,
   if-let, and, or and destructuring are already let and if), then read
   into terms.  Only the fragment the rewrite rules model is accepted:
-  anything else -- conj, maps, loop/recur, host calls, a fn passed as a
-  value -- raises `outside`, and a law that needs it is left to testing."
+  anything else -- conj, maps, host calls, a target fn passed as a value
+  -- raises `outside`, and a law that needs it is left to testing.  A
+  loop becomes a recursive definition of its own, over its bindings and
+  the locals it closes over, and recur a call of it."
   (:require [writ.lower :as l]
             [writ.prove.term :as t]))
 
@@ -83,7 +85,28 @@
               (when (or (some #(= '& %) ps) (not (every? symbol? ps)))
                 (outside! "a variadic or destructuring fn"))
               (let [ps* (mapv (fn [_] (fresh ctx "p")) ps)]
-                [:fn ps* (term-of ctx (merge env (zipmap ps ps*)) (:body ast))])))
+                ;; a recur inside a fn literal would target the fn
+                [:fn ps* (term-of (dissoc ctx :recur-target) (merge env (zipmap ps ps*)) (:body ast))])))
+    :loop (let [current (or (:current ctx) (outside! "a loop outside a defn"))
+                bs (:bindings ast)
+                _ (when-not (every? (comp symbol? first) bs) (outside! "a destructuring loop binding"))
+                ;; a loop binding's init sees the bindings before it
+                [inits _] (reduce (fn [[acc e] [b init]]
+                                    (let [v (term-of ctx e init)] [(conj acc v) (assoc e b v)]))
+                                  [[] env] bs)
+                names (mapv first bs)
+                frees (vec (sort-by str (remove (set names) (keys env))))
+                q (symbol (namespace current) (str (name current) "$loop" (swap! (:counter ctx) inc)))
+                ps (mapv (fn [_] (fresh ctx "l")) names)
+                fps (mapv (fn [_] (fresh ctx "c")) frees)
+                body (term-of (assoc ctx :recur-target [q fps])
+                              (merge env (zipmap frees fps) (zipmap names ps))
+                              (:body ast))]
+            (swap! (:extra ctx) assoc q {:params (into ps fps) :body body :recursive? true})
+            (into [:app q] (concat inits (map #(get env %) frees))))
+    :recur (if-let [[q fr] (:recur-target ctx)]
+             (into [:app q] (concat (map #(term-of ctx env %) (:args ast)) fr))
+             (outside! "recur outside a loop"))
     :invoke (let [f (:fn ast)
                   args (mapv #(term-of ctx env %) (:args ast))]
               (case (:op f)
@@ -117,7 +140,8 @@
   one the prover cannot read.  own maps each name the forms may call
   (qualified and unqualified) to its qualified name."
   [ctx ns-sym forms]
-  (into {}
+  (merge
+   (into {}
         (for [f forms
               :when (and (seq? f) (contains? '#{defn defn-} (first f)))
               :let [{:keys [name params body]} (defn-parts f)
@@ -125,7 +149,8 @@
           [q (try
                (when-not (and (vector? params) (every? symbol? params) (not (some #{'&} params)))
                  (outside! (str "the parameters of `" name "`")))
-               (let [b (lower-term ctx params (if (= 1 (count body)) (first body) (cons 'do body)))]
+               (let [b (lower-term (assoc ctx :current q :recur-target [q []]) params
+                                  (if (= 1 (count body)) (first body) (cons 'do body)))]
                  {:params params :body b
                   :recursive? (boolean (some #(and (= :app (t/head %)) (= q (second %)))
                                              (t/subterms b)))})
@@ -135,7 +160,9 @@
                    ;; a form writ.lower rejects, such as a destructuring fn
                    ;; literal, is outside the prover too
                    (:writ/error (ex-data e)) {:outside (str "`" name "`: " (ex-message e))}
-                   :else (throw e))))])))
+                   :else (throw e))))]))
+   ;; the loops the defns contain, each its own recursive definition
+   @(:extra ctx)))
 
 (defn own-names
   "name -> qualified name for the defns of each [ns-sym forms] pair, under
@@ -149,4 +176,4 @@
               k [n q]]
           [k q])))
 
-(defn context [own] {:own own :counter (atom 0)})
+(defn context [own] {:own own :counter (atom 0) :extra (atom {})})

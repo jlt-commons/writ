@@ -223,3 +223,28 @@
   (let [l (law-result (spec/check 'writ.spec-demo.sort-spec {:seed 42}) 'permutation)]
     (is (= :proved (:status l)) (pr-str l))
     (is (re-find #"generalising \(isort xs-t\)" (:proof l)))))
+
+;; --- loops ----------------------------------------------------------------------
+
+(defn- run-def
+  "Run translated definition q on args, its calls to other translated
+  definitions run the same way."
+  [defs q args]
+  (let [{:keys [params body]} (get defs q)]
+    (t/evaluate body (zipmap params args)
+                (fn [n] (if (contains? defs n)
+                          (delay (fn [& as] (run-def defs n as)))
+                          (resolve n))))))
+
+(deftest a-loop-is-a-local-recursive-definition
+  (require 'writ.spec-demo.total)
+  (let [[defs] (prover/definitions [['writ.spec-demo.total
+                                     (writ.book/read-forms (clojure.java.io/resource "writ/spec_demo/total.clj"))]])
+        f (get defs 'writ.spec-demo.total/total)]
+    (is (nil? (:outside f)) (pr-str f))
+    (testing "the translation computes what the fn computes"
+      (doseq [xs ['() [3] '(1 2 3) nil]]
+        (is (= ((resolve 'writ.spec-demo.total/total) xs)
+               (run-def defs 'writ.spec-demo.total/total [xs]))))))
+  (let [l (law-result (spec/check 'writ.spec-demo.total-spec {:seed 42 :adequacy false}) 'total-of-two)]
+    (is (= :proved (:status l)) (pr-str l))))
