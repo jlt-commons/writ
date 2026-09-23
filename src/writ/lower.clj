@@ -199,13 +199,25 @@
     (= 1 (count forms)) (lower (first forms))
     :else {:op :do :stmts (mapv lower (butlast forms)) :ret (lower (last forms))}))
 
+(defn plain-params
+  "A parameter vector with each destructuring pattern replaced by a fresh
+  name, and the body wrapped in a let that takes the pattern apart, which
+  is what clojure.core/fn does: [[params] body].  The fresh name keeps the
+  pattern's metadata, so a type given to the pattern types it."
+  [params body]
+  (if (or (not (vector? params))
+          (every? #(or (symbol? %) (nil? %)) params))
+    [params body]
+    (let [ps (mapv #(if (or (symbol? %) (nil? %)) % (with-meta (gensym "p__") (meta %))) params)
+          binds (vec (mapcat (fn [p q] (when-not (= p q) [p q])) params ps))]
+      [ps (list (list* 'let binds body))])))
+
 (defn- lower-fn [form]
   ;; (fn name? [params] body...) -- name, params and body each optional in
   ;; position; an unnamed fn still has its params and body.
   (let [tail (rest form)
         [nm tail] (if (symbol? (first tail)) [(first tail) (rest tail)] [nil tail])
-        params (first tail)
-        body (rest tail)]
+        [params body] (plain-params (first tail) (rest tail))]
     (let [ps (param-syms params)]
       {:op :fn
        :name nm

@@ -696,7 +696,7 @@
                       (cond
                         (empty? ps) out
                         (= '& (first ps)) (into out ps)
-                        (symbol? (first ps))
+                        (or (symbol? (first ps)) (coll? (first ps)))
                         (recur (rest ps) (rest ts)
                                (conj out (vary-meta (first ps) assoc :writ/type (first ts))))
                         :else (recur (rest ps) (rest ts) (conj out (first ps)))))]

@@ -510,3 +510,11 @@
 (deftest a-helper-the-prover-cannot-read-leaves-laws-tested
   (let [r (spec/check 'writ.spec-demo.sort-pairs-spec {:seed 42 :adequacy false})]
     (is (= :tested (:status (law-result r 'sorted))) (:message r))))
+
+(deftest a-fn-literal-may-destructure-its-parameters
+  (is (= :fn (:op (writ.lower/lower '(fn [[a b] {:keys [c]} & [d]] (+ a b c d))))))
+  (testing "defn params too, through the spec's static check"
+    (let [r (spec/check 'writ.spec-demo.sort-pairs-spec
+                        {:target 'writ.spec-demo.sort-pairs :seed 42 :adequacy false})]
+      (is (:ok (:static r)) (:message r))
+      (is (:ok r) (:message r)))))

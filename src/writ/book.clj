@@ -10,6 +10,7 @@
   after its own proof, and a law name is declared once."
   (:require [clojure.java.io :as io]
             [writ.check :as ck]
+            [writ.lower :as l]
             [writ.data :as dt]
             [writ.kind :as kind]
             [writ.match :as mt]
@@ -39,7 +40,16 @@
           params (first tail)
           body (rest tail)]
       (d/build nm params body))
-    f))
+    (let [[h nm & tail] f
+          doc (when (string? (first tail)) [(first tail)])
+          tail (if doc (rest tail) tail)
+          attrs (when (map? (first tail)) [(first tail)])
+          tail (if attrs (rest tail) tail)]
+      (if (and (ck/defn-form? f) (vector? (first tail)))
+        ;; destructuring parameters become fresh names and a let, as fn does
+        (let [[params body] (l/plain-params (first tail) (rest tail))]
+          (apply list h nm (concat doc attrs [params] body)))
+        f))))
 
 (defn- param-names
   "Parameter name -> quantity, the matchable scope of a defn."
