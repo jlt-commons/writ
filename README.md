@@ -259,7 +259,10 @@ with `case` on its tag:
 writ checks this statically:
 
 - The `case` names only constructors of the type, and covers every one
-  unless it has a default.
+  unless it has a default. That holds for a value destructured from a
+  typed `Tuple` too: with a game typed `(Tuple Phase Ball)`,
+  `(let [[phase ball] game] (case (first phase) ...))` must cover every
+  `Phase`.
 - A clause destructures only the fields of its own constructor.
 - A literal `[:Node ...]` has exactly the fields `Node` declares, and each
   field whose type is known fits. A type parameter takes its type from the
@@ -291,11 +294,11 @@ checks validity itself instead of going through the fn that owns the
 rule. Every law still holds. `calls` states the structure:
 
 ```clojure
-(ns shortener.core-spec
+(ns my.pipeline-spec
   (:require [clojure.string :as str]
             [writ.spec :refer [spec ann law calls]]))
 
-(spec shortener.core)
+(spec my.pipeline)
 
 (calls normalize [str/lower-case str/trim])
 (calls respond   [valid?])
@@ -325,6 +328,14 @@ the call graph of `handle` is not the one the spec gives
 ```
 
 A passing report lists each fn's call set.
+
+`calls` also guards the line between pure code and effects. The static
+check lets calls into other namespaces through unchecked, so a pure core
+that writes to a storage namespace passes it, and passes every law that
+doesn't look at the store. Its call set names the stray call:
+`` `shorten` calls `shortener.store/remember!`, which the spec does not
+list``. [examples/](examples/README.md#shortener) has this case, run
+against a real server.
 
 `(spec/call-graph 'my.ns)` returns the graph of any namespace as
 `{f #{g ...}}`. It reads the source without loading or checking it, so it
@@ -543,6 +554,13 @@ These rules apply to the plain implementation.
     value to be non-nil. A truthiness test works, and so does a `case` on
     `(first t)`
 
+  A test may sit inside `and`: `(if (and (pos? fuel) (pos? n)) ...)`
+  proves both in its then branch. An `or` proves each of its tests false
+  in its else branch. A recursion with no structural measure, such as one
+  on `(quot n 62)`, takes a fuel parameter that counts down, as
+  `encode-id` in [examples/shortener](examples/src/shortener/core.clj)
+  does.
+
   Parameters before the shrinking one pass through unchanged, so an
   accumulator goes after the collection it walks, in the parameters or
   the `loop` bindings. `rest` only shrinks a collection writ knows is
@@ -562,8 +580,7 @@ These rules apply to the plain implementation.
 
 writ can also check code that carries its annotations inline, through the
 macros in `writ.defn`. This surface enforces Bend's full discipline,
-including quantities, and states laws and proofs in the code. The books in
-`examples/` still use it. They are being ported to spec namespaces.
+including quantities, and states laws and proofs in the code.
 
 ```clojure
 (require '[writ.defn :as w])
@@ -629,7 +646,7 @@ rest of writ has no dependencies.
 
 ```
 jolt -M:test                   # or ./bin/test
-cd examples && jolt -M:test    # every example book
+cd examples && jolt -M:test    # the example programs and their specs
 ```
 
 `test/writ/spec_demo/` holds the worked example: an insertion sort and a

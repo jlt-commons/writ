@@ -1,5 +1,21 @@
-{:paths ["."]
- :deps  {writ/writ {:local/root ".."}}
+{:paths ["src"]
+ :deps  {writ/writ {:local/root ".."}
+         jolt-lang/ring-chez-adapter
+         {:git/url "https://github.com/jolt-lang/ring-chez-adapter"
+          :git/tag "v0.7.7"
+          :git/sha "ff99a9d42761482851e40876c880ac4443cc4d96"}
+         jolt-lang/http-client
+         {:git/url "https://github.com/jolt-lang/http-client"
+          :git/tag "v0.0.14"
+          :git/sha "281689c9b6b54f3b09bb0fd3ca05dba4e54c6953"}
+         net.b12n/raylib
+         {:git/url "https://github.com/jlt-commons/raylib-jlt"
+          :git/sha "2f076ef0a9c3997707e80dd935b64dcbbe00cd56"
+          :deps/root "lib"}}
  :aliases
- {:test {:extra-paths ["test"]
-         :main-opts   ["-m" "examples-runner"]}}}
+ {:test      {:extra-paths ["test"]
+              :main-opts   ["-m" "examples-runner"]}
+  :pong      {:main-opts ["-m" "pong.main"]}
+  :life      {:main-opts ["-m" "life.main"]}
+  :shortener {:main-opts ["-m" "shortener.server"]}
+  :fetch     {:main-opts ["-m" "fetch.main"]}}}

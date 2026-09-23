@@ -159,6 +159,11 @@ Plain Clojure, with no writ require and no annotations. writ rejects:
   - fields from destructuring or `first`/`nth` under a non-nil test,
     including a `case` on `(first t)`
 
+  A test inside `and` counts in the then branch, and each test of an `or`
+  is false in its else branch. Recursion with no structural measure
+  (`(quot n 62)`) takes a fuel parameter first: `(loop [fuel 11, n n] (if
+  (and (pos? fuel) (pos? n)) (recur (dec fuel) (quot n 62)) ...))`.
+
   Parameters before the shrinking one pass through unchanged, so
   accumulators go after it, in the parameters and in `loop` bindings.
   `doseq` and `for` expand to such loops; their collection needs a type
@@ -496,12 +501,9 @@ example books use.
 ## The annotated surface
 
 `writ.defn` puts the annotations in the code and adds Bend's full
-discipline on top of the rules above. The books in `examples/` are
-written this way, as `main.clj`, `LAWS.clj` and `PROOF.clj` checked
-together by `writ.book/check-files`. They are being ported to spec
-namespaces. Their `LAWS.clj` files contain identities like
-`(= (status req s) (status req s))`: the `w/proof` gate needs those, and a
-spec namespace rejects them as vacuous. Don't copy them into a spec.
+discipline on top of the rules above. Its `w/law` forms need a `w/proof`
+gate that proves only identities, like `(= (status req s) (status req s))`;
+a spec namespace rejects those as vacuous. Don't copy them into a spec.
 
 - `(w/defn f [a :- Nat, ^:many b :- Nat] :- Nat body)`: `:-` gives types.
   An unmarked binder is affine: used at most once, with zero allowed.
@@ -525,14 +527,18 @@ spec namespace rejects them as vacuous. Don't copy them into a spec.
 ```sh
 rm -rf ~/.jolt/aot-cache .jolt   # the AOT cache can serve stale namespaces
 jolt -M:test                      # engine suite
-cd examples && jolt -M:test       # every example book
+cd examples && jolt -M:test       # the example programs and their specs
 ```
 
 When a test run disagrees with a direct `jolt -e` of the same code, clear the
 AOT cache before debugging. That is a known jolt issue, not a writ bug.
 
 `test/writ/spec_demo/` holds worked specs, a sort and a tree, each with
-broken implementations and the reports they produce.
+broken implementations and the reports they produce. `examples/` has four
+programs on real libraries (raylib pong and life, a ring-chez URL
+shortener, an http-client fetcher), each a pure core, a spec, an effect
+shell and broken cores; its README walks through what each report says.
+Model a new spec on those.
 
 ## Source map
 

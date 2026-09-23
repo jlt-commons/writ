@@ -1,10 +1,13 @@
 (ns examples-runner
-  "Hand-rolled test runner so this project depends on nothing but writ.
-  `jolt -M:test` requires the test namespaces and exits non-zero on failure."
+  "`jolt -M:test` runs every example's checks and exits non-zero on a failure."
   (:require [clojure.test :as t]
-            examples-test))
+            fetch.core-test
+            life.core-test
+            pong.core-test
+            shortener.core-test))
 
-(def test-namespaces '[examples-test])
+(def test-namespaces
+  '[pong.core-test life.core-test shortener.core-test fetch.core-test])
 
 (defn -main [& _]
   (let [{:keys [fail error]} (apply t/run-tests test-namespaces)]
