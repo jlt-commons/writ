@@ -96,6 +96,9 @@
     (= exp act) true
     (not (known? exp tenv)) true
     (= 'Any exp) true
+    ;; Any is also what inference writes for a return it could not work
+    ;; out (a local fn's), so as an actual it is unknown, and unknowns pass
+    (= 'Any act) true
     (and (= 'Int exp) (= 'Nat act)) true
     ;; a String is a finite seq of chars
     (and (= '(List Char) exp) (= 'String act)) true

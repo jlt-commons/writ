@@ -3,7 +3,7 @@
   outside it.
 
     (ns my.app.spec
-      (:require [writ.spec :refer [spec data ann law]]))
+      (:require [writ.spec :refer [spec data ann law calls]]))
 
     (spec my.app)                                ; the namespace it constrains
     (ann isort [(List Nat) -> (List Nat)])       ; a public fn's signature
@@ -33,6 +33,9 @@
   impostor that still satisfies every law is a gap in the spec.  A passing
   report counts the impostors each fn's laws rejected.
 
+  `(calls f [g ...])` states the exact set of fns `f` calls, read from its
+  source; `call-graph` and `mermaid` show a namespace's graph.
+
   `instrument` wraps the target's fns with the signatures' runtime checks,
   and `scan` says which of a namespace's fns writ could check at all."
   (:require [clojure.java.io :as io]
@@ -42,6 +45,7 @@
             [writ.data :as dt]
             [writ.kind :as kind]
             [writ.law :as lw]
+            [writ.lower :as l]
             [writ.norm :as norm]
             [writ.types :as ty]
             [writ.prove :as prover]
@@ -75,8 +79,9 @@
 (defn -register! [spec-ns k v]
   (swap! registry update spec-ns
          (fn [e] (case k
-                   :target {:target v :data [] :anns {} :laws []}
+                   :target {:target v :data [] :anns {} :laws [] :calls []}
                    :data (update e :data conj v)
+                   :calls (update e :calls (fnil conj []) v)
                    :ann (assoc-in e [:anns (first v)] (second v))
                    :law (update e :laws conj v))))
   nil)
@@ -99,6 +104,28 @@
   "Give a target fn its signature: (ann f [A B -> R])."
   [nm sig]
   `(-register! '~(ns-name *ns*) :ann '~[nm (parse-ann nm sig)]))
+
+(defn- resolve-callee
+  "A callee as the spec writes it: a target fn by its simple name, or a fn
+  of another namespace, whose alias in the spec namespace is resolved."
+  [g]
+  (if-let [n (namespace g)]
+    (let [a (get (ns-aliases *ns*) (symbol n))]
+      (symbol (if a (str (ns-name a)) n) (name g)))
+    g))
+
+(defmacro calls
+  "State exactly which fns `f` calls: (calls f [g str/join]).  A simple
+  name is a fn of the target; a qualified one is a fn of another
+  namespace, through the spec's own aliases.  clojure.core and host
+  members are not part of the call graph, and neither is `f` calling
+  itself."
+  [f gs]
+  (when-not (simple-sym? f)
+    (fail! "`calls` needs a simple fn name, had: `" (pr-str f) "`"))
+  (when-not (and (vector? gs) (every? symbol? gs))
+    (fail! "`calls " f "` needs a vector of fn names, had: " (pr-str gs)))
+  `(-register! '~(ns-name *ns*) :calls '~[f (mapv resolve-callee gs)]))
 
 (defmacro law
   "State a law about the target's behaviour."
@@ -765,6 +792,134 @@
                    (group :needs-ann "can be checked once an `ann` types its collection:")
                    (group :no "cannot be checked:"))}))
 
+;; --- the call graph --------------------------------------------------------------
+
+(defn- ns-names
+  "The names an ns form brings in: {:aliases {alias lib} :refers {name
+  lib/name}}, from its :require clauses."
+  [ns-form]
+  (reduce (fn [acc [lib & opts]]
+            (let [o (apply hash-map (take (* 2 (quot (count opts) 2)) opts))]
+              (cond-> acc
+                (symbol? (:as o)) (assoc-in [:aliases (:as o)] lib)
+                (sequential? (:refer o))
+                (update :refers into (map (fn [r] [r (symbol (name lib) (name r))]))
+                        (:refer o)))))
+          {:aliases {} :refers {}}
+          (for [clause (rest ns-form)
+                :when (and (seq? clause) (= :require (first clause)))
+                spec (rest clause)
+                :when (or (vector? spec) (symbol? spec))]
+            (if (symbol? spec) [spec] (seq spec)))))
+
+(defn- callee
+  "What a name in a body refers to in the call graph: the simple name of
+  one of the namespace's own fns, or a qualified fn of another namespace.
+  nil for clojure.core, host members, and anything else."
+  [s own {:keys [aliases refers]}]
+  (cond
+    (nil? (namespace s)) (cond (contains? own s) s
+                               (contains? refers s) (get refers s))
+    (l/host-member? s) nil
+    :else (let [q (symbol (namespace s))
+                lib (get aliases q q)]
+            (cond (contains? own (symbol (name s))) (when (= lib (:self aliases)) (symbol (name s)))
+                  (= 'clojure.core lib) nil
+                  :else (symbol (name lib) (name s))))))
+
+(defn- body-refs
+  "Every name a defn's body refers to, locals excluded.  The body is
+  lowered and its binders renamed apart, so a local that shadows a fn is
+  not a reference to it.  Code writ cannot lower is read as plain symbols."
+  [params body own]
+  (try
+    (let [ast (binding [l/*locals* own]
+                (l/uniquify (l/lower (list* 'fn params body))))]
+      (keep #(when (and (map? %) (= :ref (:op %))) (:name %))
+            (tree-seq coll? #(if (map? %) (vals %) (seq %)) ast)))
+    (catch Throwable _
+      (let [locals (set (mapcat l/binding-names params))]
+        (remove locals (filter symbol? (tree-seq coll? seq body)))))))
+
+(defn- graph-of
+  "{f #{callee}} for each defn in `forms`, in the terms of `callee`."
+  [forms]
+  (let [nsf (first (filter #(head? % "ns") forms))
+        names (assoc-in (ns-names nsf) [:aliases :self] (second nsf))
+        defns (keep #(when (ck/defn-form? %) (defn-parts %)) forms)
+        own (set (map :name defns))]
+    (into {} (for [{nm :name params :params body :body} defns
+                   :when (vector? params)]
+               [nm (disj (into #{} (keep #(callee % own names)) (body-refs params body own))
+                         nm)]))))
+
+(defn call-graph
+  "The call graph of a namespace, read from its source without loading
+  it: {f #{g ...}} for each of its defns.  A callee is one of its own fns
+  by simple name, or a fn of another namespace, qualified in full.
+  clojure.core, host members and self-recursion are left out.  Effect
+  code is read too; nothing here is checked."
+  [ns-sym]
+  (graph-of (book/read-forms (source-url ns-sym))))
+
+(defn- check-calls
+  "Each `calls` form against the target's call graph."
+  [{:keys [target calls]} forms]
+  (let [graph (graph-of forms)]
+    (vec (for [[f gs] (sort-by (comp str first) calls)]
+           (let [actual (get graph f)
+                 unknown (first (filter #(and (nil? (namespace %)) (not (contains? graph %))) gs))]
+             (cond
+               (nil? actual)
+               {:fn f :calls gs :status :failed
+                :error (str "the spec gives `" f "` a call set, but " target " defines no fn `" f "`")}
+
+               unknown
+               {:fn f :calls gs :status :failed
+                :error (str "the spec says `" f "` calls `" unknown "`, but " target
+                            " defines no fn `" unknown "`")}
+
+               :else
+               (let [declared (set gs)
+                     missing (vec (sort-by str (remove actual declared)))
+                     extra (vec (sort-by str (remove declared actual)))]
+                 (if (and (empty? missing) (empty? extra))
+                   {:fn f :calls gs :status :ok}
+                   {:fn f :calls gs :status :failed :missing missing :extra extra}))))))))
+
+(defn- mermaid-id [s]
+  (let [id (-> (str s) (str/replace "?" "_Q") (str/replace "!" "_B")
+               (str/replace #"[^A-Za-z0-9_]" "_"))]
+    (if (contains? #{"end" "graph" "subgraph" "flowchart"} id) (str id "_") id)))
+
+(defn mermaid
+  "A mermaid flowchart of a call graph.  Given a namespace, its own call
+  graph.  Given a spec namespace, its target's (or opts :target's), with
+  the spec's `calls` laid over it: a call the spec does not list is a
+  dotted edge marked `not in spec`, and a call it lists that the code does
+  not make is an edge marked `missing`."
+  ([ns-sym] (mermaid ns-sym {}))
+  ([ns-sym opts]
+   (require ns-sym)
+   (let [e (get @registry ns-sym)
+         target (if e (or (:target opts) (:target e)) ns-sym)
+         graph (call-graph target)
+         declared (into {} (map (fn [[f gs]] [f (set gs)])) (when e (:calls e)))
+         edges (concat
+                 (for [[f gs] (sort-by (comp str key) graph), g (sort-by str gs)]
+                   (if (and (contains? declared f) (not (contains? (declared f) g)))
+                     [f "-.->|not in spec|" g]
+                     [f "-->" g]))
+                 (for [[f gs] (sort-by (comp str key) declared)
+                       g (sort-by str gs)
+                       :when (and (contains? graph f) (not (contains? (get graph f) g)))]
+                   [f "--x|missing|" g]))
+         nodes (sort-by str (distinct (concat (keys graph) (mapcat (fn [[f _ g]] [f g]) edges))))]
+     (str "flowchart LR"
+          (apply str (for [n nodes] (str "\n  " (mermaid-id n) "[\"" n "\"]")))
+          (apply str (for [[f arrow g] edges]
+                       (str "\n  " (mermaid-id f) " " arrow " " (mermaid-id g))))))))
+
 (defn- tenv-of [data]
   (into {} (map (fn [f] (let [d (dt/parse f)] [(:name d) (dt/env d)]))) data))
 
@@ -855,7 +1010,7 @@
 
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
-  [{:keys [ok target spec static laws gaps unspecified rejected]}]
+  [{:keys [ok target spec static laws gaps unspecified rejected calls]}]
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
        (apply str (for [{l :law p :proof st :status} laws :when (= :proved st)]
                     (str "\n  law `" l "` proved " p)))
@@ -866,7 +1021,27 @@
                            (str/join ", " (for [[k c] (sort-by key (frequencies (map :kind imps)))]
                                             (str c " " (name k))))
                            ")"))))
+       (when ok
+         (apply str (for [{f :fn gs :calls} calls]
+                      (str "\n  `" f "` "
+                           (if (seq gs)
+                             (str "calls exactly " (str/join ", " gs))
+                             "calls nothing outside clojure.core")))))
        (when-not (:ok static) (str "\n\n" (:error static)))
+       (apply str (for [{f :fn gs :calls :keys [error missing extra]} calls
+                        :when (or error (seq missing) (seq extra))]
+                    (if error
+                      (str "\n\n" error)
+                      (str "\n\nthe call graph of `" f "` is not the one the spec gives"
+                           (apply str (for [g missing]
+                                        (str "\n  `" f "` does not call `" g
+                                             "`, which the spec says it calls")))
+                           (apply str (for [g extra]
+                                        (str "\n  `" f "` calls `" g
+                                             "`, which the spec does not list")))
+                           "\n  the spec says `" f "` calls "
+                           (if (seq gs) (str "exactly " (str/join ", " gs)) "nothing outside clojure.core")
+                           ". Call through the layers the spec names instead of around them."))))
        (apply str (map #(str "\n\n" (format-failure %)) (filter #(= :failed (:status %)) laws)))
        (apply str (map #(str "\n\nlaw `" (:law %) "` is vacuous: " (:why %)
                              ". A law must say what the code does.")
@@ -932,7 +1107,7 @@
                                               :when (and (not private?) (not (contains? anns nm)))]
                                           nm)))}]
      (if-not (:ok static)
-       (let [r (assoc base :ok false :laws [] :gaps [])]
+       (let [r (assoc base :ok false :laws [] :gaps [] :calls [])]
          (assoc r :message (format-report r)))
        (let [tenv (tenv-of data)
              publics (set (keys (ns-publics (the-ns target))))
@@ -993,9 +1168,11 @@
              gaps (vec (for [{f :fn s :survivors} per-fn :when (seq s)]
                          {:fn f :survivors s}))
              results (mapv #(dissoc % :prop) results)
-             r (assoc base :laws results :gaps gaps
+             call-results (check-calls e (book/read-forms (source-url target)))
+             r (assoc base :laws results :gaps gaps :calls call-results
                            :rejected (mapv #(select-keys % [:fn :laws :rejected]) per-fn)
-                           :ok (and sound? (empty? gaps)))]
+                           :ok (and sound? (empty? gaps)
+                                    (every? #(= :ok (:status %)) call-results)))]
          (assoc r :message (format-report r)))))))
 
 (defn check!

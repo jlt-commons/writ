@@ -411,3 +411,78 @@
 
 (deftest pinned-args-ignore-calls-that-leave-an-argument-out
   (is (= {0 #{1}} (#'spec/pinned-args '[(f 1 2) (f 1)] 'f 2))))
+
+;; --- calls: the call graph the spec pins -------------------------------------
+
+(def ^:private pipeline-spec 'writ.spec-demo.pipeline-spec)
+
+(defn- calls-run [target]
+  (spec/check pipeline-spec {:target target :seed 42 :adequacy false :prove false}))
+
+(deftest a-target-that-keeps-its-layers-meets-its-calls
+  (let [r (calls-run nil)]
+    (is (:ok r) (:message r))
+    (is (= '[{:fn handle :calls [normalize respond] :status :ok}
+             {:fn normalize :calls [clojure.string/lower-case clojure.string/trim] :status :ok}
+             {:fn respond :calls [valid?] :status :ok}
+             {:fn valid? :calls [] :status :ok}]
+           (:calls r)))
+    (is (str/includes? (:message r) "`handle` calls exactly normalize, respond"))))
+
+(deftest inlining-a-helper-breaks-the-call-graph
+  (let [r (calls-run 'writ.spec-demo.pipeline-inline)
+        c (first (filter #(= 'handle (:fn %)) (:calls r)))]
+    (is (not (:ok r)))
+    (testing "the laws still hold: only the call graph catches it"
+      (is (every? #(not= :failed (:status %)) (:laws r))))
+    (is (= :failed (:status c)))
+    (is (= '[normalize] (:missing c)))
+    (is (= '[clojure.string/lower-case clojure.string/trim] (:extra c)))
+    (is (str/includes? (:message r) "`handle` does not call `normalize`, which the spec says it calls"))
+    (is (str/includes? (:message r) "`handle` calls `clojure.string/lower-case`, which the spec does not list"))))
+
+(deftest skipping-a-layer-breaks-the-call-graph
+  (let [c (first (filter #(= 'handle (:fn %))
+                         (:calls (calls-run 'writ.spec-demo.pipeline-bypass))))]
+    (is (= '[respond] (:missing c)))
+    (is (= '[valid?] (:extra c)))))
+
+(deftest a-local-that-shadows-a-fn-is-not-a-call-to-it
+  (let [c (first (filter #(= 'handle (:fn %))
+                         (:calls (calls-run 'writ.spec-demo.pipeline-shadow))))]
+    (is (= '[respond] (:missing c)))
+    (is (= '[valid?] (:extra c)))))
+
+(deftest calls-must-name-the-target-s-fns
+  (let [r (spec/check 'writ.spec-demo.pipeline-unknown-spec {:seed 42 :adequacy false :prove false})]
+    (is (not (:ok r)))
+    (is (str/includes? (:message r) "the spec says `handle` calls `normalise`, but writ.spec-demo.pipeline defines no fn `normalise`"))
+    (is (str/includes? (:message r) "the spec gives `render` a call set, but writ.spec-demo.pipeline defines no fn `render`"))))
+
+(deftest call-graph-reads-any-namespace
+  (is (= '{normalize #{clojure.string/lower-case clojure.string/trim}
+           valid? #{}
+           respond #{valid?}
+           handle #{normalize respond}}
+         (spec/call-graph 'writ.spec-demo.pipeline)))
+  (testing "effect code too: it is read, not checked"
+    (let [g (spec/call-graph 'writ.spec-demo.scan-mixed)]
+      (is (= '#{shout classify} (get g 'loud-classify)))
+      (is (= #{} (get g 'log!))))))
+
+(deftest mermaid-draws-the-call-graph
+  (let [m (spec/mermaid 'writ.spec-demo.pipeline)]
+    (is (str/starts-with? m "flowchart LR"))
+    (is (str/includes? m "handle --> normalize"))
+    (is (str/includes? m "handle --> respond"))
+    (is (str/includes? m "normalize --> clojure_string_lower_case")))
+  (testing "given a spec, it draws the target and marks calls the spec does not list"
+    (let [m (spec/mermaid pipeline-spec {:target 'writ.spec-demo.pipeline-bypass})]
+      (is (str/includes? m "handle -.->|not in spec| valid_Q"))
+      (is (str/includes? m "handle --x|missing| respond")))))
+
+(deftest a-local-fn-s-unknown-return-does-not-fail-a-signed-return
+  ;; inference types a local fn's return it cannot work out as Any; that is
+  ;; an unknown, so the signed return type still holds
+  (is (writ.types/compat? '(Tuple Keyword String) 'Any {}))
+  (is (:ok (:static (calls-run 'writ.spec-demo.pipeline-shadow)))))

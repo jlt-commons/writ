@@ -2,11 +2,12 @@
 name: writ
 description: >-
   Use when writing a writ spec -- the problem statement as checkable laws
-  about what code means (writ.spec: spec/ann/data/law) -- or the plain Clojure
-  implementation it constrains, or when reading a writ.spec report or any
+  about what code means and how it calls (writ.spec:
+  spec/ann/data/law/calls) -- or the plain Clojure implementation it
+  constrains, or when reading a writ.spec report or any
   "Writ:" error (purity, termination, ordering, arity, types, tagged data,
-  failing, vacuous or gapped laws). Also for the annotated writ.defn surface
-  (w/defn, ^:many, w/match, w/law, w/proof) used by the example books.
+  failing, vacuous or gapped laws, call graph mismatches). Also for the
+  annotated writ.defn surface (w/defn, ^:many, w/match, w/law, w/proof).
 ---
 
 # writ
@@ -76,6 +77,31 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
   A free name refers first to the target's public fns, then to the spec's
   helpers, then to clojure.core. Laws cannot quantify over fn types,
   because no generator exists for them.
+- `(calls f [g str/join])`: `f`'s direct calls are exactly this set. A
+  simple name is a target fn; a qualified one is a fn of another
+  namespace, through the spec's aliases. Called or passed as a value both
+  count. clojure.core, host members, self-recursion and locals that
+  shadow a fn do not. See [The call graph](#the-call-graph).
+
+## The call graph
+
+Laws say what the code computes; `calls` says how it is put together.
+Use it where the structure is part of the intent: a handler goes through
+the layer that owns a rule (`respond` decides validity, so `handle` must
+call `respond`, not `valid?`), a helper is reused rather than inlined, a
+pure core never reaches an IO namespace. An implementation that inlines
+or bypasses passes every law and still fails `calls`.
+
+- Start from the code's actual graph: `(spec/call-graph 'my.ns)` returns
+  `{f #{g ...}}` for any namespace, effect code included. It reads the
+  source and checks nothing.
+- `(spec/mermaid 'my.ns)` renders it as a mermaid flowchart;
+  `(spec/mermaid 'my.spec)` draws the target with the spec's `calls`
+  over it, marking unlisted calls `not in spec` and absent ones `missing`.
+- The static rules use the graph whether or not a spec has `calls`:
+  definitions refer only to those above them, so there are no cycles but
+  self-recursion, and `scan` reports every caller of a fn writ cannot
+  check ("it uses `f`, which writ cannot check").
 
 ## What a spec should say
 
@@ -172,6 +198,8 @@ value anywhere else is rejected.
 (spec/check! 'my.sort-spec)                       ; throws with the message
 (spec/sample '(List Nat) {} 5)                    ; what a type generates
 (spec/scan 'my.ns)                                ; which fns a spec could cover
+(spec/call-graph 'my.ns)                          ; {f #{g ...}}, read from source
+(spec/mermaid 'my.spec)                           ; the graph, with the spec's calls
 (spec/instrument 'my.sort-spec)                   ; runtime arg/return checks
 ```
 
@@ -233,6 +261,13 @@ confirm it, then without one.
   the named stand-in satisfies the spec. Add a law about `f`'s meaning
   that the stand-in breaks. If you own only the implementation, report the
   gap to the spec's owner; the code is not at fault.
+- ``the call graph of `f` is not the one the spec gives`` - `f` calls a
+  fn the spec does not list, or does not call one it lists. Route the
+  call through the named fn (don't inline it, don't skip a layer). If the
+  graph in the spec is wrong, say so; don't edit `calls` to match.
+- ``the spec says `f` calls `g`, but ns defines no fn `g` `` / ``the spec
+  gives `f` a call set, but ns defines no fn `f` `` - define it or fix
+  the spelling; the spec names the structure.
 - ``law `x` fails for ...`` - the implementation is wrong for that input;
   see [Reading a report](#reading-a-report).
 - ``the hypothesis never held in N trials`` - no generated input satisfied

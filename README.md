@@ -211,7 +211,7 @@ sufficient.
 
 ## Writing a spec
 
-A spec namespace requires `writ.spec` and uses four forms.
+A spec namespace requires `writ.spec` and uses five forms.
 
 - `(spec target.ns)` names the namespace it constrains. It comes first.
 - `(ann f [A B -> R])` gives fn `f` its parameter and return types. Every
@@ -221,6 +221,8 @@ A spec namespace requires `writ.spec` and uses four forms.
 - `(data Name Ctor (Ctor2 FieldType ...) ...)` declares a datatype the
   target's values use. `(data Box [a] (Wrap a))` takes type parameters.
 - `(law name proposition)` states a law.
+- `(calls f [g ...])` states exactly which fns `f` calls. See
+  [The call graph](#the-call-graph).
 
 A spec may define its own helper fns, like `ascending?` above. They run
 only when laws run.
@@ -279,6 +281,82 @@ A proposition is built from:
 Inside a law, a free name refers first to the target's public fns, then to
 the spec's own helpers, then to `clojure.core`.
 
+### The call graph
+
+Laws say what the code computes. They can't say how the code is put
+together, and an implementation can compute the right thing through the
+wrong structure: it inlines a helper instead of calling it, so the two
+drift apart the next time the helper changes, or it skips a layer and
+checks validity itself instead of going through the fn that owns the
+rule. Every law still holds. `calls` states the structure:
+
+```clojure
+(ns shortener.core-spec
+  (:require [clojure.string :as str]
+            [writ.spec :refer [spec ann law calls]]))
+
+(spec shortener.core)
+
+(calls normalize [str/lower-case str/trim])
+(calls respond   [valid?])
+(calls handle    [normalize respond])   ; not valid?: respond owns that
+```
+
+`(calls f [g ...])` means `f`'s direct calls are exactly that set, no
+more and no fewer. The call graph is read from `f`'s source:
+
+- A simple name is one of the target's own fns. A qualified name is a fn
+  of another namespace, resolved through the spec's aliases, so
+  `str/trim` is `clojure.string/trim`.
+- A fn counts when it is called or referred to as a value, as in
+  `(map normalize xs)`.
+- `clojure.core`, host members and `f` calling itself are left out.
+  Recursion is the termination rule's business.
+- A local binding that shadows a fn is not a call to it. The body is
+  lowered and its locals renamed apart before the graph is read.
+
+A `calls` failure is reported beside the laws, and it fails the check:
+
+```
+the call graph of `handle` is not the one the spec gives
+  `handle` does not call `respond`, which the spec says it calls
+  `handle` calls `valid?`, which the spec does not list
+  the spec says `handle` calls exactly normalize, respond. Call through the layers the spec names instead of around them.
+```
+
+A passing report lists each fn's call set.
+
+`(spec/call-graph 'my.ns)` returns the graph of any namespace as
+`{f #{g ...}}`. It reads the source without loading or checking it, so it
+works on effect code too, and it's the quickest way to write a first
+`calls` form. `(spec/mermaid 'my.ns)` renders the same graph as a mermaid
+flowchart. Given a spec namespace, `(spec/mermaid 'my.spec)` draws the
+target's graph with the spec laid over it. A call the spec doesn't list
+is a dotted edge marked `not in spec`, and a listed call the code doesn't
+make is an edge marked `missing`:
+
+```
+flowchart LR
+  handle["handle"]
+  normalize["normalize"]
+  respond["respond"]
+  valid_Q["valid?"]
+  handle --> normalize
+  handle -.->|not in spec| valid_Q
+  respond --> valid_Q
+  handle --x|missing| respond
+```
+
+writ also uses the call graph in its static rules, whether or not the
+spec has `calls` forms:
+
+- A definition refers only to definitions above it, so the graph has no
+  cycles except self-recursion. A defn and the local fns it binds can't
+  be mutually recursive either.
+- `scan` walks the graph: a fn that calls one writ can't check is reported
+  with "it uses `f`, which writ cannot check", so one effect deep in a
+  call chain shows up at every caller above it.
+
 ## Running the check
 
 `(writ.spec/check 'my.sort-spec)` returns a report map:
@@ -291,6 +369,7 @@ the spec's own helpers, then to `clojure.core`.
  :laws        [{:law sorted :status :tested :trials 100 :seed 1732 :discarded 0} ...]
  :gaps        []                ; fns the laws don't pin down
  :rejected    [{:fn isort ...}] ; per fn: its laws and the stand-ins they rejected
+ :calls       [{:fn handle :calls [normalize respond] :status :ok} ...]
  :unspecified []                ; public fns with no ann
  :message     "writ.spec: my.sort-spec against my.sort: ok\n  `insert`: ..."}
 ```
@@ -329,6 +408,10 @@ It works in three stages, and each runs only if the one before passed.
      `insert`: 2 laws, 5 impostors rejected (2 constant, 1 pass-through, 2 perturbed)
      `isort`: 2 laws, 5 impostors rejected (2 constant, 1 pass-through, 2 perturbed)
    ```
+
+The `calls` forms are checked once the static stage passes, beside the
+laws, and each gets an entry in `:calls` with `:status` `:ok` or
+`:failed`, plus `:missing` and `:extra` when it failed.
 
 Options: `:target` checks a different implementation against the same spec,
 `:trials` is the number of test.check runs per law (default 100), `:seed`
@@ -433,6 +516,8 @@ The report map has the same in `:forms`, one entry per form with
 `(spec/instrument 'my.sort-spec)` wraps the target's signed fns with runtime
 argument and return checks for use at the REPL, and `unstrument` removes
 them. `(spec/sample '(List Nat) {} 5)` shows what a type generates.
+`(spec/call-graph 'my.ns)` and `(spec/mermaid 'my.ns)` read a namespace's
+call graph; see [The call graph](#the-call-graph).
 
 ## What the static check enforces
 
@@ -518,7 +603,7 @@ of forms, and `writ.book/check-files` checks source files as one book.
 
 ## Modules
 
-- `writ.spec`: spec namespaces, law checking, instrument
+- `writ.spec`: spec namespaces, law checking, the call graph, instrument
 - `writ.prove`: the proof search; `writ.prove.term`, `writ.prove.rewrite`
   and `writ.prove.translate` hold the terms, the rewrite rules and the
   translation from Clojure
