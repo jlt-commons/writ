@@ -569,13 +569,23 @@
         finite (atom (into #{} (comp (filter #(finite-type? (ty/binder-type % tenv)))
                                      (map qname-of))
                            params))
-        copy-of (fn [init s]
-                  (let [x (if (and (= :invoke (:op init))
-                                   (contains? '#{seq vec} (core-head init {:bound #{}}))
-                                   (= 1 (count (:args init))))
-                            (first (:args init))
-                            init)]
-                    (and (ref? x) (contains? s (qname-of (:name x))))))]
+        ;; a copy of a finite collection, or what a collection fn makes of
+        ;; one, is finite: (rest xs), (drop 2 xs), (filter p xs), ...
+        copy-of (fn copy-of [init s]
+                  (let [h (when (= :invoke (:op init)) (core-head init {:bound #{}}))
+                        args (:args init)
+                        coll (case h
+                               (seq vec rest next nnext butlast pop distinct reverse)
+                               (when (= 1 (count args)) (first args))
+                               (drop filter remove keep take-while drop-while sort)
+                               (when (<= 1 (count args)) (last args))
+                               map (when (<= 2 (count args)) (some #(when (copy-of % s) %) (rest args)))
+                               (nthrest nthnext subvec) (first args)
+                               nil)]
+                    (cond
+                      coll (copy-of coll s)
+                      (ref? init) (contains? s (qname-of (:name init)))
+                      :else false)))]
     (walk-ast ast
       (fn [n]
         (case (:op n)

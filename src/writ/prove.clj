@@ -179,7 +179,7 @@
                               [(rw/context (dissoc opts :ih)) false] hyps)
         ;; the induction hypotheses, read under the facts of this case
         ctx (assoc ctx :ih (mapv (fn [i] (update i :lhs #(rw/normalize ctx %))) (:ih opts)))
-        ctx (assoc ctx :memo (atom {}) :stuck (atom #{}))
+        ctx (assoc ctx :memo (atom {}) :stuck (atom #{}) :int-memo (atom {}))
         n (when-not vacuous (rw/normalize ctx g))]
     (swap! (:unfolded opts) into @(:unfolded ctx))
     (when (and *stuck* (not vacuous) (not (truthy? n)) (or (zero? depth) (nil? (split-candidate n))))
@@ -207,17 +207,35 @@
   "The law at a smaller value, as rewrites: an equality rewrites its left
   side to its right, anything else rewrites to true."
   [opts {:keys [hyps goals]} v smaller]
-  (let [nctx (rw/context (dissoc opts :ih))
+  (let [free (:ih-free opts)
+        ;; a variable the law is quantified over as well stays free in the
+        ;; hypothesis: renamed to a pattern variable, and held to its type
+        ren (into {} (map (fn [[x _]] [x (symbol (str "?ih%" x))])) free)
+        pvars (set (vals ren))
+        nctx (rw/context (-> opts (dissoc :ih)
+                             (update :types merge (into {} (map (fn [[x ty]] [(ren x) ty])) free))))
         n #(rw/normalize nctx %)
-        hyp (when (seq hyps)
-              (reduce (fn [a b] [:if a b [:lit false]]) hyps))]
+        type-hyps (for [[x ty] free
+                        :when (contains? '#{Nat Int} ty)]
+                    (cond-> [:call 'integer? (ren x)]
+                      (= 'Nat ty) (as-> h [:if h [:call '<= [:lit 0] (ren x)] [:lit false]])))
+        hyp (when (seq (concat hyps type-hyps))
+              (reduce (fn [a b] [:if a b [:lit false]])
+                      (concat (map #(t/subst % ren) hyps) type-hyps)))]
     (vec (for [s smaller
                g goals
-               :let [gi (t/subst g {v s})
+               :let [gi (t/subst (t/subst g ren) {v s})
                      hi (some-> hyp (t/subst {v s}))]]
-           (if (and (= :call (head gi)) (= '= (second gi)) (= 4 (count gi)))
-             {:hyp hi :lhs (n (nth gi 2)) :rhs (n (nth gi 3))}
-             {:hyp hi :lhs (n gi) :rhs [:lit true]})))))
+           (cond-> (if (and (= :call (head gi)) (= '= (second gi)) (= 4 (count gi)))
+                     {:hyp hi :lhs (n (nth gi 2)) :rhs (n (nth gi 3))}
+                     {:hyp hi :lhs (n gi) :rhs [:lit true]})
+             (seq pvars) (assoc :vars pvars))))))
+
+(defn- useful-ih
+  "The hypotheses that can rewrite something: not one whose left side
+  normalised to a bare variable, which would match every term."
+  [ihs]
+  (vec (remove (comp symbol? :lhs) ihs)))
 
 (defn- prove-all
   "Prove every goal (under the hyps) in one context of opts."
@@ -276,14 +294,96 @@
                   (let [opts* (-> opts
                                   (update :types merge (:types c))
                                   (assoc :ih []))
-                        opts* (assoc opts* :ih (ih-for opts* g v (:smaller c)))
+                        opts* (assoc opts* :ih (useful-ih (ih-for opts* g v (:smaller c))))
                         gi {:hyps (instance (:hyps g) v (:value c))
                             :goals (instance (:goals g) v (:value c))}]
                     [c (or (prove-all opts* gi)
-                           (by-generalizing opts* gi (keys (:types c))))]))]
+                           (by-generalizing (dissoc opts* :ih-free) gi (keys (:types c))))]))]
       (when (every? (comp some? second) steps)
         {:by :induction :on v
          :cases (mapv (fn [[c p]] {:case (:desc c) :proof p}) steps)}))))
+
+(defn- fuelled
+  "f's result, or nil when it runs out of fuel."
+  [f]
+  (try (f)
+       (catch clojure.lang.ExceptionInfo e
+         (if (:writ.prove.rewrite/fuel (ex-data e)) nil (throw e)))))
+
+(def ^:private synthetic-lemmas
+  "The prover's own lemmas, which are not laws of the spec."
+  '#{accumulator-is-an-integer accumulator-adds})
+
+(defn- plus-of?
+  "Is t the accumulator p grown by addition: (+ p e), (+ e p) or (inc p)?"
+  [t p]
+  (and (= :call (head t))
+       (or (and (= 'inc (second t)) (= p (nth t 2 nil)))
+           (and (= '+ (second t)) (= 4 (count t)) (some #{p} (drop 2 t))))))
+
+(defn- accumulators
+  "Calls in terms that fold with + into an accumulator starting at 0: a
+  recursive definition whose recursive calls grow parameter i by
+  addition, called with 0 there, and a reduce by such a fn from 0.  Each
+  is {:call c :with (fn [acc] c-with-acc)}."
+  [opts terms]
+  (distinct
+    (for [x (mapcat t/subterms terms)
+          r (case (head x)
+              :app (let [d (get-in opts [:defs (second x)])
+                         args (vec (drop 2 x))
+                         rec (filter #(and (= :app (head %)) (= (second x) (second %)))
+                                     (t/subterms (:body d)))]
+                     (when (and (:recursive? d) (seq rec))
+                       (for [i (range (count args))
+                             :when (and (= [:lit 0] (nth args i))
+                                        (every? #(plus-of? (nth % (+ 2 i)) (nth (:params d) i)) rec))]
+                         {:call x :with (fn [acc] (assoc x (+ 2 i) acc))})))
+              :call (when (and (= 'reduce (second x)) (= 5 (count x)) (= [:lit 0] (nth x 3)))
+                      (let [f (nth x 2)]
+                        (when (or (= [:cfn '+] f)
+                                  (and (= :fn (head f)) (= 2 (count (second f)))
+                                       (plus-of? (nth f 2) (first (second f)))))
+                          [{:call x :with (fn [acc] (assoc x 3 acc))}])))
+              nil)]
+      r)))
+
+(defn- generalized-lemmas
+  "For a fold into an accumulator starting at 0, prove that the fold from
+  any integer acc is an integer, and is acc plus the fold from 0; each by
+  induction on a list variable of the fold, acc left free in the
+  hypothesis.  Returns the lemma rules, or nil."
+  [opts {:keys [call with]}]
+  (let [acc (symbol (str "acc%" (Math/abs (hash call))))
+        c-acc (with acc)
+        law-vars (filter #(get-in opts [:types %]) (sort-by str (t/vars call)))
+        list-vars (filter #(let [ty (get-in opts [:types %])]
+                             (and (seq? ty) (contains? '#{List Vec} (first ty))))
+                          law-vars)
+        opts* (-> opts (update :types assoc acc 'Int) (assoc :ih-free {acc 'Int}))
+        prove (fn [o g] (first (keep (fn [v] (fuelled #(by-induction o g v (get-in opts [:types v]))))
+                                     list-vars)))
+        int-goal {:hyps [] :goals [[:call 'integer? c-acc]]}
+        eq-goal {:hyps [] :goals [[:call '= c-acc [:call '+ acc call]]]}
+        as-rules (fn [nm goal]
+                   (let [ren (into {} (map (fn [x] [x (symbol (str "?" nm "%" x))])) (cons acc law-vars))
+                         g (t/subst (first (:goals goal)) ren)
+                         ctx (rw/context (-> opts (dissoc :ih)
+                                             (update :types merge
+                                                     (into {} (map (fn [[x v]] [v (if (= x acc) 'Int (get-in opts [:types x]))]))
+                                                           ren))))
+                         n #(rw/normalize ctx %)
+                         hyp [:call 'integer? (ren acc)]]
+                     (if (= 'integer? (second g))
+                       {:name nm :vars (set (vals ren)) :hyp hyp :lhs (n g) :rhs [:lit true]}
+                       {:name nm :vars (set (vals ren)) :hyp hyp :lhs (n (nth g 2)) :rhs (n (nth g 3))})))]
+    (when (seq list-vars)
+      (when-let [p1 (prove opts* int-goal)]
+        (let [r1 (as-rules 'accumulator-is-an-integer int-goal)
+              opts2 (update opts* :lemmas conj r1)]
+          (when-let [p2 (prove opts2 eq-goal)]
+            {:rules [r1 (as-rules 'accumulator-adds eq-goal)]
+             :trace {:by :accumulator :on (t/show call) :integer p1 :adds p2}}))))))
 
 (defn- case-vars [trace]
   (distinct (keep (fn [x] (when (and (map? x) (= :list-cases (:by x))) (:on x)))
@@ -307,7 +407,11 @@
          (when-let [gs (seq (distinct (keep (fn [x] (when (and (map? x) (= :generalizing (:by x)))
                                                        (:on x)))
                                            (tree-seq coll? seq trace))))]
-           (str ", generalising " (str/join " and " (map pr-str gs)))))))
+           (str ", generalising " (str/join " and " (map pr-str gs))))
+         (when-let [as (seq (distinct (keep (fn [x] (when (and (map? x) (= :accumulator (:by x)))
+                                                       (:on x)))
+                                           (tree-seq coll? seq trace))))]
+           (str ", generalising the accumulator of " (str/join " and " (map pr-str as)))))))
 
 (defn- lemma-rules
   "An earlier proved law as rewrite rules: each equality rewrites its left
@@ -327,10 +431,14 @@
                 (t/subst (reduce (fn [a b] [:if a b [:lit false]]) (:hyps g)) ren))]
       (when (seq bs)
         (vec (for [gl (:goals g)
-                   :let [[l r] (if (and (= :call (head gl)) (= '= (second gl)) (= 4 (count gl)))
-                                 [(n (nth gl 2)) (n (nth gl 3))]
+                   :let [calls (fn [x] (count (filter #(= :app (head %)) (t/subterms x))))
+                         [l r] (if (and (= :call (head gl)) (= '= (second gl)) (= 4 (count gl)))
+                                 (let [a (n (nth gl 2)) b (n (nth gl 3))]
+                                   ;; rewrite toward fewer calls of definitions:
+                                   ;; (= (+ a b) (total ...)) rewrites the call
+                                   (if (< (calls a) (calls b)) [b a] [a b]))
                                  [(n gl) [:lit true]])]
-                   :when (not (symbol? l))]
+                   :when (not (or (symbol? l) (= :lin (head l))))]
                {:name name :vars (set (vals ren)) :hyp hyp :lhs l :rhs r}))))
     (catch clojure.lang.ExceptionInfo _ nil)))
 
@@ -351,20 +459,43 @@
                 :unfolded unfolded :fuel (or fuel 20000) :lemmas-used lemmas-used
                 :rets (or rets {})
                 :lemmas (vec (mapcat #(lemma-rules % defs tenv own) lemmas))}
+          ;; an attempt that runs out of fuel fails on its own; the others
+          ;; still get their turn
           attempt (fn [f] (reset! unfolded #{}) (reset! lemmas-used #{})
-                    (let [r (f)] [r @unfolded]))
+                    (let [r (try (f)
+                                 (catch clojure.lang.ExceptionInfo e
+                                   (if (:writ.prove.rewrite/fuel (ex-data e)) nil (throw e))))]
+                      [r @unfolded]))
           tries (concat [#(some->> (prove-all opts g) (hash-map :by :cases :proofs))]
                         (for [[v ty] bs] #(by-induction opts g v ty)))
           [trace used] (or (first (filter first (map attempt tries))) [nil #{}])
+          ;; a fold into an accumulator: prove it adds, then try again with that
+          [trace used] (if trace
+                         [trace used]
+                         (or (first
+                               (for [cand (accumulators opts (fuelled
+                                                               #(let [ctx (rw/context opts)]
+                                                                  (mapv (fn [x] (rw/normalize ctx x))
+                                                                        (concat (:hyps g) (:goals g))))))
+                                     :let [gl (generalized-lemmas opts cand)]
+                                     :when gl
+                                     :let [opts* (update opts :lemmas into (:rules gl))
+                                           r (first (filter first
+                                                            (map attempt
+                                                                 (concat [#(some->> (prove-all opts* g) (hash-map :by :cases :proofs))]
+                                                                         (for [[v ty] bs] #(by-induction opts* g v ty))))))]
+                                     :when r]
+                                 [{:by :with :lemma (:trace gl) :proof (first r)} (second r)]))
+                             [nil #{}]))
           target-used (filter #(= (str target) (namespace %)) used)]
       (cond
         (nil? trace) {:proved false :reason "no proof found"}
         (empty? target-used) {:proved false :reason "the proof does not use the code"}
-        :else {:proved true :trace trace
-               :summary (str (summary trace)
-                             (when (seq @lemmas-used)
-                               (str ", citing " (str/join ", " (sort @lemmas-used)))))
-               :lemmas (vec (sort @lemmas-used))}))
+        :else (let [cited (sort (remove synthetic-lemmas @lemmas-used))]
+                {:proved true :trace trace
+                 :summary (str (summary trace)
+                               (when (seq cited) (str ", citing " (str/join ", " cited))))
+                 :lemmas (vec cited)})))
     (catch clojure.lang.ExceptionInfo e
       (cond
         (tr/outside-reason e) {:proved false :reason (ex-message e)}

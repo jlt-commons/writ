@@ -248,3 +248,36 @@
                (run-def defs 'writ.spec-demo.total/total [xs]))))))
   (let [l (law-result (spec/check 'writ.spec-demo.total-spec {:seed 42 :adequacy false}) 'total-of-two)]
     (is (= :proved (:status l)) (pr-str l))))
+
+(deftest reduce-folds-a-list
+  (let [plus [:fn '[a b] [:call '+ 'a 'b]]]
+    (is (= [:lit 6] (norm [:call 'reduce plus [:lit 0] (t/value->term [1 2 3])])))
+    (is (= [:lit 0] (norm [:call 'reduce plus [:lit 0] [:nil]])))
+    (testing "over concatenated colls it folds one after the other"
+      (is (= (norm {:types '{xs {:elems Nat} ys {:elems Nat}}}
+                   [:call 'reduce plus [:call 'reduce plus [:lit 0] [:sq 'xs]] [:sq 'ys]])
+             (norm {:types '{xs {:elems Nat} ys {:elems Nat}}}
+                   [:call 'reduce plus [:lit 0] [:sq [:eapp 'xs 'ys]]]))))
+    (testing "a fn that may return reduced is not unrolled"
+      (is (= :call (first (norm [:call 'reduce [:fn '[a b] [:ap 'g 'a 'b]] [:lit 0]
+                                 (t/value->term [1 2])])))))))
+
+;; --- phase 3: folds and accumulators --------------------------------------------
+
+(deftest a-fold-into-an-accumulator-is-proved-by-generalising-it
+  (let [r (spec/check 'writ.spec-demo.total-spec {:seed 42})]
+    (is (:ok r) (:message r))
+    (doseq [nm '[total-sums size-counts reduce-sums]]
+      (let [l (law-result r nm)]
+        (is (= :proved (:status l)) (pr-str l))
+        (is (re-find #"generalising the accumulator of" (:proof l)) (pr-str l))
+        (is (not-any? '#{accumulator-adds accumulator-is-an-integer} (:lemmas l)))))
+    (testing "a reduce over concatenated colls, citing the law before it"
+      (is (= :proved (:status (law-result r 'reduce-appends))))
+      (is (= '[reduce-sums] (:lemmas (law-result r 'reduce-appends)))))))
+
+(deftest a-broken-fold-is-never-proved
+  (let [r (spec/check 'writ.spec-demo.total-spec {:seed 42 :target 'writ.spec-demo.total-bad})]
+    (doseq [nm '[total-sums size-counts reduce-sums]]
+      (is (= :failed (:status (law-result r nm))) (str nm)))
+    (is (not-any? :prover-bug (:laws r)))))

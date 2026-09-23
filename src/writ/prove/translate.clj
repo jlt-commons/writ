@@ -14,7 +14,8 @@
 (def core-fns
   "The clojure.core fns the prover models."
   '#{seq first rest next second empty? count cons list vector vec concat
-     filter map not = < <= > >= + - * inc dec zero? pos? neg? nth identity apply})
+     filter map not = < <= > >= + - * inc dec zero? pos? neg? nth identity apply
+     reduce integer?})
 
 (def value-fns
   "The clojure.core fns that may be passed as values: the modelled ones,

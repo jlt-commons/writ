@@ -159,14 +159,43 @@
 
 (def ^:private int-types '#{Nat Int})
 
+(declare proved-integer?)
+
+(def ^:private int-list-types '#{(List Nat) (List Int) (Vec Nat) (Vec Int)})
+
+(defn- int-elems?
+  "Is every element of this collection an integer, by the types?"
+  [ctx c]
+  (letfn [(elems-ok? [e]
+            (cond
+              (symbol? e) (contains? #{{:elems 'Nat} {:elems 'Int}} (get-in ctx [:types e]))
+              :else (case (head e)
+                      :enil true
+                      :econs (and (or (t/int-lit? (nth e 1))
+                                      (and (symbol? (nth e 1))
+                                           (contains? int-types (get-in ctx [:types (nth e 1)]))))
+                                  (elems-ok? (nth e 2)))
+                      :eapp (and (elems-ok? (nth e 1)) (elems-ok? (nth e 2)))
+                      :elems (int-elems? ctx (second e))
+                      false)))]
+    (cond
+      (symbol? c) (contains? int-list-types (get-in ctx [:types c]))
+      (= :nil (head c)) true
+      (= :sq (head c)) (elems-ok? (second c))
+      :else false)))
+
 (defn int-term?
-  "Is t known to be an integer?  Literals, linear forms, counts, and
-  variables typed Nat or Int.  Nothing else is trusted."
+  "Is t known to be an integer?  Literals, linear forms, counts, variables
+  typed Nat or Int, and a term a fact, hypothesis or proved lemma says is
+  an integer?.  Nothing else is trusted: not even a fn's signature."
   [ctx t]
   (or (t/int-lit? t)
       (contains? #{:lin} (head t))
       (and (symbol? t) (contains? int-types (get-in ctx [:types t])))
-      (and (= :call (head t)) (= 'count (second t)))))
+      (and (= :call (head t)) (= 'count (second t)))
+      (and (= :call (head t)) (= 'apply (second t)) (= [:cfn '+] (nth t 2 nil))
+           (int-elems? ctx (nth t 3 nil)))
+      (and (contains? #{:app :call} (head t)) (proved-integer? ctx t))))
 
 (defn- nat-atom? [ctx a]
   (or (and (symbol? a) (= 'Nat (get-in ctx [:types a])))
@@ -403,6 +432,42 @@
           nil))
       :else nil)))
 
+(defn- reduced-free?
+  "Can fn value f never return a `reduced`?  Then reduce runs it over the
+  whole collection.  A core fn value can't (reduced itself is outside the
+  model), nor can a fn literal whose calls reach only definitions the
+  prover read, since none of those can call reduced either.  A call of an
+  unknown fn value could."
+  ([ctx f] (reduced-free? ctx f #{}))
+  ([ctx f seen]
+   (case (head f)
+     :cfn (not (contains? '#{reduced ensure-reduced} (second f)))
+     :fn (every? (fn [x]
+                   (case (head x)
+                     :ap (reduced-free? ctx (second x) seen)
+                     :app (let [q (second x) d (get-in ctx [:defs q])]
+                            (or (contains? seen q)
+                                (and (:params d) (reduced-free? ctx [:fn (:params d) (:body d)]
+                                                                (conj seen q)))))
+                     true))
+                 (t/subterms (nth f 2)))
+     false)))
+
+(defn- reduce-rule
+  "(reduce f init coll), one step: an empty coll gives init, a head
+  goes into the accumulator, and concatenated colls fold one after the
+  other."
+  [ctx f init coll]
+  (let [e (when (= :sq (head coll)) (second coll))]
+    (cond
+      (= :nil (head coll)) init
+      (= :enil (head e)) init
+      (not (reduced-free? ctx f)) nil
+      (= :econs (head e)) [:call 'reduce f [:ap f init (nth e 1)] [:sq (nth e 2)]]
+      (= :eapp (head e)) [:call 'reduce f [:call 'reduce f init [:sq (nth e 1)]] [:sq (nth e 2)]]
+      (= :elems (head e)) [:call 'reduce f init (second e)]
+      :else nil)))
+
 (defn- computed
   "The computed rules: a rewrite of t, or nil."
   [ctx x]
@@ -457,6 +522,12 @@
                  [:sq (reduce (fn [e v] [:eapp [:elems v] e])
                               [:elems (last args)] (reverse (butlast args)))])
         identity (when (= 1 n) a)
+        integer? (when (= 1 n)
+                   (cond (int-term? ctx a) [:lit true]
+                         (or (= :nil (head a)) (= :sq (head a))
+                             (and (t/lit? a) (not (integer? (second a))))) [:lit false]
+                         :else nil))
+        reduce (when (= 3 n) (reduce-rule ctx a b (nth args 2)))
         nth (when (and (<= 2 n 3) (t/int-lit? b))
               (nth-rule a (second b) (if (= 3 n) (nth args 2) ::none)))
         nil))
@@ -478,8 +549,17 @@
 (defn- out-of-fuel! []
   (throw (ex-info "out of fuel" {::fuel true})))
 
-(defn- burn! [ctx]
-  (when (neg? (swap! (:fuel ctx) dec)) (out-of-fuel!)))
+(def ^:dynamic *last-terms*
+  "When bound to an atom, keeps the terms rewritten as fuel runs low, for
+  debugging a rewrite that does not terminate."
+  nil)
+
+(defn- burn!
+  ([ctx] (burn! ctx nil))
+  ([ctx x]
+   (let [left (swap! (:fuel ctx) dec)]
+     (when (and *last-terms* x (< left 60)) (swap! *last-terms* conj x))
+     (when (neg? left) (out-of-fuel!)))))
 
 (declare normalize)
 
@@ -530,11 +610,29 @@
             (do (swap! (:unfolded ctx) conj f) body)
             (do (swap! (:stuck ctx) conj x) nil)))))))
 
-(defn- ih-rewrite [ctx x]
-  (some (fn [{:keys [hyp lhs rhs]}]
-          (when (and (= x lhs) (or (nil? hyp) (true? (truthiness ctx (normalize ctx hyp)))))
-            (swap! (:used-ih ctx) inc)
-            rhs))
+(declare match-term)
+
+(defn- loops?
+  "Would rewriting x to y only put x back inside a bigger term?"
+  [x y]
+  (and (not= x y) (some #(= x %) (t/subterms y))))
+
+(defn- ih-rewrite
+  "Rewrite x by an induction hypothesis.  One with free variables (its
+  law quantified over them as well) matches x as a pattern, and holds
+  only for their declared types, which its hypothesis states."
+  [ctx x]
+  (some (fn [{:keys [hyp lhs rhs vars]}]
+          ;; a hypothesis whose left side is a bare variable would match
+          ;; every term; it has nothing to rewrite
+          (when-let [m (when-not (symbol? lhs)
+                         (if (seq vars) (match-term lhs x vars) (when (= x lhs) {})))]
+            (let [hyp (some-> hyp (t/subst m))
+                  y (t/subst rhs m)]
+              (when (and (or (nil? hyp) (true? (truthiness ctx (normalize ctx hyp))))
+                         (not (loops? x y)))
+                (swap! (:used-ih ctx) inc)
+                y))))
         (:ih ctx)))
 
 (defn match-term
@@ -553,7 +651,22 @@
      (= pat x) m
      :else nil)))
 
-(declare normalize truthiness)
+(declare normalize truthiness ih-rewrite lemma-rewrite)
+
+(defn- proved-integer?
+  "Does a fact, an induction hypothesis or a proved lemma say (integer? t)?"
+  [ctx t]
+  (let [memo (:int-memo ctx)
+        hit (some-> memo deref (get t))]
+    (if (some? hit)
+      hit
+      (let [q [:call 'integer? t]
+            _ (some-> memo (swap! assoc t false))  ; no circular answer while working it out
+            r (boolean (or (true? (get (:facts ctx) q))
+                           (= [:lit true] (ih-rewrite ctx q))
+                           (= [:lit true] (lemma-rewrite ctx q))))]
+        (some-> memo (swap! assoc t r))
+        r))))
 
 (defn- lemma-rewrite
   "Rewrite x by an earlier proved law: its left side matched against x,
@@ -566,8 +679,10 @@
                         (let [h (t/subst hyp m)]
                           (and (every? #(not (contains? vars %)) (t/vars h))
                                (true? (truthiness ctx (normalize ctx h))))))
-                (swap! (:lemmas-used ctx) conj name)
-                (t/subst rhs m)))))
+                (let [y (t/subst rhs m)]
+                  (when-not (loops? x y)
+                    (swap! (:lemmas-used ctx) conj name)
+                    y))))))
         (:lemmas ctx)))
 
 (def ^:private boolean-fns
@@ -620,7 +735,7 @@
         facts (if (and (= :le (head c)) (false? v) (lin-of ctx (second c)))
                 (assoc facts [:le (lin->term (lin+ (lin* -1 (lin-of ctx (second c))) {:c -1 :m {}}))] true)
                 facts)]
-    (assoc ctx :facts facts :memo (atom {}) :stuck (atom #{})))))
+    (assoc ctx :facts facts :memo (atom {}) :stuck (atom #{}) :int-memo (atom {})))))
 
 (defn normalize
   "Rewrite t to normal form under ctx.  An if whose test is open gets its
@@ -663,7 +778,7 @@
                                   (or (ih-rewrite ctx x*) (lemma-rewrite ctx x*)))]
                     (do (burn! ctx) (normalize ctx y))
                     x*)
-                  (do (burn! ctx)
+                  (do (burn! ctx x*)
                       (if-let [y (step ctx x*)]
                         (if (= y x*) x* (normalize ctx y))
                         x*)))))]
@@ -677,7 +792,7 @@
   {:defs (or defs {}) :types (or types {}) :tenv (or tenv {})
    :facts (or facts {}) :ih (or ih []) :lemmas (or lemmas [])
    :lemmas-used (or lemmas-used (atom #{}))
-   :memo (atom {}) :stuck (atom #{}) :unfolded (atom #{}) :used-ih (atom 0)
+   :memo (atom {}) :stuck (atom #{}) :unfolded (atom #{}) :used-ih (atom 0) :int-memo (atom {})
    :fuel (atom (or fuel 20000))})
 
 ;; --- checking the rules against the runtime ----------------------------------------
@@ -771,7 +886,13 @@
                      (gen/tuple (gen/elements '[filter map]) (gen/elements sample-fns) sub))
            (gen/fmap (fn [[c a b]] [:if c a b]) (gen/tuple sub sub sub))
            (gen/fmap (fn [[f x]] [:call 'apply [:cfn f] x])
-                     (gen/tuple (gen/elements '[<= < >= > +]) sub))])))))
+                     (gen/tuple (gen/elements '[<= < >= > +]) sub))
+           (gen/fmap (fn [[f i x]] [:call 'reduce f i x])
+                     (gen/tuple (gen/elements [[:cfn '+] [:cfn 'max]
+                                               [:fn '[a b] [:call '+ 'a [:lit 1]]]
+                                               [:fn '[a b] [:call 'cons 'b 'a]]])
+                                int-leaf sub))
+           (gen/fmap (fn [x] [:call 'integer? x]) sub)])))))
 
 (defn ground-check
   "Normalise random closed terms and run both: wherever the original
