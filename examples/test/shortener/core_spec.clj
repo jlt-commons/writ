@@ -13,7 +13,7 @@
   `store-of` shortens a generated list of URLs into an empty store."
   (:require [clojure.string :as str]
             [shortener.core :refer [handle]]
-            [writ.spec :refer [spec data ann refine graph law calls]]))
+            [writ.spec :refer [spec data ann refine graph flow law calls]]))
 
 (spec shortener.core)
 
@@ -36,18 +36,24 @@
 ;; what encode-id hands out: one to eleven letters and digits
 (refine Code [s String] (boolean (re-matches #"[0-9a-zA-Z]{1,11}" s)))
 
+;; a URL as it is stored: no surrounding space
+(refine Trimmed [s String] (= s (str/trim s)))
+
 (graph shortener
-  {:states {:id Nat, :code Code, :text String, :url String, :verdict Bool,
+  {:states {:id Nat, :code Code, :text String, :url Trimmed, :verdict Bool,
             :method Keyword, :route Route,
             :links (Map String String), :reply Reply,
             :result (Tuple (Map String String) Reply)}
    :edges  {:id     {[encode-id] #{:code}}
-            :text   {[decode-id] #{:id}, [valid-code?] #{:verdict}}
-            :url    {[normalize-url] #{:url}, [valid-url?] #{:verdict}}
+            :code   {[decode-id] #{:id}}
+            :text   {[normalize-url] #{:url}, [valid-code?] #{:verdict}}
+            :url    {[valid-url?] #{:verdict}}
             :method {[route String] #{:route}}
             :links  {[shorten String] #{:result}
                      [follow String] #{:reply}
-                     [handle Keyword String String] #{:result}}}})
+                     [handle Keyword String String] #{:result}}
+            ;; the links after a request are the links for the next one
+            :result {[first] #{:links}}}})
 
 ;; --- the call graph ------------------------------------------------------------
 
@@ -59,6 +65,30 @@
 (calls decode-id     [digit])
 (calls encode-id     [])
 (calls normalize-url [str/trim])
+
+;; --- the data flow -----------------------------------------------------------------
+
+;; handle routes the request, and the route decides the reply: a new link
+;; is made from the body, a code from the path is followed in the links
+(flow handle [links method path body]
+  [method route :result]
+  [path route follow :result]
+  [body shorten :result]
+  [links shorten]
+  [links follow])
+
+;; the shell, which writ does not check, still answers every request
+;; with handle, run against the store, and turns handle's reply into the
+;; response. Its source is read, never loaded.
+(calls shortener.server/app {:through [shortener.core/handle shortener.store/transact!]})
+(flow shortener.server/app [req] [req shortener.core/handle response :result])
+
+;; the body is normalized, the normalized URL is what is validated and
+;; stored, and a new code comes from the store's size
+(flow shorten [links body]
+  [body normalize-url valid-url? :result]
+  [normalize-url :result]
+  [links encode-id :result])
 
 ;; --- vocabulary -------------------------------------------------------------------
 

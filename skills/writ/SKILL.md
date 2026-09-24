@@ -3,7 +3,7 @@ name: writ
 description: >-
   Use when writing a writ spec -- the problem statement as a state graph
   and checkable laws about what code means and how it calls (writ.spec:
-  spec/graph/refine/ann/data/law/calls/machine) -- or its proof namespace
+  spec/graph/refine/ann/data/law/calls/flow/machine/plan) -- or its proof namespace
   (proof-of/lemma/hint), or the plain Clojure implementation it
   constrains, or when reading a writ.spec report or any
   "Writ:" error (purity, termination, ordering, arity, types, tagged data,
@@ -41,9 +41,16 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
 2. The state graph: the problem's states as types, refinements most
    often, and the fns that step between them. Every spec has one; write
    it before the laws. See [The state graph](#the-state-graph).
-3. `ann` for each public fn.
-4. Laws for what each step means.
-5. Then the implementation. If a law holds but isn't proved, write a
+3. `ann` for each public fn. A public fn with no `ann` fails the check;
+   a helper the plan doesn't name should be private (`defn-`).
+4. The wiring: `flow` for the path data takes through each fn that
+   composes steps, `calls` for the layers it must (or must not) reach.
+   See [Flows](#flows) and [The call graph](#the-call-graph).
+5. Laws for what each step means.
+6. Show the plan: `(spec/plan 'my.spec)` prints states, steps, signatures,
+   laws and wiring from the spec alone. When a person asked for the
+   feature, show it to them and have them confirm it before writing code.
+7. Then the implementation. If a law holds but isn't proved, write a
    lemma or hint in the proof namespace (see
    [The proof namespace](#the-proof-namespace)); never weaken the law.
 
@@ -63,32 +70,45 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
    :before [[:yellow :red]]})                  ; also :never [[a b]], :final [s]
 ```
 
+- The state is the fn's first argument, unless `_` marks it:
+  `[insert Nat _]` is `(insert n state)`. `[first]`, `[second]` or
+  `[last]` takes a state out of a tuple state, so a fn that returns
+  `[next-state reply]` can lead back: `{:result {[first] #{:links}}}`.
 - `(refine Name [x Base] pred)` is a type: values of Base where pred
   holds. Use it in `ann`, `forall`, states, other refinements. It defines
   `Name?`. Refine the parts (a Paddle, a Ball) rather than folding random
   Ints into range inside laws.
-- Each edge's fn must fit by its `ann`: first param = the state's base
-  type, then the arg types; the return type = the targets' base type.
+- Each edge's fn must fit by its `ann`: the state's param (first, or at
+  `_`) = the state's base type, the others the arg types; the return type
+  = the targets' base type.
 - An edge into refinements is a law named `graph:state:fn`: every value
   of the state goes, by the fn, into one of the targets, and the fn never
-  throws. It is tested and proved like any law.
-- An edge into plain types, like `{:unsorted {[isort] #{:sorted}}}` over
-  `(List Nat)`, is data flow only, checked against the signatures. A spec
-  of plain functions still has a graph: the data the problem moves
-  through.
-- `:start`, `:final`, `:never`, `:before` are rules of the graph itself;
-  with every edge proved they hold for every run of the code.
+  throws. It is tested and proved like any law, and reads as the target's
+  predicate of the call, `(ascending? (isort xs))`.
+- Each target of such an edge is also a law, `graph:state:fn->target`:
+  some value of the state lands there. A step the code never takes fails,
+  so don't list targets "just in case"; list the steps the problem has.
+- Two states of the same plain type fail the check (`:unsorted` and
+  `:sorted` both `(List Nat)` say nothing apart). Make the meaningful one
+  a refinement, defined with the helpers the laws use:
+  `(refine Sorted [xs (List Nat)] (ascending? xs))`, and the edge into it
+  is the sort's law. An edge may not list a plain state beside refined
+  ones either.
+- An edge into plain types of their own is data flow only, checked
+  against the signatures. A spec of plain functions still has a graph:
+  the data the problem moves through.
+- `:start`, `:final`, `:never`, `:before` are rules of the graph itself.
+  With every edge proved, `:never` and `:before` hold for every run of the
+  code. Reachability and `:final` say each step can happen, not that a
+  run from the start gets there.
 
 ## A spec
 
 ```clojure
 (ns my.sort-spec
-  (:require [writ.spec :refer [spec data ann law graph]]))
+  (:require [writ.spec :refer [spec data ann law graph refine]]))
 
 (spec my.sort {:require :proved})                ; the namespace it constrains
-
-(graph sorting {:states {:unsorted (List Nat), :sorted (List Nat)}
-                :edges  {:unsorted {[isort] #{:sorted}}}})
 
 (ann insert [Nat (List Nat) -> (List Nat)])      ; one per public fn
 (ann isort  [(List Nat) -> (List Nat)])
@@ -96,11 +116,15 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
 (defn ascending? [xs] (or (empty? xs) (apply <= xs)))   ; the spec's own
 (defn occurrences [x xs] (count (filter #(= x %) xs)))  ; vocabulary
 
-(law sorted      (forall [xs (List Nat)] (ascending? (isort xs))))
+(refine Sorted [xs (List Nat)] (ascending? xs))
+
+(graph sorting                                   ; its edges are the laws
+  {:states {:unsorted (List Nat), :sorted Sorted} ; "isort sorts" and
+   :edges  {:unsorted {[isort] #{:sorted}}         ; "insert keeps it sorted"
+            :sorted   {[insert Nat _] #{:sorted}}}})
+
 (law permutation (forall [x Nat, xs (List Nat)]
                    (= (occurrences x (isort xs)) (occurrences x xs))))
-(law insert-keeps-sorted (forall [x Nat, xs (List Nat)]
-                           (=> (ascending? xs) (ascending? (insert x xs)))))
 (law insert-adds (forall [x Nat, xs (List Nat)]
                    (= (occurrences x (insert x xs)) (inc (occurrences x xs)))))
 ```
@@ -127,13 +151,19 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
   - any expression, which holds when it is truthy
 
   A free name refers first to the target's public fns, then to the spec's
-  helpers, then to clojure.core. Laws cannot quantify over fn types,
-  because no generator exists for them.
+  helpers, then to clojure.core. A spec helper may not share a name with
+  a target public fn: the check fails and says to rename the helper.
+  Laws cannot quantify over fn types, because no generator exists for
+  them.
 - `(calls f [g str/join])`: `f`'s direct calls are exactly this set. A
   simple name is a target fn; a qualified one is a fn of another
   namespace, through the spec's aliases. Called or passed as a value both
   count. clojure.core, host members, self-recursion and locals that
-  shadow a fn do not. See [The call graph](#the-call-graph).
+  shadow a fn do not. `(calls f {:through [g] :not [h]})` states reach
+  instead: `f` reaches `g` through any chain of its namespace's fns, and
+  never reaches `h`. See [The call graph](#the-call-graph).
+- `(flow f [param ...] [link link ...] ...)`: the path data takes through
+  `f`. See [Flows](#flows).
 
 ## The proof namespace
 
@@ -206,6 +236,29 @@ or bypasses passes every law and still fails `calls`.
   definitions refer only to those above them, so there are no cycles but
   self-recursion, and `scan` reports every caller of a fn writ cannot
   check ("it uses `f`, which writ cannot check").
+
+## Flows
+
+```clojure
+(flow handle [req]                   ; handle's params, by position
+  [req normalize respond :result]    ; req goes to normalize, its result to respond,
+  [normalize :result])               ; respond's to the result; the answer uses normalize
+```
+
+A link is a parameter, a fn (what it returns) or, last, `:result`. `a`
+reaches fn `b` when some call to `b` is passed a value that comes from
+`a`, directly or through other calls; `a` reaches `:result` when the
+return value comes from it, a branch's test included. Lambdas passed to a
+fn get the call's other arguments, as do fns passed by name; loops carry
+what `recur` passes. `calls` says which fns are called; `flow` says what
+they are given, which catches a fn that calls every layer but hands one
+the raw input.
+
+Write a flow for each fn that composes steps: a handler, a `step` that
+dispatches, a policy built from smaller rules. `f` may be a fn of another
+namespace, such as the effect shell (`(flow server/app [req] [req
+core/handle :result])`); there, simple names are that namespace's fns.
+`(spec/flow-facts 'my.ns 'f)` shows what the check reads.
 
 ## What a spec should say
 
@@ -313,6 +366,9 @@ value anywhere else is rejected.
 (spec/call-graph 'my.ns)                          ; {f #{g ...}}, read from source
 (spec/mermaid 'my.spec)                           ; the graph, with the spec's calls
 (spec/mermaid 'my.spec {:machine 'm})             ; a machine's table as a state diagram
+(spec/mermaid 'my.spec {:graph 'g})               ; a state graph as a state diagram
+(spec/plan 'my.spec)                              ; the plan, for a person to confirm
+(spec/flow-facts 'my.ns 'f)                       ; what `flow` reads from f
 (spec/instrument 'my.sort-spec)                   ; runtime arg/return checks
 ```
 
@@ -343,10 +399,13 @@ law runs until it is fixed. After that, each law has a `:status`:
 - A failure "found by the solver, when no test did" is a real
   counterexample: the solver found values that break the law, and running
   the code on them confirmed it. Fix the code at those values.
-- `graph `g`: ... ` lines: edges proved, and edges checked as data flow;
-  `graph `g` breaks its own rules` is the graph's own `:never`, `:before`,
-  `:final` or reachability failing; fix the graph or the code, whichever
-  is wrong, and say which.
+- `graph `g`: ... ` lines: edges proved, each of their steps taken, and
+  edges checked as data flow; `graph `g` breaks its own rules` is the
+  graph's own `:never`, `:before`, `:final` or reachability failing; fix
+  the graph or the code, whichever is wrong, and say which.
+- `not a step of any graph or machine: f` on a passing report: a signed
+  public fn the plan doesn't place. Fine for a helper laws need to name;
+  otherwise it belongs on the graph or in a flow.
 - ``declares no state graph``: add the graph first.
 - `:lemmas` in the report: the proof namespace's lemmas; each must be
   `:proved`.
@@ -399,9 +458,26 @@ confirm it, then without one.
   that the stand-in breaks. If you own only the implementation, report the
   gap to the spec's owner; the code is not at fault.
 - ``the call graph of `f` is not the one the spec gives`` - `f` calls a
-  fn the spec does not list, or does not call one it lists. Route the
-  call through the named fn (don't inline it, don't skip a layer). If the
-  graph in the spec is wrong, say so; don't edit `calls` to match.
+  fn the spec does not list, or does not call one it lists, or (map form)
+  does not reach a `:through` fn or reaches a `:not` one, with the path.
+  Route the call through the named fn (don't inline it, don't skip a
+  layer). If the graph in the spec is wrong, say so; don't edit `calls`
+  to match.
+- ``the flow of `f` is not the one the spec gives`` - ``` `b` is never
+  given anything that comes from `a` ``` means pass `b` what `a`
+  returns (or the parameter `a`), not something else; ``` `f` never calls
+  `b` ``` means the step is missing; ``what `f` returns does not come from
+  `a` `` means `a`'s result is computed and dropped. Fix the wiring.
+- ``law `g:s:f->t` fails ... the graph says a f can take s to t, but no
+  generated s does`` - the code never takes that step. Usually the code
+  is stuck (a missing transition); if the step truly cannot happen, the
+  graph is wrong: say so.
+- ``graph `g`: :a and :b are both T, so nothing tells them apart`` - make
+  one (or both) a refinement that says what it means.
+- ``` `x` is defined by the spec and by ns ``` - rename the spec's helper;
+  a law would otherwise judge the code with the code.
+- ``` `f` is public, but the spec gives it no signature ``` - sign it if
+  the plan has it; make it private (`defn-`) if it is a helper.
 - ``the spec says `f` calls `g`, but ns defines no fn `g` `` / ``the spec
   gives `f` a call set, but ns defines no fn `f` `` - define it or fix
   the spelling; the spec names the structure.

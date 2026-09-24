@@ -23,7 +23,8 @@
     (testing "the lemma is reported apart, and does not count as a law of the spec"
       (is (= [{:lemma 'insert-keeps-sorted :status :proved}]
              (mapv #(select-keys % [:lemma :status]) (:lemmas r))))
-      (is (= 3 (:laws (:proof r))))
+      ;; three laws, the graph's edge and the witness for its step
+      (is (= 5 (:laws (:proof r))))
       (is (str/includes? (:message r) "lemma `insert-keeps-sorted` proved")))))
 
 (deftest a-false-lemma-fails-the-check
