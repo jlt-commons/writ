@@ -437,7 +437,37 @@
                                        :sigs '{writ.spec-demo.tree/insert {:params [Nat Tree] :ret Tree}
                                                writ.spec-demo.tree/to-list {:params [Tree] :ret (List Nat)}
                                                writ.spec-demo.tree/size {:params [Tree] :ret Nat}}})]
-    (is (= '#{insert%contract to-list%contract} (set (map :name rules))))))
+    (is (= '#{insert%contract to-list%contract size%contract size%nonneg%contract}
+           (set (map :name rules))))))
+
+(deftest nat-and-int-contracts-are-proved-from-the-code
+  (let [forms '[(ns c.nums)
+                (defn twice [n] (* 2 n))
+                (defn down [n] (- n 1))
+                (defn total [xs] (if (seq xs) (+ (first xs) (total (rest xs))) 0))
+                (defn half-str [s] (str s))]
+        [defs] (prover/definitions [['c.nums forms]])
+        rules (prover/prove-contracts {:defs defs :tenv {}
+                                       :sigs '{c.nums/twice {:params [Int] :ret Int}
+                                               c.nums/down {:params [Nat] :ret Nat}
+                                               c.nums/total {:params [(List Nat)] :ret Nat}
+                                               c.nums/half-str {:params [Int] :ret Int}}})
+        names (set (map :name rules))]
+    (testing "an Int return is an integer"
+      (is (contains? names 'twice%contract)))
+    (testing "a Nat return is an integer and not negative"
+      (is (contains? names 'total%contract))
+      (is (contains? names 'total%nonneg%contract)))
+    (testing "a Nat return that can go negative is only an integer"
+      (is (contains? names 'down%contract))
+      (is (not (contains? names 'down%nonneg%contract))))
+    (testing "a signature the code does not keep proves nothing"
+      (is (not (contains? names 'half-str%contract))))
+    (testing "a proved contract makes a call an integer term, and a Nat"
+      (let [ctx (rw/context {:types '{k Nat xs (List Nat)} :lemmas rules})]
+        (is (rw/int-term? ctx [:app 'c.nums/twice 'k]))
+        (is (= [:lit true] (rw/normalize ctx [:call '<= [:lit 0] [:app 'c.nums/total 'xs]])))
+        (is (not= [:lit true] (rw/normalize ctx [:call '<= [:lit 0] [:app 'c.nums/down 'k]])))))))
 
 ;; --- rewriting under names, facts and floats --------------------------------------
 

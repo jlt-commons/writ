@@ -4,6 +4,8 @@
   is a law about the code like any other, so it must hold and be proved;
   it helps prove the spec's laws, but never counts as one of them."
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [writ.spec :as spec]))
 
@@ -79,6 +81,11 @@
     (testing "the second check finds its proofs in the cache"
       (is (every? :cached (filter #(= :proved (:status %)) (:laws again))))
       (is (not-any? :cached (:laws first-run))))
+    (testing "the contracts are kept apart from the laws, keyed on the code"
+      (let [f (io/file dir "contracts--writ.spec-demo.court.edn")
+            c (edn/read-string (slurp f))]
+        (is (.exists f))
+        (is (contains? (set (map :name (:rules c))) 'move%contract))))
     (testing "another target has a cache of its own"
       (let [other (spec/check 'writ.spec-demo.court-spec {:seed 42 :cache-dir dir :target 'writ.spec-demo.court-open})]
         (is (not-any? :cached (:laws other)))))

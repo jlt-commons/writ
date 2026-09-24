@@ -589,7 +589,10 @@ Proofs are cached in `.writ-cache/`, one file per spec. A cached proof is
 used only when the law, its hint and lemmas, and the source of the code,
 the spec, the proof namespace and writ itself are all exactly as they
 were when it was found and checked, so a check that changes nothing
-proves nothing again. `:cache false` turns it off; `:cache-dir` puts it
+proves nothing again. The contracts proved for the code are cached
+apart, in one file per implementation, keyed on the code, its signatures
+and data and writ, so editing a law or the proof namespace keeps them.
+`:cache false` turns it off; `:cache-dir` puts it
 elsewhere. Add `.writ-cache/` to `.gitignore`.
 
 ### Requiring proof
@@ -739,7 +742,9 @@ the laws, the prover proves each signed fn's contract from its code, as
 ACL2s's `defunc` does: given arguments of its parameter types, it returns
 a value of its return type. Then `(insert x t)` is known to be a `Tree`.
 A set, a map or a fn has no recognizer, and takes only a variable of its
-own type. Contracts for `Nat` and `Int` returns aren't proved yet. The passes repeat until nothing new is proved, so a
+own type. An `Int` return is proved an integer, and a `Nat` return is then
+proved not negative, so `(size t)` is an integer term the arithmetic
+works with, known to be at least 0. The passes repeat until nothing new is proved, so a
 law may cite one that comes later in the spec. A law that is only tested
 is never cited. The report names what each proof used:
 

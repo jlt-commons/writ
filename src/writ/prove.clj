@@ -534,31 +534,46 @@
 (defn prove-contracts
   "Prove each signed fn's contract, as defunc does: on arguments of its
   parameter types, it returns a value of its return type -- where that
-  type has a recognizer to say so.  A signature is only a claim; a
-  contract proved from the code is a fact, and a lemma's variable may take
-  a call of the fn as its value once the contract says the call is of the
-  variable's type.  Passes repeat while one proves something new, so a fn
-  may lean on the contracts of the fns it calls.  Each proof is replayed
-  by the checker.  Returns the proved contracts as lemma rules."
+  type has a recognizer to say so.  An Int return is (integer? call); a
+  Nat return is that and then (<= 0 call), proved once the call is known
+  to be an integer.  A signature is only a claim; a contract proved from
+  the code is a fact, and a lemma's variable may take a call of the fn as
+  its value once the contract says the call is of the variable's type.
+  Callees go first, so a fn may lean on the contracts of the fns it
+  calls; one that fails is tried again only once a fn its code reaches
+  has a new contract.  Each proof is replayed by the checker.
+  Returns the proved contracts as lemma rules."
   [{:keys [defs tenv sigs fuel]}]
   (let [recs (sc/recognizers tenv (types-of [] [] sigs))
         defs (merge defs (:defs recs))
+        goal (fn [f ps types nm check & [after]]
+               (let [call (into [:app f] ps)
+                     pat (into [:app f] (map #(symbol (str "?" %)) ps))]
+                 [[f nm] {:types types :ps ps :after after
+                          :g {:hyps [] :goals [(t/subst check {'%x call})]}
+                          :rule {:name (symbol (str (name f) nm))
+                                 :vars (set (map #(symbol (str "?" %)) ps))
+                                 :types (into {} (map (fn [p] [(symbol (str "?" p)) (types p)])) ps)
+                                 :lhs (t/subst check {'%x pat})
+                                 :rhs [:lit true]}}]))
         goals (into {}
                     (for [[f {:keys [params ret]}] (sort-by key sigs)
                           :let [d (get defs f)
-                                c (get-in recs [:checks (plain ret)])]
-                          :when (and (:params d) (= (count params) (count (:params d)))
-                                     (vector? c) (= :app (head c)))
+                                ret (plain ret)
+                                c (get-in recs [:checks ret])]
+                          :when (and (:params d) (= (count params) (count (:params d))))
                           :let [ps (mapv #(symbol (str "c%" %)) (range (count params)))
-                                types (zipmap ps (map plain params))
-                                call (into [:app f] ps)]]
-                      [f {:types types :ps ps
-                          :g {:hyps [] :goals [(t/subst c {'%x call})]}
-                          :rule {:name (symbol (str (name f) "%contract"))
-                                 :vars (set (map #(symbol (str "?" %)) ps))
-                                 :types (into {} (map (fn [p] [(symbol (str "?" p)) (types p)])) ps)
-                                 :lhs (t/subst c {'%x (into [:app f] (map #(symbol (str "?" %)) ps))})
-                                 :rhs [:lit true]}}]))
+                                types (zipmap ps (map plain params))]
+                          g (cond
+                              (and (vector? c) (= :app (head c)))
+                              [(goal f ps types "%contract" c)]
+                              (contains? '#{Int Nat} ret)
+                              (cond-> [(goal f ps types "%contract" [:call 'integer? '%x])]
+                                (= 'Nat ret)
+                                (conj (goal f ps types "%nonneg%contract"
+                                            [:call '<= [:lit 0] '%x] [f "%contract"])))
+                              :else [])]
+                      g))
         attempt (fn [rules {:keys [types ps g]}]
                   (let [opts {:defs defs :tenv tenv :types types :recognizers recs
                               :unfolded (atom #{}) :lemmas-used (atom #{}) :fuel (or fuel 20000)
@@ -567,12 +582,42 @@
                                 #(or (some->> (prove-all opts g) (hash-map :by :cases :proofs))
                                      (first (keep (fn [p] (by-induction opts g p (types p))) ps))))]
                     (when (and trace (:ok (check/check-proof (dissoc opts :lemmas-used :unfolded) g trace)))
-                      trace)))]
-    (loop [rules [] todo goals]
-      (let [done (into {} (keep (fn [[f x]] (when (attempt rules x) [f (:rule x)]))) todo)]
-        (if (empty? done)
+                      trace)))
+        ;; the fns each fn's code calls, itself and transitively
+        callees (fn [f] (set (keep #(when (= :app (head %)) (second %))
+                                   (some-> (get defs f) :body t/subterms))))
+        reach (memoize (fn [f] (loop [seen #{f} todo [f]]
+                                 (if-let [x (first todo)]
+                                   (let [new (remove seen (callees x))]
+                                     (recur (into seen new) (into (subvec todo 1) new)))
+                                   seen))))
+        ;; callees first, so a proof can lean on what it calls in the
+        ;; same pass; a Nat's bound after its integer contract
+        order (vec (sort-by (fn [[f nm]] [(count (reach f)) (str f) (= nm "%nonneg%contract")])
+                            (keys goals)))
+        ;; the contracts proved so far that f's code can use
+        usable (fn [f proved] (set (filter (fn [[g]] (contains? (reach f) g)) proved)))]
+    ;; a goal that failed is tried again only once a fn its code reaches
+    ;; has a new contract: nothing else changes what it can prove
+    (loop [rules [] proved #{} tried {} todo order]
+      (let [[rules proved tried]
+            (reduce (fn [[rules proved tried] [f :as k]]
+                      (let [x (get goals k)
+                            have (usable f proved)]
+                        (if (or (and (:after x) (not (contains? proved (:after x))))
+                                (= have (get tried k)))
+                          [rules proved tried]
+                          (if (attempt rules x)
+                            [(conj rules (:rule x)) (conj proved k) tried]
+                            [rules proved (assoc tried k have)]))))
+                    [rules proved tried] todo)
+            left (vec (remove proved todo))]
+        (if (or (= (count left) (count todo))
+                (not-any? (fn [[f :as k]]
+                            (not= (get tried k) (usable f proved)))
+                          left))
           rules
-          (recur (into rules (vals done)) (apply dissoc todo (keys done))))))))
+          (recur rules proved tried left))))))
 
 (defn definitions
   "Translate the defns of the target and the spec: [defs own].  pairs is
