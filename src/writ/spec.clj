@@ -295,23 +295,29 @@
 
     (hint sorted {:induct xs :use [insert-keeps-sorted]})
 
-  :induct, the variable to try induction on first; :use, the only lemmas
-  and laws the proof may cite; :strategy, one of :symbolic (run the code
-  on symbolic values), :induction or :rewriting; :fuel, the rewrites one
-  attempt may make.  A hint only steers the search: a proof it finds is
+  :induct, the variable to try induction on first; :vary, the other
+  variables the induction hypothesis holds at every value of, not just
+  the goal's -- an accumulator a fold passes on, say; :use, the only
+  lemmas and laws the proof may cite; :strategy, one of :symbolic (run
+  the code on symbolic values), :induction or :rewriting; :fuel, the
+  rewrites one attempt may make.  A hint only steers the search: a proof it finds is
   checked like any other."
   [law-name m]
   (let [where (str "`hint " law-name "`")]
     (when-not (simple-sym? law-name)
       (fail! "a `hint` names a law by its simple symbol, had: `" (pr-str law-name) "`"))
     (when-not (map? m)
-      (fail! where " takes a map: {:induct x :use [lemma ...] :strategy :symbolic :fuel n}"))
-    (when-let [bad (seq (remove #{:induct :use :strategy :fuel} (keys m)))]
-      (fail! where " has unknown keys: " (pr-str bad) "; it takes :induct :use :strategy :fuel"))
+      (fail! where " takes a map: {:induct x :vary [y] :use [lemma ...] :strategy :symbolic :fuel n}"))
+    (when-let [bad (seq (remove #{:induct :vary :use :strategy :fuel} (keys m)))]
+      (fail! where " has unknown keys: " (pr-str bad) "; it takes :induct :vary :use :strategy :fuel"))
     (when (and (contains? m :strategy) (not (contains? strategies (:strategy m))))
       (fail! where ": :strategy must be one of " (pr-str (sort strategies)) ", had " (pr-str (:strategy m))))
     (when (and (contains? m :induct) (not (simple-sym? (:induct m))))
       (fail! where ": :induct names a variable of the law"))
+    (when (and (contains? m :vary) (not (and (vector? (:vary m)) (every? simple-sym? (:vary m)))))
+      (fail! where ": :vary is a vector of variables of the law"))
+    (when (and (contains? m :vary) (contains? (set (:vary m)) (:induct m)))
+      (fail! where ": the variable of the induction cannot vary in its own hypothesis"))
     (when (and (contains? m :use) (not (and (vector? (:use m)) (every? simple-sym? (:use m)))))
       (fail! where ": :use is a vector of lemma and law names"))
     (when (and (contains? m :fuel) (not (pos-int? (:fuel m))))
@@ -582,12 +588,17 @@
 (defn- qualify
   "Resolve a law's free names the way the spec reads them: a target public
   first, then a name the spec ns interns; bound names and anything else
-  (core, aliases) are left for eval in the spec ns."
-  [form bound target-publics spec-interns target spec-ns]
+  (core, aliases) are left for eval in the spec ns.  own, name ->
+  qualified name, comes before both: a lemma reads the defns of its proof
+  namespace first."
+  ([form bound target-publics spec-interns target spec-ns]
+   (qualify form bound target-publics spec-interns target spec-ns {}))
+  ([form bound target-publics spec-interns target spec-ns own]
   (letfn [(walk [f bound]
             (cond
               (and (symbol? f) (nil? (namespace f)) (not (contains? bound f)))
-              (cond (contains? target-publics f) (symbol (name target) (name f))
+              (cond (contains? own f) (get own f)
+                    (contains? target-publics f) (symbol (name target) (name f))
                     (contains? spec-interns f) (symbol (name spec-ns) (name f))
                     :else f)
               (and (seq? f) (= 'quote (first f))) f
@@ -598,7 +609,15 @@
               (map? f) (into {} (map (fn [[k v]] [(walk k bound) (walk v bound)])) f)
               (set? f) (into #{} (map #(walk % bound)) f)
               :else f))]
-    (walk form bound)))
+    (walk form bound))))
+
+(defn- proof-own
+  "name -> qualified name for the defns a proof namespace interns."
+  [proof-ns]
+  (if proof-ns
+    (into {} (for [[k v] (ns-interns (the-ns proof-ns)) :when (fn? @v)]
+               [k (symbol (name proof-ns) (name k))]))
+    {}))
 
 (defn- calls-target?
   "Does a qualified law mention any fn of the target namespace?"
@@ -1869,10 +1888,30 @@
   [results opts target spec-ns tenv anns refs ctx]
   (if (= false (:prove opts))
     results
-    (let [defs (delay (prover/definitions
-                        [[target (book/read-forms (source-url target))]
-                         [spec-ns (mapv refine->defn (book/read-forms (source-url spec-ns)))]]))
+    (let [proof-ns (::proof-ns opts)
+          defs (delay (prover/definitions
+                        (cond-> [[target (book/read-forms (source-url target))]
+                                 [spec-ns (mapv refine->defn (book/read-forms (source-url spec-ns)))]]
+                          ;; a proof namespace's own defns, reading the
+                          ;; target's fns it refers by their plain names --
+                          ;; the fns of the target checked, when a stand-in
+                          ;; is checked in place of the spec's own
+                          proof-ns (conj [proof-ns (book/read-forms (source-url proof-ns))
+                                          (into {} (for [[k v] (ns-refers (the-ns proof-ns))
+                                                         :when (contains? #{target (:target (get @registry spec-ns))}
+                                                                          (ns-name (:ns (meta v))))]
+                                                     [k (symbol (name target) (name k))]))]))))
           anns (into {} (map (fn [[k sig]] [k (erase sig refs)])) anns)
+          sigs (into {} (for [[nm sig] anns]
+                          [(symbol (str target) (str nm)) {:params (mapv plain (:params sig)) :ret (plain (:ret sig))}]))
+          ;; what each signed fn returns, proved from its code once: the
+          ;; laws' lemmas are instantiated only at terms of their types
+          contracts (delay (let [[ds] @defs] (prover/prove-contracts {:defs ds :tenv tenv :sigs sigs})))
+          sigs (into {} (for [[nm sig] anns]
+                          [(symbol (str target) (str nm)) {:params (mapv plain (:params sig)) :ret (plain (:ret sig))}]))
+          ;; what each signed fn returns, proved from its code once: the
+          ;; laws' lemmas are instantiated only at terms of their types
+          contracts (delay (let [[ds] @defs] (prover/prove-contracts {:defs ds :tenv tenv :sigs sigs})))
           ;; a proof found before, from the same law, lemmas, code, spec,
           ;; proof namespace and writ, is the same proof
           cache-dir (when-not (= false (:cache opts)) (or (:cache-dir opts) ".writ-cache"))
@@ -1893,6 +1932,8 @@
                                                 :hint (get (::hints opts) (:law r))
                                                 :fuel (or (:fuel (get (::hints opts) (:law r))) (:fuel opts))
                                                 :total (:total r)
+                                                :lemma (:lemma r)
+                                                :sigs sigs :contracts @contracts
                                                 :defs ds :tenv tenv
                                                 :target target :own own :lemmas lemmas
                                                 :rets (into {} (for [[nm sig] anns]
@@ -2006,6 +2047,7 @@
              laws (into (vec laws) (mapcat #(graph-obligations % refs) (:graphs e)))
              publics (set (keys (ns-publics (the-ns target))))
              interns (set (keys (ns-interns (the-ns spec-ns))))
+             proof-own* (proof-own (:ns proof-e))
              opaque (into (set publics) interns)
              numeric-fns (into #{} (keep (fn [[k s]] (when (contains? '#{Nat Int Float Double}
                                                                       (plain (:ret s)))
@@ -2020,13 +2062,16 @@
                                   :let [p (desugar prop)]]
                               (try
                                 (lw/check-prop-shape! p)
-                                (let [qp (qualify p #{} publics interns target spec-ns)]
+                                (let [qp (qualify p #{} publics interns target spec-ns
+                                                  (if lemma proof-own* {}))]
+                                  ;; a lemma is proof, not contract: one about
+                                  ;; clojure.core alone is a fact the proof uses
                                   (cond
-                                    (not (calls-target? qp target))
+                                    (and (not lemma) (not (calls-target? qp target)))
                                     {:law name :status :vacuous
                                      :why (str "it calls no fn of " target)}
 
-                                    (try-prove p data-tenv opaque numeric-fns)
+                                    (and (not lemma) (try-prove p data-tenv opaque numeric-fns))
                                     {:law name :status :vacuous
                                      :why (str "writ.norm proves it without looking at the "
                                                "implementation, so any code satisfies it")}

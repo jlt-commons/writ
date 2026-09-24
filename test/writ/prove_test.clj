@@ -173,6 +173,32 @@
     (is (:ok r) (pr-str (:failures r)))
     (is (<= 10 (:checked r)))))
 
+(deftest sort-and-distinct-are-modelled-on-integer-lists
+  (testing "the model computes what sort and distinct compute"
+    (let [r (rw/model-check 300 42)]
+      (is (:ok r) (pr-str (:counterexample r)))))
+  (testing "on a list of integers, sorting is inserting each element in turn"
+    (is (= 'reduce (second (norm {:types '{xs (List Nat)}} [:call 'sort [:call 'distinct 'xs]]))))
+    (is (= 'reduce (second (norm {:types '{xs (List Int)}} [:call 'sort 'xs])))))
+  (testing "on two unknown integers it is the comparison"
+    (let [x (norm {:types '{a Nat b Nat}} [:call 'sort [:call 'distinct (t/seq-term '[a b])]])]
+      (doseq [[a b] [[1 2] [2 1] [3 3] [0 7]]]
+        (is (= (sort (distinct [a b])) (t/evaluate x {'a a 'b b}))))))
+  (testing "elements that may be floats or strings are left alone"
+    (is (= [:call 'sort 'xs] (norm {:types '{xs (List Double)}} [:call 'sort 'xs])))
+    (is (= [:call 'sort [:call 'distinct 'xs]] (norm [:call 'sort [:call 'distinct 'xs]])))))
+
+(deftest filter-and-every-walk-a-concatenation
+  (let [ctx {:types '{a {:elems Nat} b {:elems Nat}}}
+        f [:fn '[y] [:call 'odd? 'y]]]
+    (is (= (norm ctx [:sq [:eapp [:elems [:call 'filter f [:sq 'a]]] [:elems [:call 'filter f [:sq 'b]]]]])
+           (norm ctx [:call 'filter f [:sq [:eapp 'a 'b]]])))
+    (is (= (norm ctx [:if [:call 'every? f [:sq 'a]] [:call 'every? f [:sq 'b]] [:lit false]])
+           (norm ctx [:call 'every? f [:sq [:eapp 'a 'b]]]))))
+  (let [r (rw/self-test (filter #(re-find #"-app$" (name (first %))) rw/pattern-rules) 200 42)]
+    (is (:ok r) (pr-str (:failures r)))
+    (is (= 3 (:checked r)))))
+
 (deftest comparisons-follow-from-chains-of-facts
   ;; a <= b, b <= c, c <= d  gives  a <= d, and settles d < a false
   (let [le (fn [x y] [:le [:lin 0 [[y 1] [x -1]]]])
@@ -326,6 +352,141 @@
             r (prover/prove-law law)]
         (is (:proved r) (str nm))
         (is (= {:ok true} (writ.prove.check/check-proof opts goal (:trace r))) (str nm))))))
+
+;; --- a hypothesis that varies ----------------------------------------------------------
+
+(def ^:private fold-prop
+  '(forall [xs (List Nat)]
+     (forall [acc (List Nat)]
+       (= (count (reduce (fn [a v] (cons v a)) acc xs)) (+ (count acc) (count xs))))))
+
+(deftest a-varying-hypothesis-is-replayed-by-the-checker
+  (let [law {:prop fold-prop :defs {} :tenv {} :target 'none :own {} :lemma true
+             :hint {:induct 'xs :vary '[acc] :strategy :induction}}
+        r (prover/prove-law law)
+        [bs body] (writ.prove.scheme/split-foralls fold-prop)
+        recs (writ.prove.scheme/recognizers {} (map second bs))
+        opts {:defs (:defs recs) :tenv {} :types (into {} bs) :fuel 20000 :lemmas [] :recognizers recs}
+        goal (writ.prove.scheme/goal (writ.prove.translate/context {}) (mapv first bs) body)]
+    (is (:proved r) (pr-str r))
+    (testing "without its recognizers the checker can't show acc's instance is a list"
+      (is (not (:ok (writ.prove.check/check-proof (dissoc opts :recognizers) goal (:trace r))))))
+    (is (= '{acc (List Nat)} (:vary (:trace r))))
+    (is (= {:ok true} (writ.prove.check/check-proof opts goal (:trace r))))
+    (testing "the fold is not proved with the accumulator held fixed"
+      (is (not (:proved (prover/prove-law (assoc-in law [:hint :vary] nil))))))
+    (testing "the checker rebuilds the hypothesis the trace names, and no other"
+      (is (not (:ok (writ.prove.check/check-proof opts goal (dissoc (:trace r) :vary)))))
+      (is (re-find #"cannot vary"
+                   (:reason (writ.prove.check/check-proof opts goal (assoc (:trace r) :vary '{acc (List Int)})))))
+      (is (re-find #"cannot vary"
+                   (:reason (writ.prove.check/check-proof opts goal (assoc (:trace r) :vary '{xs (List Nat)}))))))))
+
+;; --- a lemma holds only at its own types ------------------------------------------
+
+(def ^:private tree-tenv
+  '{Tree {:arity 0 :params [] :ctors {Leaf {:fields []} Node {:fields [Tree Nat Tree]}}}})
+
+(defn- run-recognizer
+  "Evaluate recognizer `nm` of `recs` on value v, as the runtime would."
+  [recs nm v]
+  (letfn [(res [q] (delay (fn [x] (let [d (get-in recs [:defs q])]
+                                    (t/evaluate (:body d) {(first (:params d)) x} res)))))]
+    (try (boolean (t/evaluate [:app nm 'v] {'v v} res)) (catch Throwable _ false))))
+
+(deftest a-recognizer-accepts-what-the-type-checks
+  (let [recs (writ.prove.scheme/recognizers tree-tenv '[Tree (List Nat) (Vec Int)])
+        vecs (fn vecs [v] (cond (map-entry? v) v (sequential? v) (mapv vecs v) :else v))
+        junk [nil [] () [:Leaf] [:Leaf 1] [:Node [:Leaf] 3 [:Leaf]] [:Node [:Leaf] -3 [:Leaf]]
+              [:Node [:Leaf] 3] '(:Node (:Leaf) 2 (:Leaf)) [1 2] [-1] ["a"] "ab" 5 {:a 1} [nil]]]
+    (doseq [ty '[Tree (List Nat) (Vec Int)]
+            :let [nm (get-in recs [:names ty])]]
+      (is (symbol? nm) (str ty))
+      (testing (str "every value of " ty " is recognised")
+        (doseq [v (spec/sample ty tree-tenv 30)]
+          (is (run-recognizer recs nm v) (pr-str [ty v]))))
+      (testing (str "what is recognised as " ty " is one, lists read as vectors")
+        (doseq [v junk :when (run-recognizer recs nm v)]
+          (is (spec/conforms? ty (vecs v) tree-tenv) (pr-str [ty v])))))))
+
+(deftest a-lemma-instance-must-have-the-lemmas-types
+  (let [recs (writ.prove.scheme/recognizers tree-tenv '[Tree])
+        rule (fn [ty] {:name 'l :vars '#{?a} :types {'?a ty} :lhs [:app 'f '?a] :rhs [:lit 1]})
+        rw (fn [ty types x] (rw/normalize (rw/context {:types types :lemmas [(rule ty)]
+                                                        :defs (:defs recs) :recognizers recs})
+                                          [:app 'f x]))]
+    (testing "a Nat"
+      (is (= [:lit 1] (rw 'Nat '{k Nat} 'k)))
+      (is (= [:lit 1] (rw 'Nat {} [:lit 3])))
+      (is (not= [:lit 1] (rw 'Nat '{k Int} 'k)))
+      (is (not= [:lit 1] (rw 'Nat {} [:lit -1]))))
+    (testing "a Tree"
+      (is (= [:lit 1] (rw 'Tree '{t Tree} 't)))
+      (is (not= [:lit 1] (rw 'Tree {} 'u)) "an unknown value is not known to be a Tree")
+      (is (= [:lit 1] (rw 'Tree '{n Nat} (t/seq-term [[:lit :Node] (t/seq-term [[:lit :Leaf]]) 'n (t/seq-term [[:lit :Leaf]])]))))
+      (is (not= [:lit 1] (rw 'Tree {} (t/seq-term [[:lit :Node] (t/seq-term [[:lit :Leaf]]) [:lit -1] (t/seq-term [[:lit :Leaf]])])))))
+    (testing "a type with no recognizer takes only a variable of it"
+      (is (= [:lit 1] (rw '(Set Int) '{s (Set Int)} 's)))
+      (is (not= [:lit 1] (rw '(Set Int) {} [:call 'hash-set [:lit 1]]))))))
+
+(deftest a-fns-contract-is-proved-from-its-code
+  (require 'writ.spec-demo.tree)
+  (let [[defs] (prover/definitions [['writ.spec-demo.tree
+                                     (writ.book/read-forms (clojure.java.io/resource "writ/spec_demo/tree.clj"))]])
+        rules (prover/prove-contracts {:defs defs :tenv tree-tenv
+                                       :sigs '{writ.spec-demo.tree/insert {:params [Nat Tree] :ret Tree}
+                                               writ.spec-demo.tree/to-list {:params [Tree] :ret (List Nat)}
+                                               writ.spec-demo.tree/size {:params [Tree] :ret Nat}}})]
+    (is (= '#{insert%contract to-list%contract} (set (map :name rules))))))
+
+;; --- rewriting under names, facts and floats --------------------------------------
+
+(deftest fns-that-differ-only-in-parameter-names-are-one-term
+  (is (= (norm [:fn '[a] [:call 'inc 'a]]) (norm [:fn '[b] [:call 'inc 'b]])))
+  (testing "an inner fn's parameters never capture an outer one's"
+    (let [x (norm [:fn '[a] [:fn '[b] [:call '+ 'a 'b]]])]
+      (is (= 7 (((t/evaluate x) 3) 4)))))
+  (testing "a fact about one is a fact about the other"
+    (let [f (fn [p] [:call 'every? [:fn [p] [:call 'odd? p]] 'xs])
+          ctx (rw/assume (rw/context {:types '{xs (List Nat)}}) (rw/normalize (rw/context {}) (f 'a)) true)]
+      (is (= [:lit true] (rw/normalize ctx (f 'b)))))))
+
+(deftest what-picks-parts-of-integers-holds-no-float
+  (let [ctx {:types '{xs (List Nat) ys (List Double)}}
+        pick (fn [v] [:call 'filter [:fn '[y] [:call 'odd? 'y]] v])]
+    (is (= [:lit true] (norm ctx [:call '= (pick 'xs) (pick 'xs)])))
+    (is (= '= (second (norm ctx [:call '= (pick 'ys) (pick 'ys)]))) "a NaN may be inside")
+    (testing "and a fold that only arranges them"
+      (let [fold [:call 'reduce [:fn '[s x] [:call 'cons 'x 's]] [:sq [:enil]] 'xs]]
+        (is (= [:lit true] (norm ctx [:call '= fold fold])))))
+    (testing "a shared first part leaves the rest to compare"
+      (let [ctx {:types '{a {:elems Nat} b Nat c Nat}}]
+        (is (= (norm ctx [:call '= 'b 'c])
+               (norm ctx [:call '= [:sq [:eapp 'a [:econs 'b [:enil]]]] [:sq [:eapp 'a [:econs 'c [:enil]]]]])))))))
+
+(deftest a-lemma-binds-a-free-variable-from-the-facts
+  ;; (every? #(> % ?v) ?B) and ?x <= ?v: nothing in ?B is below ?x.  The
+  ;; left side binds ?x and ?B; ?v comes from a fact.
+  (let [above (fn [v b] [:call 'every? [:fn '[y] [:call '> 'y v]] b])
+        below (fn [x b] [:call 'filter [:fn '[y] [:call '< 'y x]] b])
+        types '{x Nat v Nat xs (List Nat) ?x Nat ?v Nat ?B (List Nat)}
+        n0 (rw/context {:types types})
+        rule {:name 'none-below :vars '#{?x ?v ?B}
+              :hyp (rw/normalize n0 [:if (above '?v '?B) [:call '<= '?x '?v] [:lit false]])
+              :lhs (rw/normalize n0 (below '?x '?B)) :rhs [:sq [:enil]]}
+        ctx (fn [facts] (reduce (fn [c f] (rw/assume c (rw/normalize n0 f) true))
+                                (rw/context {:types types :lemmas [rule]}) facts))]
+    (is (= [:sq [:enil]] (rw/normalize (ctx [(above 'v 'xs) [:call '<= 'x 'v]]) (below 'x 'xs))))
+    (testing "without the fact, or with the wrong bound, it stays"
+      (is (not= [:sq [:enil]] (rw/normalize (ctx [[:call '<= 'x 'v]]) (below 'x 'xs))))
+      (is (not= [:sq [:enil]] (rw/normalize (ctx [(above 'v 'xs) [:call '< 'v 'x]]) (below 'x 'xs)))))))
+
+(deftest a-rewrite-to-itself-is-not-applied
+  ;; an induction hypothesis at the empty list can read () -> (): applying
+  ;; it would read its hypothesis, which holds (), again and again
+  (let [ih {:lhs [:sq [:enil]] :rhs [:sq [:enil]]
+            :hyp [:call 'every? [:fn '[y] [:call 'odd? 'y]] [:sq [:enil]]]}]
+    (is (= [:sq [:enil]] (rw/normalize (rw/context {:ih [ih] :fuel 200}) [:call 'rest [:nil]])))))
 
 ;; --- constants and more of clojure.core ------------------------------------------
 

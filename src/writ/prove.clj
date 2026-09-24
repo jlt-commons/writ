@@ -12,8 +12,13 @@
 
   A proof holds for every input on which the law's terms return, as with
   Typed Clojure; writ still runs every law, which catches the inputs where
-  a term throws.  A proof that never unfolds one of the target's own
-  definitions says nothing about the code, and is not reported."
+  a term throws.  The logic is untyped, as ACL2's is: a lemma, or a
+  hypothesis that varies, is used only at terms shown to be of its
+  variables' types -- by a recognizer, and by each signed fn's contract,
+  proved from its code before any law.  A proof that never unfolds one of the target's own
+  definitions says nothing about the code, and is not reported -- unless
+  it proves a lemma of a proof namespace, which may be about clojure.core
+  alone."
   (:require [clojure.string :as str]
             [clojure.test.check.generators :as gen]
             [writ.prove.term :as t :refer [head]]
@@ -233,15 +238,27 @@
             :when p]
         {:by :generalizing :ih i :call call :as ys :ty ty :on (t/show call) :proof p}))))
 
+(defn- varying
+  "The variables of opts' :vary, but v, with their types: they stay free
+  in an induction hypothesis on v."
+  [opts v]
+  (into {} (for [x (:vary opts)
+                 :let [ty (get-in opts [:types x])]
+                 :when (and ty (not= x v))]
+             [x ty])))
+
 (defn- by-induction [opts g v ty]
   (when-let [cs (cases v ty (:tenv opts))]
-    (let [steps (for [c cs]
+    (let [free (varying opts v)
+          opts (cond-> opts (seq free) (assoc :ih-free free))
+          steps (for [c cs]
                   (let [[opts* gi] (sc/induction-case opts g v c)]
                     [c (or (prove-all opts* gi)
                            (by-generalizing (dissoc opts* :ih-free) gi (keys (:types c))))]))]
       (when (every? (comp some? second) steps)
-        {:by :induction :on v :ty (plain ty)
-         :cases (mapv (fn [[c p]] {:case (:desc c) :proof p}) steps)}))))
+        (cond-> {:by :induction :on v :ty (plain ty)
+                 :cases (mapv (fn [[c p]] {:case (:desc c) :proof p}) steps)}
+          (seq free) (assoc :vary free))))))
 
 (defn- fuelled
   "f's result, or nil when it runs out of fuel."
@@ -410,12 +427,24 @@
       (swap! (:unfolded opts) into (mapcat second rs))
       {:by :symbolic :certificates (mapv first rs)})))
 
+(defn- types-of
+  "The types a law's variables, its lemmas' and the signatures name."
+  [bs lemmas sigs]
+  (distinct (map plain (concat (map second bs)
+                               (mapcat #(map second (first (split-foralls (:prop %)))) lemmas)
+                               (mapcat (fn [[_ {:keys [params ret]}]] (cons ret params)) sigs)))))
+
+(defn- contract? [nm] (str/ends-with? (name nm) "%contract"))
+
 (defn prove-law
   "Try to prove a law.  prop is the desugared law, its names qualified;
   defs are the translated definitions; target the implementation's ns;
-  lemmas are the laws proved before it, as {:name :prop}.
+  lemmas are the laws proved before it, as {:name :prop}; lemma, true
+  for a lemma of a proof namespace, which may be about clojure.core alone;
+  sigs, the target's signatures, {name {:params :ret}}; contracts, the
+  rules prove-contracts gave for them.
   Returns {:proved true :trace :summary :lemmas} or {:proved false :reason}."
-  [{:keys [prop defs tenv target own fuel lemmas rets total hint]}]
+  [{:keys [prop defs tenv target own fuel lemmas rets total hint lemma sigs contracts]}]
   (try
     (let [[bs0 body] (split-foralls prop)
           tctx (tr/context own)
@@ -423,14 +452,17 @@
           [bs g] (expand-tuples (map (fn [[x ty]] [x (plain ty)]) bs0) g0)
           unfolded (atom #{})
           lemmas-used (atom #{})
+          recs (sc/recognizers tenv (types-of bs lemmas sigs))
+          defs (merge defs (:defs recs))
           opts {:defs defs :tenv tenv :types (into {} (map (fn [[x ty]] [x (plain ty)])) bs)
-                :total total
+                :total total :vary (:vary hint) :recognizers recs
                 :unfolded unfolded :fuel (or fuel 20000) :lemmas-used lemmas-used
                 :rets (or rets {})
-                :lemmas (vec (mapcat #(lemma-rules % defs tenv own)
-                                     (if-let [use (:use hint)]
-                                       (filter #(contains? (set use) (:name %)) lemmas)
-                                       lemmas)))}
+                :lemmas (into (vec (mapcat #(lemma-rules % defs tenv own)
+                                           (if-let [use (:use hint)]
+                                             (filter #(contains? (set use) (:name %)) lemmas)
+                                             lemmas)))
+                              contracts)}
           ;; an attempt that runs out of fuel fails on its own; the others
           ;; still get their turn
           ran-out (atom false)
@@ -478,16 +510,16 @@
                              [nil #{}]))
           target-used (filter #(= (str target) (namespace %)) used)
           ;; every proof is replayed by the checker before it is reported
-          checked (when (and trace (seq target-used))
+          checked (when (and trace (or lemma (seq target-used)))
                     (check/check-proof (dissoc opts :lemmas-used :unfolded) g trace))]
       (cond
         (nil? trace) (cond-> {:proved false :reason (if @ran-out "the search ran out of fuel" "no proof found")}
                        (seq bs) (merge (when-let [cex (first (keep #(sym/counterexample opts (:hyps g) %) (:goals g)))]
                                          {:counterexample (recompose bs0 cex)})))
-        (empty? target-used) {:proved false :reason "the proof does not use the code"}
+        (and (empty? target-used) (not lemma)) {:proved false :reason "the proof does not use the code"}
         (not (:ok checked)) {:proved false
                              :reason (str "the proof checker rejected the proof: " (:reason checked))}
-        :else (let [cited (sort (remove synthetic-lemmas @lemmas-used))]
+        :else (let [cited (sort (remove #(or (contains? synthetic-lemmas %) (contract? %)) @lemmas-used))]
                 {:proved true :trace trace
                  :summary (str (summary trace)
                                (when total ", and it never throws")
@@ -499,15 +531,61 @@
         (:writ.prove.rewrite/fuel (ex-data e)) {:proved false :reason "the search ran out of fuel"}
         :else (throw e)))))
 
+(defn prove-contracts
+  "Prove each signed fn's contract, as defunc does: on arguments of its
+  parameter types, it returns a value of its return type -- where that
+  type has a recognizer to say so.  A signature is only a claim; a
+  contract proved from the code is a fact, and a lemma's variable may take
+  a call of the fn as its value once the contract says the call is of the
+  variable's type.  Passes repeat while one proves something new, so a fn
+  may lean on the contracts of the fns it calls.  Each proof is replayed
+  by the checker.  Returns the proved contracts as lemma rules."
+  [{:keys [defs tenv sigs fuel]}]
+  (let [recs (sc/recognizers tenv (types-of [] [] sigs))
+        defs (merge defs (:defs recs))
+        goals (into {}
+                    (for [[f {:keys [params ret]}] (sort-by key sigs)
+                          :let [d (get defs f)
+                                c (get-in recs [:checks (plain ret)])]
+                          :when (and (:params d) (= (count params) (count (:params d)))
+                                     (vector? c) (= :app (head c)))
+                          :let [ps (mapv #(symbol (str "c%" %)) (range (count params)))
+                                types (zipmap ps (map plain params))
+                                call (into [:app f] ps)]]
+                      [f {:types types :ps ps
+                          :g {:hyps [] :goals [(t/subst c {'%x call})]}
+                          :rule {:name (symbol (str (name f) "%contract"))
+                                 :vars (set (map #(symbol (str "?" %)) ps))
+                                 :types (into {} (map (fn [p] [(symbol (str "?" p)) (types p)])) ps)
+                                 :lhs (t/subst c {'%x (into [:app f] (map #(symbol (str "?" %)) ps))})
+                                 :rhs [:lit true]}}]))
+        attempt (fn [rules {:keys [types ps g]}]
+                  (let [opts {:defs defs :tenv tenv :types types :recognizers recs
+                              :unfolded (atom #{}) :lemmas-used (atom #{}) :fuel (or fuel 20000)
+                              :lemmas rules :rets {}}
+                        trace (fuelled
+                                #(or (some->> (prove-all opts g) (hash-map :by :cases :proofs))
+                                     (first (keep (fn [p] (by-induction opts g p (types p))) ps))))]
+                    (when (and trace (:ok (check/check-proof (dissoc opts :lemmas-used :unfolded) g trace)))
+                      trace)))]
+    (loop [rules [] todo goals]
+      (let [done (into {} (keep (fn [[f x]] (when (attempt rules x) [f (:rule x)]))) todo)]
+        (if (empty? done)
+          rules
+          (recur (into rules (vals done)) (apply dissoc todo (keys done))))))))
+
 (defn definitions
   "Translate the defns of the target and the spec: [defs own].  pairs is
-  [[ns-sym forms] ...]; each ns reads its own plain names first."
+  [[ns-sym forms] ...] or [[ns-sym forms refers] ...]; each ns reads its
+  own plain names first, then the plain names in refers, name ->
+  qualified name."
   [pairs]
-  (let [qualified (into {} (for [[k v] (tr/own-names pairs) :when (namespace k)] [k v]))
+  (let [qualified (into {} (for [[k v] (tr/own-names (map #(take 2 %) pairs)) :when (namespace k)] [k v]))
         defs (into {}
-                   (for [[ns-sym forms] pairs]
-                     (let [own (merge qualified (into {} (for [[k v] (tr/own-names [[ns-sym forms]])
-                                                               :when (nil? (namespace k))]
-                                                           [k v])))]
+                   (for [[ns-sym forms refers] pairs]
+                     (let [own (merge qualified refers
+                                      (into {} (for [[k v] (tr/own-names [[ns-sym forms]])
+                                                     :when (nil? (namespace k))]
+                                                 [k v])))]
                        (tr/defs-of (tr/context own) ns-sym forms))))]
     [defs qualified]))
