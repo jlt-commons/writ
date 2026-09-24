@@ -32,25 +32,6 @@
 
 (defn- tighter? [side v old] (or (nil? old) (if (= side :hi) (< v (first old)) (> v (first old)))))
 
-(defn- setup
-  "Bounds, rows and the variables in Bland's order, for literals lits."
-  [lits]
-  (reduce (fn [st [_ a _ :as l]]
-            (let [slacks (:slacks st)
-                  multi (not (and (= 1 (count a)) (#{1 -1} (val (first a)))))
-                  st (if (and multi (not (contains? slacks a)) (not (contains? slacks (neg-form a))))
-                       (-> st (update :slacks conj a) (assoc-in [:rows [:slack a]] a))
-                       st)
-                  [x side v] (bound-of (:slacks st) l)
-                  st (reduce (fn [st y] (if (contains? (:idx st) y) st
-                                            (assoc-in st [:idx y] (count (:idx st)))))
-                             st (concat (keys a) [x]))]
-              (if (tighter? side v (get-in st [:bounds x side]))
-                (assoc-in st [:bounds x side] [v l])
-                st)))
-          {:slacks #{} :rows {} :bounds {} :idx {}}
-          lits))
-
 (defn- value [st x] (get-in st [:val x] 0))
 
 (defn- violation [st x]
@@ -89,33 +70,84 @@
               [(lit y (other side)) a]
               [(lit y side) (- a)])))))
 
+(defn- register [st x]
+  (if (contains? (:idx st) x) st (assoc-in st [:idx x] (count (:idx st)))))
+
+(defn- row-of
+  "Linear form a written over the nonbasic variables of the tableau."
+  [st a]
+  (reduce-kv (fn [m y k]
+               (if-let [r (get-in st [:rows y])]
+                 (reduce-kv (fn [m z d] (let [v (+ (get m z 0) (* k d))] (if (zero? v) (dissoc m z) (assoc m z v))))
+                            m r)
+                 (let [v (+ (get m y 0) k)] (if (zero? v) (dissoc m y) (assoc m y v)))))
+             {} a))
+
+(defn- assert-lit
+  "The tableau with literal l's bound added: a new variable is nonbasic at
+  0, a new slack a basic row over the nonbasic variables."
+  [st [_ a _ :as l]]
+  (let [multi (not (and (= 1 (count a)) (#{1 -1} (val (first a)))))
+        st (reduce register st (keys a))
+        st (if (and multi (not (contains? (:slacks st) a)) (not (contains? (:slacks st) (neg-form a))))
+             (let [sx [:slack a]
+                   row (row-of st a)]
+               (-> st (update :slacks conj a) (assoc-in [:rows sx] row)
+                   (register sx)
+                   (assoc-in [:val sx] (reduce-kv (fn [t x k] (+ t (* k (get-in st [:val x] 0)))) 0 row))))
+             st)
+        [x side v] (bound-of (:slacks st) l)
+        st (register st x)]
+    (if (tighter? side v (get-in st [:bounds x side]))
+      (assoc-in st [:bounds x side] [v l])
+      st)))
+
+(defn- repair-nonbasic
+  "Move each nonbasic variable out of bounds to the bound it breaks, and
+  the basic variables with it."
+  [st]
+  (reduce (fn [st x]
+            (if (contains? (:rows st) x)
+              st
+              (let [v (value st x)
+                    {:keys [lo hi]} (get-in st [:bounds x])
+                    target (cond (and lo (< v (first lo))) (first lo)
+                                 (and hi (> v (first hi))) (first hi))]
+                (if (nil? target)
+                  st
+                  (let [d (- target v)]
+                    (reduce-kv (fn [st b r] (if-let [c (r x)] (update-in st [:val b] (fnil + 0) (* c d)) st))
+                               (assoc-in st [:val x] target) (:rows st)))))))
+          st (keys (:idx st))))
+
+(defn empty-tableau []
+  {:slacks #{} :rows {} :bounds {} :idx {} :val {}})
+
 (defn check
   "Are the literals [:le a c] satisfiable over the rationals?  {:sat
-  values} or {:conflict [[literal multiplier] ...]}.  Throws ::budget after
-  max-pivots pivots."
-  [lits max-pivots]
-  (let [st (setup lits)
-        clash (some (fn [[x {:keys [lo hi]}]] (when (and lo hi (> (first lo) (first hi))) x))
-                    (:bounds st))]
-    (if clash
-      {:conflict [[(second (get-in st [:bounds clash :lo])) 1]
-                  [(second (get-in st [:bounds clash :hi])) 1]]}
-      (let [order #(get-in st [:idx %])
-            ;; nonbasic variables start at 0, or the nearest bound
-            vals (into {} (for [x (keys (:idx st)) :when (not (contains? (:rows st) x))]
-                            (let [{:keys [lo hi]} (get-in st [:bounds x])]
-                              [x (cond (and lo (< 0 (first lo))) (first lo)
-                                       (and hi (> 0 (first hi))) (first hi)
-                                       :else 0)])))
-            vals (reduce-kv (fn [m s row] (assoc m s (reduce-kv (fn [t x k] (+ t (* k (vals x)))) 0 row)))
-                            vals (:rows st))]
-        (loop [st (assoc st :val vals) n 0]
+  values :tableau t} or {:conflict [[literal multiplier] ...]}.  Throws
+  ::budget after max-pivots pivots.  Given a tableau a check of fewer of
+  the literals ended with, it starts from there: only the new bounds need
+  repairing."
+  ([lits max-pivots] (check lits max-pivots nil))
+  ([lits max-pivots from]
+   (let [base (or from (empty-tableau))
+         st (reduce assert-lit base (remove (or (:asserted base) #{}) lits))
+         st (assoc st :asserted (into (or (:asserted base) #{}) lits))
+         clash (some (fn [[x {:keys [lo hi]}]] (when (and lo hi (> (first lo) (first hi))) x))
+                     (:bounds st))]
+     (if clash
+       {:conflict [[(second (get-in st [:bounds clash :lo])) 1]
+                   [(second (get-in st [:bounds clash :hi])) 1]]}
+       (let [order #(get-in st [:idx %])]
+         (loop [st (repair-nonbasic st) n 0]
           (when (> n max-pivots)
             (throw (ex-info "simplex pivot budget exhausted" {::budget true})))
           (let [bad (first (sort-by order (filter #(violation st %) (keys (:rows st)))))]
             (if-not bad
-              {:sat (into {} (remove (fn [[x _]] (and (vector? x) (= :slack (first x))))) (:val st))
-               :tableau (select-keys st [:rows :bounds :val :idx])}
+              {:sat (into {} (for [x (keys (:idx st)) :when (not (and (vector? x) (= :slack (first x))))]
+                               [x (value st x)]))
+               :tableau st}
               (let [side (violation st bad)
                     target (first (get-in st [:bounds bad side]))
                     ;; below its lower bound it must rise, above its upper it must fall
@@ -126,7 +158,7 @@
                     y (first (sort-by order (map first (filter can? (get-in st [:rows bad])))))]
                 (if y
                   (recur (pivot-and-update st bad y target) (inc n))
-                  {:conflict (explain st bad side)})))))))))
+                  {:conflict (explain st bad side)}))))))))))
 
 (defn gomory
   "A Gomory cut for a satisfied tableau whose basic variable x has a

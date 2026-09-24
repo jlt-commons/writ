@@ -86,7 +86,9 @@
 
 (declare eval-formula)
 
-(defn- eval-term [t m]
+(defn eval-term
+  "The value of integer term t in model m."
+  [t m]
   (let [ev #(eval-term % m)]
     (cond
       (integer? t) t
