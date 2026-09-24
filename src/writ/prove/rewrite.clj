@@ -816,16 +816,66 @@
   [x y]
   (and (not= x y) (some #(= x %) (t/subterms y))))
 
+(defn has-type?
+  "Is term u known to be of type ty?  A variable of that type is; an
+  integer term is an Int, and a Nat when it is not negative; anything else
+  is when the type's recognizer, applied to it, rewrites to true.  A type
+  with no recognizer (a set, a map) takes only a variable of its own."
+  [ctx ty u]
+  (let [el (fn [t] (when (and (seq? t) (contains? '#{List Vec} (first t))) (second t)))]
+    (boolean
+      (or (= ty (get-in ctx [:types u]))
+          (and (= :sq (head u)) (symbol? (second u)) (el ty)
+               (= {:elems (el ty)} (get-in ctx [:types (second u)])))
+          (case ty
+            Int (int-term? ctx u)
+            Nat (and (int-term? ctx u)
+                     (true? (truthiness ctx (normalize ctx [:call '<= [:lit 0] u]))))
+            (let [c (get-in ctx [:recognizers :checks ty])]
+              (cond (= :any c) true
+                    (nil? c) false
+                    :else (true? (truthiness ctx (normalize ctx (t/subst c {'%x u})))))))))))
+
+(defn- typed?
+  "Do the terms bindings m give a rule's variables have the variables'
+  types?"
+  [ctx types m]
+  (every? (fn [[v ty]] (or (not (contains? m v)) (has-type? ctx ty (get m v)))) types))
+
+(defn- recognizer-rule
+  "A recognizer on a variable of its type is true.  A list recognizer on a
+  concatenation is its parts'; on the elements of a value, the value's
+  (nil being the empty list)."
+  [ctx x]
+  (when (and (= :app (head x)) (= 3 (count x)))
+    (let [r (second x) u (nth x 2)
+          ty (some (fn [[ty n]] (when (= n r) ty)) (get-in ctx [:recognizers :names]))]
+      (cond
+        (and ty (or (and (symbol? u) (= ty (get-in ctx [:types u])))
+                    (and (= :sq (head u)) (symbol? (second u)) (seq? ty)
+                         (contains? '#{List Vec} (first ty))
+                         (= {:elems (second ty)} (get-in ctx [:types (second u)])))))
+        [:lit true]
+        (and (contains? (get-in ctx [:recognizers :lists]) r) (= :sq (head u)))
+        (let [e (second u)]
+          (case (head e)
+            :eapp [:if [:app r [:sq (nth e 1)]] [:app r [:sq (nth e 2)]] [:lit false]]
+            :elems [:if [:call '= (second e) t/tnil] [:lit true] [:app r (second e)]]
+            nil))
+        :else nil))))
+
 (defn- ih-rewrite
   "Rewrite x by an induction hypothesis.  One with free variables (its
   law quantified over them as well) matches x as a pattern, and holds
   only for their declared types, which its hypothesis states."
   [ctx x]
-  (some (fn [{:keys [hyp lhs rhs vars]}]
+  (some (fn [{:keys [hyp lhs rhs vars types]}]
           ;; a hypothesis whose left side is a bare variable would match
           ;; every term; it has nothing to rewrite
           (when-let [m (when-not (symbol? lhs)
-                         (if (seq vars) (match-term lhs x vars) (when (= x lhs) {})))]
+                         (if (seq vars)
+                           (let [m (match-term lhs x vars)] (when (and m (typed? ctx types m)) m))
+                           (when (= x lhs) {})))]
             (let [hyp (some-> hyp (t/subst m))
                   y (t/subst rhs m)]
               ;; a rewrite to x itself changes nothing, and its hypothesis
@@ -900,12 +950,14 @@
 (defn- lemma-rewrite
   "Rewrite x by an earlier proved law: its left side matched against x,
   its hypothesis, instantiated, normalised to true here.  A variable of
-  the hypothesis the left side does not bind is bound from the facts."
+  the hypothesis the left side does not bind is bound from the facts.
+  The law holds only at its own types, so each term its variables take
+  must be shown to be of the variable's type."
   [ctx x]
-  (some (fn [{:keys [vars hyp lhs rhs name]}]
+  (some (fn [{:keys [vars hyp lhs rhs name types]}]
           (when-let [m0 (match-term lhs x vars)]
             (some (fn [m]
-                    (when (every? #(contains? m %) (t/vars rhs))
+                    (when (and (every? #(contains? m %) (t/vars rhs)) (typed? ctx types m))
                       (let [y (t/subst rhs m)]
                         (when (and (not= x y)
                                    (not (loops? x y))
@@ -958,6 +1010,7 @@
         [:lit (get (:facts ctx) x)])
       (apply-patterns (get @indexed (rule-key x)) x)
       (computed ctx x)
+      (recognizer-rule ctx x)
       (when (= :app (head x)) (unfold ctx x))))
 
 (defn assume
@@ -1042,8 +1095,9 @@
 (defn context
   "A fresh normalising context.  defs: name -> {:params :body :recursive?};
   types: variable -> type; tenv: data declarations."
-  [{:keys [defs types tenv facts ih fuel lemmas lemmas-used]}]
+  [{:keys [defs types tenv facts ih fuel lemmas lemmas-used recognizers]}]
   {:defs (or defs {}) :types (or types {}) :tenv (or tenv {})
+   :recognizers (or recognizers {})
    :facts (or facts {}) :ih (or ih []) :lemmas (or lemmas [])
    :lemmas-used (or lemmas-used (atom #{}))
    :memo (atom {}) :stuck (atom #{}) :unfolded (atom #{}) :used-ih (atom 0) :int-memo (atom {})

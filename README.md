@@ -726,7 +726,20 @@ When a case still isn't closed, the prover tries two things:
 
 A law proved earlier is a lemma for the laws after it: an equality
 rewrites its left side to its right, anything else rewrites to true, when
-its hypotheses hold. The passes repeat until nothing new is proved, so a
+its hypotheses hold.
+
+A lemma holds only at its own types, and the prover's logic is untyped,
+as ACL2's is, so a type is a hypothesis like any other. Each term a
+lemma's variable takes must be shown to be of the variable's type: a
+variable of that type is; an integer term is an Int, and a Nat when it
+can't be negative; anything else must satisfy the type's recognizer,
+which the prover builds from the spec's `data` and takes values apart
+with the way the type's cases do. A signature is only a claim, so before
+the laws, the prover proves each signed fn's contract from its code, as
+ACL2s's `defunc` does: given arguments of its parameter types, it returns
+a value of its return type. Then `(insert x t)` is known to be a `Tree`.
+A set, a map or a fn has no recognizer, and takes only a variable of its
+own type. Contracts for `Nat` and `Int` returns aren't proved yet. The passes repeat until nothing new is proved, so a
 law may cite one that comes later in the spec. A law that is only tested
 is never cited. The report names what each proof used:
 

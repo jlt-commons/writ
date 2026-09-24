@@ -365,9 +365,12 @@
              :hint {:induct 'xs :vary '[acc] :strategy :induction}}
         r (prover/prove-law law)
         [bs body] (writ.prove.scheme/split-foralls fold-prop)
-        opts {:defs {} :tenv {} :types (into {} bs) :fuel 20000 :lemmas []}
+        recs (writ.prove.scheme/recognizers {} (map second bs))
+        opts {:defs (:defs recs) :tenv {} :types (into {} bs) :fuel 20000 :lemmas [] :recognizers recs}
         goal (writ.prove.scheme/goal (writ.prove.translate/context {}) (mapv first bs) body)]
     (is (:proved r) (pr-str r))
+    (testing "without its recognizers the checker can't show acc's instance is a list"
+      (is (not (:ok (writ.prove.check/check-proof (dissoc opts :recognizers) goal (:trace r))))))
     (is (= '{acc (List Nat)} (:vary (:trace r))))
     (is (= {:ok true} (writ.prove.check/check-proof opts goal (:trace r))))
     (testing "the fold is not proved with the accumulator held fixed"
@@ -378,6 +381,63 @@
                    (:reason (writ.prove.check/check-proof opts goal (assoc (:trace r) :vary '{acc (List Int)})))))
       (is (re-find #"cannot vary"
                    (:reason (writ.prove.check/check-proof opts goal (assoc (:trace r) :vary '{xs (List Nat)}))))))))
+
+;; --- a lemma holds only at its own types ------------------------------------------
+
+(def ^:private tree-tenv
+  '{Tree {:arity 0 :params [] :ctors {Leaf {:fields []} Node {:fields [Tree Nat Tree]}}}})
+
+(defn- run-recognizer
+  "Evaluate recognizer `nm` of `recs` on value v, as the runtime would."
+  [recs nm v]
+  (letfn [(res [q] (delay (fn [x] (let [d (get-in recs [:defs q])]
+                                    (t/evaluate (:body d) {(first (:params d)) x} res)))))]
+    (try (boolean (t/evaluate [:app nm 'v] {'v v} res)) (catch Throwable _ false))))
+
+(deftest a-recognizer-accepts-what-the-type-checks
+  (let [recs (writ.prove.scheme/recognizers tree-tenv '[Tree (List Nat) (Vec Int)])
+        vecs (fn vecs [v] (cond (map-entry? v) v (sequential? v) (mapv vecs v) :else v))
+        junk [nil [] () [:Leaf] [:Leaf 1] [:Node [:Leaf] 3 [:Leaf]] [:Node [:Leaf] -3 [:Leaf]]
+              [:Node [:Leaf] 3] '(:Node (:Leaf) 2 (:Leaf)) [1 2] [-1] ["a"] "ab" 5 {:a 1} [nil]]]
+    (doseq [ty '[Tree (List Nat) (Vec Int)]
+            :let [nm (get-in recs [:names ty])]]
+      (is (symbol? nm) (str ty))
+      (testing (str "every value of " ty " is recognised")
+        (doseq [v (spec/sample ty tree-tenv 30)]
+          (is (run-recognizer recs nm v) (pr-str [ty v]))))
+      (testing (str "what is recognised as " ty " is one, lists read as vectors")
+        (doseq [v junk :when (run-recognizer recs nm v)]
+          (is (spec/conforms? ty (vecs v) tree-tenv) (pr-str [ty v])))))))
+
+(deftest a-lemma-instance-must-have-the-lemmas-types
+  (let [recs (writ.prove.scheme/recognizers tree-tenv '[Tree])
+        rule (fn [ty] {:name 'l :vars '#{?a} :types {'?a ty} :lhs [:app 'f '?a] :rhs [:lit 1]})
+        rw (fn [ty types x] (rw/normalize (rw/context {:types types :lemmas [(rule ty)]
+                                                        :defs (:defs recs) :recognizers recs})
+                                          [:app 'f x]))]
+    (testing "a Nat"
+      (is (= [:lit 1] (rw 'Nat '{k Nat} 'k)))
+      (is (= [:lit 1] (rw 'Nat {} [:lit 3])))
+      (is (not= [:lit 1] (rw 'Nat '{k Int} 'k)))
+      (is (not= [:lit 1] (rw 'Nat {} [:lit -1]))))
+    (testing "a Tree"
+      (is (= [:lit 1] (rw 'Tree '{t Tree} 't)))
+      (is (not= [:lit 1] (rw 'Tree {} 'u)) "an unknown value is not known to be a Tree")
+      (is (= [:lit 1] (rw 'Tree '{n Nat} (t/seq-term [[:lit :Node] (t/seq-term [[:lit :Leaf]]) 'n (t/seq-term [[:lit :Leaf]])]))))
+      (is (not= [:lit 1] (rw 'Tree {} (t/seq-term [[:lit :Node] (t/seq-term [[:lit :Leaf]]) [:lit -1] (t/seq-term [[:lit :Leaf]])])))))
+    (testing "a type with no recognizer takes only a variable of it"
+      (is (= [:lit 1] (rw '(Set Int) '{s (Set Int)} 's)))
+      (is (not= [:lit 1] (rw '(Set Int) {} [:call 'hash-set [:lit 1]]))))))
+
+(deftest a-fns-contract-is-proved-from-its-code
+  (require 'writ.spec-demo.tree)
+  (let [[defs] (prover/definitions [['writ.spec-demo.tree
+                                     (writ.book/read-forms (clojure.java.io/resource "writ/spec_demo/tree.clj"))]])
+        rules (prover/prove-contracts {:defs defs :tenv tree-tenv
+                                       :sigs '{writ.spec-demo.tree/insert {:params [Nat Tree] :ret Tree}
+                                               writ.spec-demo.tree/to-list {:params [Tree] :ret (List Nat)}
+                                               writ.spec-demo.tree/size {:params [Tree] :ret Nat}}})]
+    (is (= '#{insert%contract to-list%contract} (set (map :name rules))))))
 
 ;; --- rewriting under names, facts and floats --------------------------------------
 

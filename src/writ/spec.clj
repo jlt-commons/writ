@@ -1902,6 +1902,16 @@
                                                                           (ns-name (:ns (meta v))))]
                                                      [k (symbol (name target) (name k))]))]))))
           anns (into {} (map (fn [[k sig]] [k (erase sig refs)])) anns)
+          sigs (into {} (for [[nm sig] anns]
+                          [(symbol (str target) (str nm)) {:params (mapv plain (:params sig)) :ret (plain (:ret sig))}]))
+          ;; what each signed fn returns, proved from its code once: the
+          ;; laws' lemmas are instantiated only at terms of their types
+          contracts (delay (let [[ds] @defs] (prover/prove-contracts {:defs ds :tenv tenv :sigs sigs})))
+          sigs (into {} (for [[nm sig] anns]
+                          [(symbol (str target) (str nm)) {:params (mapv plain (:params sig)) :ret (plain (:ret sig))}]))
+          ;; what each signed fn returns, proved from its code once: the
+          ;; laws' lemmas are instantiated only at terms of their types
+          contracts (delay (let [[ds] @defs] (prover/prove-contracts {:defs ds :tenv tenv :sigs sigs})))
           ;; a proof found before, from the same law, lemmas, code, spec,
           ;; proof namespace and writ, is the same proof
           cache-dir (when-not (= false (:cache opts)) (or (:cache-dir opts) ".writ-cache"))
@@ -1923,6 +1933,7 @@
                                                 :fuel (or (:fuel (get (::hints opts) (:law r))) (:fuel opts))
                                                 :total (:total r)
                                                 :lemma (:lemma r)
+                                                :sigs sigs :contracts @contracts
                                                 :defs ds :tenv tenv
                                                 :target target :own own :lemmas lemmas
                                                 :rets (into {} (for [[nm sig] anns]

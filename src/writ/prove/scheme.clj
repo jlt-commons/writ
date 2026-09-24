@@ -81,6 +81,128 @@
 
       :else nil)))
 
+;; --- recognizers ------------------------------------------------------------------
+;; A law proved for every value of a type holds at a term only if the term
+;; is of that type.  The prover's logic is untyped, like ACL2's: a type is
+;; a hypothesis, and a recognizer states it.  Each recognizer takes a value
+;; apart the way the type's cases do, so what it accepts is what a proof
+;; over the type covers.
+
+(def ^:private scalar-checks
+  '{Bool boolean? String string? Char char? Keyword keyword? Symbol symbol?
+    Float number? Double number?})
+
+(def ^:private rec-var '%x)
+
+(defn- type-var? [tenv ty]
+  (or (= 'Any ty)
+      (and (symbol? ty) (:tvar (get tenv ty)))
+      (and (symbol? ty) (not (get tenv ty)) (not (contains? scalar-checks ty))
+           (not (contains? '#{Nat Int Unit} ty)))))
+
+(defn- rec-name [ty]
+  (symbol "writ.prove.types"
+          (str (-> (pr-str ty) (str/replace #"[\s()]+" "-") (str/replace #"^-|-$" "")) "?")))
+
+(defn- conj-terms [cs]
+  (if (empty? cs)
+    [:lit true]
+    (reduce (fn [a c] [:if c a [:lit false]]) (reverse cs))))
+
+(defn recognizers
+  "Recognizers for `types` (and the types their parts have) under tenv:
+  {:names {type name} :defs {name def} :checks {type template} :lists
+  #{name}}.  A template is a term in `%x` saying a value is of the type:
+  :any for a type every value is of (a type variable), and no entry for a
+  type with no recognizer (a set, a map, a fn), which only a variable of
+  that type is known to be."
+  [tenv types]
+  (let [out (atom {:names {} :defs {} :checks {} :lists #{}})
+        bad (atom #{})]
+    (letfn [(check [ty e]
+              (let [ty (plain ty)]
+                (cond
+                  (= 'Nat ty) [:if [:call 'integer? e] [:call '<= [:lit 0] e] [:lit false]]
+                  (= 'Int ty) [:call 'integer? e]
+                  (= 'Unit ty) [:call '= e t/tnil]
+                  (contains? scalar-checks ty) [:call (scalar-checks ty) e]
+                  (type-var? tenv ty) [:lit true]
+                  :else (when-let [n (rec ty)] [:app n e]))))
+            (rec [ty]
+              (let [known (:names @out)]
+                (if (contains? known ty)
+                  (get known ty)
+                  (let [n (rec-name ty)
+                        _ (swap! out assoc-in [:names ty] n)
+                        body (body-of ty rec-var)]
+                    (if body
+                      (do (swap! out assoc-in [:defs n]
+                                 {:params [rec-var] :body body
+                                  :recursive? (boolean (some #(and (= :app (head %)) (= n (second %)))
+                                                             (t/subterms body)))})
+                          n)
+                      (do (swap! bad conj n) n))))))
+            (body-of [ty x]
+              (let [[h & args] (if (seq? ty) ty [ty])]
+                (cond
+                  (contains? '#{List Vec} h)
+                  (when-let [c (check (first args) [:call 'first x])]
+                    (swap! out update :lists conj (rec-name ty))
+                    [:if [:call 'seq x]
+                     [:if c [:app (rec-name ty) [:call 'rest x]] [:lit false]]
+                     (if (= 'List h)
+                       [:if [:call '= x t/tnil] [:lit true] [:call '= x [:sq t/enil]]]
+                       [:call '= x [:sq t/enil]])])
+
+                  (= 'Tuple h)
+                  (let [cs (map-indexed (fn [i a] (check a [:call 'nth x [:lit i]])) args)]
+                    (when (every? some? cs)
+                      [:if [:call '= [:call 'count x] [:lit (count args)]] (conj-terms cs) [:lit false]]))
+
+                  (and (symbol? h) (get tenv h) (:ctors (get tenv h)))
+                  (let [d (get tenv h)
+                        sub (zipmap (:params d) args)
+                        st (fn st [y] (cond (symbol? y) (get sub y y) (seq? y) (apply list (map st y)) :else y))
+                        arms (for [[c info] (sort-by (comp str key) (:ctors d))
+                                   :let [fs (map st (:fields info))
+                                         cs (map-indexed (fn [i f] (check f [:call 'nth x [:lit (inc i)]])) fs)]]
+                               (when (every? some? cs)
+                                 [[:call '= [:call 'first x] [:lit (keyword (str c))]]
+                                  [:if [:call '= [:call 'count x] [:lit (inc (count fs))]] (conj-terms cs) [:lit false]]]))]
+                    (when (every? some? arms)
+                      (reduce (fn [e [c b]] [:if c b e]) [:lit false] (reverse arms))))
+
+                  :else nil)))]
+      (doseq [ty types] (check ty rec-var))
+      ;; a recognizer whose type, or a part's, has none is dropped, and so
+      ;; is every one that calls it
+      (loop []
+        (let [{:keys [defs]} @out
+              gone (set (for [[n d] defs
+                              :when (or (contains? @bad n)
+                                        (some #(and (= :app (head %)) (contains? @bad (second %))
+                                                    (not= n (second %)))
+                                              (t/subterms (:body d))))]
+                          n))]
+          (when (seq gone)
+            (swap! bad into gone)
+            (swap! out update :defs #(apply dissoc % gone))
+            (recur))))
+      (let [{:keys [names] :as o} @out
+            all (into (set types) (keys names))]
+        (assoc o
+               :names (into {} (remove (fn [[_ n]] (contains? @bad n))) names)
+               :lists (set (remove #(contains? @bad %) (:lists o)))
+               :checks (into {} (for [ty all
+                                      :let [ty (plain ty)
+                                            c (cond (type-var? tenv ty) :any
+                                                    (contains? '#{Nat Int} ty) nil
+                                                    :else (let [c (check ty rec-var)]
+                                                            (when-not (and (= :app (head c)) (contains? @bad (second c)))
+                                                              c)))]
+                                      :when c]
+                                  [ty c])))))))
+
 ;; --- goals under hypotheses ---------------------------------------------------
 
 (defn truthy? [x]
@@ -159,7 +281,8 @@
            (cond-> (if (and (= :call (head gi)) (= '= (second gi)) (= 4 (count gi)))
                      {:hyp hi :lhs (n (nth gi 2)) :rhs (n (nth gi 3))}
                      {:hyp hi :lhs (n gi) :rhs [:lit true]})
-             (seq pvars) (assoc :vars pvars))))))
+             (seq pvars) (assoc :vars pvars
+                                :types (into {} (map (fn [[x ty]] [(ren x) (plain ty)])) free)))))))
 
 (defn useful-ih
   "The hypotheses that can rewrite something: not one whose left side
@@ -201,7 +324,7 @@
                                    (if (< (calls a) (calls b)) [b a] [a b]))
                                  [(n gl) [:lit true]])]
                    :when (not (or (symbol? l) (= :lin (head l))))]
-               {:name name :vars (set (vals ren)) :hyp hyp :lhs l :rhs r}))))
+               {:name name :vars (set (vals ren)) :types types :hyp hyp :lhs l :rhs r}))))
     (catch clojure.lang.ExceptionInfo _ nil)))
 
 
@@ -289,7 +412,10 @@
                                     (into {} (map (fn [[x v]] [v (if (= x acc) 'Int (get-in opts [:types x]))]))
                                           ren))))
         n #(rw/normalize ctx %)
-        hyp [:call 'integer? (ren acc)]]
+        hyp [:call 'integer? (ren acc)]
+        types (into {} (keep (fn [[x v]] (when-let [ty (if (= x acc) 'Int (get-in opts [:types x]))]
+                                           [v (plain ty)])))
+                    ren)]
     (if (= 'integer? (second g))
-      {:name nm :vars (set (vals ren)) :hyp hyp :lhs (n g) :rhs [:lit true]}
-      {:name nm :vars (set (vals ren)) :hyp hyp :lhs (n (nth g 2)) :rhs (n (nth g 3))})))
+      {:name nm :vars (set (vals ren)) :types types :hyp hyp :lhs (n g) :rhs [:lit true]}
+      {:name nm :vars (set (vals ren)) :types types :hyp hyp :lhs (n (nth g 2)) :rhs (n (nth g 3))})))
