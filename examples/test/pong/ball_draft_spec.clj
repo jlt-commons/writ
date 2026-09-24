@@ -5,11 +5,16 @@
   adequacy check tries exactly that stand-in and reports the gap.
   core_spec.clj closes it with `in-open-court-the-ball-travels-at-its-velocity`."
   (:require [pong.core :refer [W H PH LEFT-X]]
-            [writ.spec :refer [spec ann law]]))
+            [writ.spec :refer [spec ann graph law]]))
 
 (spec pong.core)
 
 (ann advance [(Tuple Int Int Int Int) Int Int -> (Tuple Int Int Int Int)])
+
+;; a draft: the ball goes on being a ball, and nothing more is said here
+(graph ball
+  {:states {:ball (Tuple Int Int Int Int)}
+   :edges  {:ball {[advance Int Int] #{:ball}}}})
 
 (defn court-paddle [y] (mod y (inc (- H PH))))
 

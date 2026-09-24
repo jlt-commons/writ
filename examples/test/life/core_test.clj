@@ -13,10 +13,23 @@
   (let [r (spec/check 'life.core-spec)]
     (is (:ok r) (:message r))))
 
+(deftest the-readable-life-is-proved
+  (let [r (spec/check 'life.core-spec {:seed 42})
+        status (fn [l] (:status (first (filter #(= l (:law %)) (:laws r)))))]
+    (doseq [l '[neighbours-are-the-eight-cells-around neighbours-names-each-once
+                a-cell-lives-by-the-rule the-plane-has-no-favoured-place]]
+      (is (= :proved (status l)) (str l)))))
+
 (deftest the-fast-life-meets-the-same-spec
-  (let [r (spec/check 'life.core-spec {:target 'life.fast})]
-    (is (:ok r) (:message r))
-    (is (= 'life.fast (:target r)))))
+  (testing "it counts with frequencies, outside the prover, so it is tested, not proved"
+    (let [r (spec/check 'life.core-spec {:target 'life.fast :require :tested})]
+      (is (:ok r) (:message r))
+      (is (= 'life.fast (:target r))))))
+
+(deftest a-favoured-place-is-refuted
+  (let [r (check 'life.broken.origin)]
+    (is (not (:ok r)))
+    (is (str/includes? (:message r) "law `the-plane-has-no-favoured-place` fails for"))))
 
 (deftest highlife-is-not-life
   (let [r (check 'life.broken.highlife)]

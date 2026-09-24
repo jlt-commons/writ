@@ -5,13 +5,17 @@
   any other status, and writ reports that: a `classify` that agrees on
   these statuses and answers anything at all elsewhere satisfies it.
   core_spec.clj states the bands instead."
-  (:require [writ.spec :refer [spec data ann law]]))
+  (:require [writ.spec :refer [spec data ann graph law]]))
 
 (spec fetch.core)
 
 (data Class Done Redirect Transient Failed)
 
 (ann classify [Nat -> Class])
+
+(graph statuses
+  {:states {:status Nat, :class Class}
+   :edges  {:status {[classify] #{:class}}}})
 
 (law ok-is-done (= [:Done] (classify 200)))
 (law moved-is-a-redirect (= [:Redirect] (classify 301)))

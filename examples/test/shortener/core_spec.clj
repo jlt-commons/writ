@@ -13,7 +13,7 @@
   `store-of` shortens a generated list of URLs into an empty store."
   (:require [clojure.string :as str]
             [shortener.core :refer [handle]]
-            [writ.spec :refer [spec data ann law calls]]))
+            [writ.spec :refer [spec data ann refine graph law calls]]))
 
 (spec shortener.core)
 
@@ -30,6 +30,24 @@
 (ann follow        [(Map String String) String -> Reply])
 (ann handle        [(Map String String) Keyword String String
                     -> (Tuple (Map String String) Reply)])
+
+;; --- the state graph ---------------------------------------------------------------
+
+;; what encode-id hands out: one to eleven letters and digits
+(refine Code [s String] (boolean (re-matches #"[0-9a-zA-Z]{1,11}" s)))
+
+(graph shortener
+  {:states {:id Nat, :code Code, :text String, :url String, :verdict Bool,
+            :method Keyword, :route Route,
+            :links (Map String String), :reply Reply,
+            :result (Tuple (Map String String) Reply)}
+   :edges  {:id     {[encode-id] #{:code}}
+            :text   {[decode-id] #{:id}, [valid-code?] #{:verdict}}
+            :url    {[normalize-url] #{:url}, [valid-url?] #{:verdict}}
+            :method {[route String] #{:route}}
+            :links  {[shorten String] #{:result}
+                     [follow String] #{:reply}
+                     [handle Keyword String String] #{:result}}}})
 
 ;; --- the call graph ------------------------------------------------------------
 

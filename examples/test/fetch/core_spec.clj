@@ -10,7 +10,7 @@
   generated offset, like (+ 400 (mod n 100)), and name the statuses that
   carry meaning one by one."
   (:require [fetch.core :refer [base-ms cap-ms max-attempts]]
-            [writ.spec :refer [spec data ann law]]))
+            [writ.spec :refer [spec data ann refine graph law]]))
 
 (spec fetch.core)
 
@@ -21,6 +21,19 @@
 (ann backoff-ms  [Nat -> Nat])
 (ann repeatable? [Keyword Nat -> Bool])
 (ann next-action [Keyword Nat Nat -> Action])
+
+;; --- the flow of a request ---------------------------------------------------------
+
+;; a wait is never shorter than the base or longer than the cap
+(refine Delay [ms Nat] (<= base-ms ms cap-ms))
+
+(graph retry
+  {:states {:status Nat, :class Class, :attempt Nat, :delay Delay,
+            :method Keyword, :safe Bool, :action Action}
+   :edges  {:status  {[classify] #{:class}}
+            :attempt {[backoff-ms] #{:delay}}
+            :method  {[repeatable? Nat] #{:safe}
+                      [next-action Nat Nat] #{:action}}}})
 
 (def redirects #{301 302 303 307 308})
 (def transient #{0 408 425 429 500 502 503 504})
