@@ -297,7 +297,7 @@
 (deftest a-spec-that-does-not-pin-a-fn-down-has-gaps
   (let [r (spec/check 'writ.spec-demo.sort-weak-spec {:seed 42})
         gap-fns (set (map :fn (:gaps r)))]
-    (is (every? #(contains? #{:tested :proved} (:status %)) (:laws r)) "every law holds")
+    (is (every? #(contains? #{:tested :proved :witnessed} (:status %)) (:laws r)) "every law holds")
     (is (not (:ok r)) "but the spec is too weak to mean anything")
     (is (contains? gap-fns 'isort))
     (testing "the report names the impostor that satisfied every law"
@@ -346,7 +346,7 @@
 
 (deftest laws-that-fix-an-argument-leave-the-rest-unspecified
   (let [r (spec/check 'writ.spec-demo.classify-weak-spec {:seed 42})]
-    (is (every? #(contains? #{:tested :proved} (:status %)) (:laws r)) "every law holds")
+    (is (every? #(contains? #{:tested :proved :witnessed} (:status %)) (:laws r)) "every law holds")
     (is (not (:ok r)))
     (is (= ['classify-read] (map :fn (:gaps r))))
     (is (re-find #"when it returns a different value whenever `n` is not one of -127, -2, -1, 0"
@@ -572,3 +572,32 @@
     (is (str/includes? m "[*] --> Locked"))
     (is (str/includes? m "Locked --> Unlocked : Coin"))
     (is (str/includes? m "Locked --> [*]"))))
+
+;; --- a law judges the code with the spec's own helpers ------------------------
+
+(deftest a-helper-named-like-a-target-fn-is-rejected
+  (let [r (spec/check 'writ.spec-demo.shadow-spec {:seed 42})]
+    (is (not (:ok r)))
+    (is (= '[ascending?] (:ambiguous r)))
+    (is (empty? (:laws r)) "no law runs while a name means two things")
+    (is (str/includes? (:message r)
+                       "`ascending?` is defined by the spec and by writ.spec-demo.shadow"))
+    (is (str/includes? (:message r) "rename the spec's `ascending?`"))))
+
+;; --- the spec bounds the code's public fns --------------------------------------
+
+(deftest a-public-fn-the-spec-does-not-sign-fails
+  (let [r (spec/check spec-ns {:target 'writ.spec-demo.sort-extra :seed 42})]
+    (is (not (:ok r)))
+    (is (= '[largest] (:unspecified r)))
+    (is (str/includes? (:message r)
+                       "`largest` is public, but the spec gives it no signature"))
+    (is (str/includes? (:message r) "make it private with defn-"))))
+
+(deftest the-report-names-public-fns-off-the-graph
+  (let [r (spec/check spec-ns {:seed 42})]
+    (is (:ok r) (:message r))
+    (is (= [] (:off-graph r)) "insert is a step: it keeps a sorted list sorted"))
+  (let [r (spec/check 'writ.spec-demo.flow-spec {:seed 42})]
+    (is (= '[insert] (:off-graph r)))
+    (is (str/includes? (:message r) "not a step of any graph or machine: insert"))))

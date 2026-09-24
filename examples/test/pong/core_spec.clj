@@ -8,7 +8,7 @@
   the four phases of a game; each edge is proved from the code, so every
   run of `step` stays inside the graph and keeps its rules."
   (:require [pong.core :refer [W H PH LEFT-X RIGHT-X WIN]]
-            [writ.spec :refer [spec data ann refine graph law]]))
+            [writ.spec :refer [spec data ann refine graph flow law]]))
 
 (spec pong.core {:require :proved})
 
@@ -59,6 +59,20 @@
             :paused  {[step Key] #{:paused :playing}}
             :won     {[step Key] #{:won :serving}}}
    :before [[:playing :won]]})
+
+;; a tick of play: the key moves the left paddle, the ball draws the
+;; right one, and the ball moves against both
+(flow play [ball ly ry ls rs key]
+  [key move-paddle advance :result]
+  [ball track advance]
+  [ball advance :result])
+
+;; step hands the game and the key to play, and moves the paddle while
+;; a serve counts down
+(flow step [game key]
+  [game play :result]
+  [key play]
+  [key move-paddle :result])
 
 ;; --- paddles -------------------------------------------------------------------
 

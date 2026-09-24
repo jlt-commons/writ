@@ -44,14 +44,20 @@ test/my/sort_test.clj     runs the check
 
 1. Declare the state graph. Every spec has one: the problem's states, as
    types -- refinements most often -- and the fns that step between them.
-   It is the first thing a spec says, and writ proves each of its edges.
-2. State what each step means, as laws, and ask for proof with
+   It is the first thing a spec says. writ proves each of its edges, and
+   checks that the code takes every step the graph names.
+2. Say how the steps are wired: `flow` for the path data takes through a
+   fn, `calls` for the layers it goes through.
+3. State what each step means, as laws, and ask for proof with
    `(spec my.sort {:require :proved})`.
-3. Write the implementation as ordinary Clojure.
-4. Run the check. If it fails, the report says what to fix. If a law holds
+4. Read the plan back: `(spec/plan 'my.sort-spec)` prints the states,
+   steps, signatures, laws and wiring from the spec alone, for a person
+   to confirm before any code is written.
+5. Write the implementation as ordinary Clojure.
+6. Run the check. If it fails, the report says what to fix. If a law holds
    but is not proved, help the prover with a lemma or a hint in the proof
    namespace; don't weaken the law.
-5. Keep the check in the test suite, so it gates every change.
+7. Keep the check in the test suite, so it gates every change.
 
 writ is a test dependency. The spec and the check live on the test
 classpath, so production code never loads writ.
@@ -93,34 +99,35 @@ The spec:
 
 ```clojure
 (ns my.sort-spec
-  (:require [writ.spec :refer [spec ann law graph]]))
+  (:require [writ.spec :refer [spec ann law graph refine]]))
 
 (spec my.sort {:require :proved})
 
 (ann insert      [Nat (List Nat) -> (List Nat)])
 (ann isort       [(List Nat) -> (List Nat)])
 
-;; the problem's data flow: a list goes in, a sorted list comes out
-(graph sorting
-  {:states {:unsorted (List Nat), :sorted (List Nat)}
-   :edges  {:unsorted {[isort] #{:sorted}}}})
-
 (defn ascending? [xs]
   (or (empty? xs) (apply <= xs)))
+
+;; what makes a list sorted
+(refine Sorted [xs (List Nat)] (ascending? xs))
+
+;; the problem's states: a list goes in, a sorted list comes out, and
+;; inserting into a sorted list keeps it sorted (`_` is where the state goes)
+(graph sorting
+  {:states {:unsorted (List Nat), :sorted Sorted}
+   :edges  {:unsorted {[isort] #{:sorted}}
+            :sorted   {[insert Nat _] #{:sorted}}}})
 
 (defn occurrences [x xs]
   (count (filter #(= x %) xs)))
 
-;; a sort puts its input in order...
-(law sorted (forall [xs (List Nat)] (ascending? (isort xs))))
-
-;; ...and keeps every element, duplicates included
+;; the graph already says a sort puts its input in order; it also
+;; keeps every element, duplicates included
 (law permutation (forall [x Nat, xs (List Nat)]
                    (= (occurrences x (isort xs)) (occurrences x xs))))
 
-;; insert keeps an ordered list ordered, and adds exactly one x
-(law insert-keeps-sorted (forall [x Nat, xs (List Nat)]
-                           (=> (ascending? xs) (ascending? (insert x xs)))))
+;; and insert adds exactly one x
 (law insert-adds (forall [x Nat, xs (List Nat)]
                    (= (occurrences x (insert x xs)) (inc (occurrences x xs)))))
 ```
@@ -137,7 +144,11 @@ The check:
     (is (:ok r) (:message r))))
 ```
 
-If `insert` dropped a value equal to the head, the report would read:
+The graph's edges are laws: `sorting:unsorted:isort` says every list
+`isort` returns is `Sorted`, and `sorting:sorted:insert` that `insert`
+keeps a sorted list sorted. Each step the graph names must also be taken,
+by some input. If `insert` dropped a value equal to the head, the report
+would read:
 
 ```
 writ.spec: my.sort-spec against my.sort: FAILED
@@ -229,23 +240,35 @@ sufficient.
 
 ## Writing a spec
 
-A spec namespace requires `writ.spec` and uses six forms.
+A spec namespace requires `writ.spec` and uses these forms.
 
 - `(spec target.ns)` names the namespace it constrains. It comes first.
 - `(ann f [A B -> R])` gives fn `f` its parameter and return types. Every
-  public fn should have one; the report lists the ones that don't. A
-  private helper that recurses over a collection needs one too, because
-  writ has to know the collection is finite to accept the recursion.
+  public fn needs one: a public fn with no `ann` fails the check, since
+  nothing would check it. Sign it if the plan has it, or make it private
+  with `defn-` if it is a helper. A private helper that recurses over a
+  collection needs an `ann` too, because writ has to know the collection
+  is finite to accept the recursion.
+- `(refine Name [x Base] pred)` is a type: the values of `Base` where
+  `pred` holds. See [Refinements](#refinements).
+- `(graph name {...})` is the problem's states and the steps between them.
+  See [The state graph](#the-state-graph).
 - `(data Name Ctor (Ctor2 FieldType ...) ...)` declares a datatype the
   target's values use. `(data Box [a] (Wrap a))` takes type parameters.
 - `(law name proposition)` states a law.
-- `(calls f [g ...])` states exactly which fns `f` calls. See
+- `(calls f [g ...])` states exactly which fns `f` calls, and
+  `(calls f {:through [g] :not [h]})` what it reaches. See
   [The call graph](#the-call-graph).
+- `(flow f [param ...] [link link ...] ...)` states the path data takes
+  through `f`. See [Flows](#flows).
 - `(machine name {...})` states that a fn steps a state machine by a
   transition table. See [Machines](#machines).
 
 A spec may define its own helper fns, like `ascending?` above. They run
-only when laws run.
+only when laws run. A helper may not share a name with a public fn of the
+target: a law's free name is read as the target's fn first, so the helper
+would silently be replaced by the code it is meant to judge. writ rejects
+the spec instead, and says which name to rename.
 
 ### Types
 
@@ -326,7 +349,23 @@ rule. Every law still holds. `calls` states the structure:
 ```
 
 `(calls f [g ...])` means `f`'s direct calls are exactly that set, no
-more and no fewer. The call graph is read from `f`'s source:
+more and no fewer. A plan often knows the layers but not every helper, so
+the map form states reach instead:
+
+```clojure
+(calls handle {:through [normalize respond] :not [str/upper-case]})
+```
+
+`:through` names fns `handle` must reach, directly or through any chain
+of the namespace's own fns; `:not` names fns it must never reach. A
+reach that breaks the rule is reported with its path:
+
+```
+the call graph of `handle` is not the one the spec gives
+  `handle` reaches `clojure.string/upper-case`, which the spec says it never does: handle -> normalize -> clojure.string/upper-case
+```
+
+The call graph is read from `f`'s source:
 
 - A simple name is one of the target's own fns. A qualified name is a fn
   of another namespace, resolved through the spec's aliases, so
@@ -356,6 +395,12 @@ doesn't look at the store. Its call set names the stray call:
 `` `shorten` calls `shortener.store/remember!`, which the spec does not
 list``. [examples/](examples/README.md#shortener) has this case, run
 against a real server.
+
+`f` may be a fn of another namespace, named through the spec's aliases.
+That is how a spec reaches the effect shell, which writ doesn't check but
+which is where the core gets called: `(calls server/app {:through
+[core/handle]})` fails if the shell answers requests some other way. In
+such a form, a simple name is a fn of that namespace.
 
 `(spec/call-graph 'my.ns)` returns the graph of any namespace as
 `{f #{g ...}}`. It reads the source without loading or checking it, so it
@@ -421,29 +466,59 @@ its edges are the fns that step between them:
    :before [[:yellow :red]]})
 ```
 
-An edge's key is the fn and the types of the arguments after the state:
-`[move-paddle Key]` is `(move-paddle state key)` for every `Key`. writ
-checks the graph three ways:
+An edge's key is the fn and the types of its other arguments. The state
+is the first argument unless `_` marks where it goes: `[move-paddle Key]`
+is `(move-paddle state key)` for every `Key`, and `[insert Nat _]` is
+`(insert n state)`. An edge out of a tuple state may take a part of it
+with `first`, `second` or `last`, which is how a fn that returns the next
+state with something else leads back round: `{:result {[first]
+#{:links}}}`. writ checks the graph four ways:
 
 - **Data flow.** Each edge's fn must take its state's type and return its
   targets' type, by its `ann`.
 - **Each edge is a law.** An edge into refinements is an obligation named
   for the graph, the state and the fn, `signal:yellow:tick`, run and
   proved like any law: the fn takes every value of its state into one of
-  the states it names, and it never throws. A step that breaks it is
-  reported with the state it breaks on:
+  the states it names, and it never throws. The law is the target's
+  predicate applied to the call, `(Sorted? (isort xs))` read as
+  `(ascending? (isort xs))`, so it is proved the way the spec's own laws
+  are. A step that breaks it is reported with the state it breaks on:
 
   ```
   law `signal:yellow:tick` fails for
     l = [:Yellow 5]
     a tick from yellow must land in yellow or red
   ```
+- **Each step is taken.** An edge only bounds the code, and code that
+  never leaves its state keeps every bound. So each target of an edge is
+  also a law, `signal:green:tick->yellow`: some value of the state, and
+  some arguments, land there. A signal stuck on green fails it:
+
+  ```
+  law `signal:green:tick->yellow` fails
+    the graph says a tick can take green to yellow, but no generated green does
+  ```
 - **The graph's own rules.** `:start` names a state, or `[state value]`
   with a value in it; every state must be reachable from it; `:final`
   states must be reachable from every state; `:never [a b]` says no path
   leads from a to b, and `:before [a b]` that every path from the start
-  to b passes a. With every edge proved, these hold for every run of the
-  code, not only for the table.
+  to b passes a.
+
+What that adds up to: with every edge proved, `:never` and `:before`
+hold for every run of the code, since a run only takes edges the graph
+has. Reachability and `:final` are about the steps, each of which some
+value of its state takes; they do not promise that a run from the start
+gets there.
+
+States must say what sets them apart. Two states of the same plain type,
+like `:unsorted (List Nat)` and `:sorted (List Nat)`, fail the check: a
+value of one is a value of the other, so an edge between them checks the
+type and nothing else, and the names say more than the graph does. Make
+the state that means something a refinement, `(refine Sorted [xs (List
+Nat)] (ascending? xs))`, and the edge into it is the law. For the same
+reason an edge may not list a plain state beside refined ones: every
+result is in the plain one. Define a refinement with the same helpers the
+laws use, so the prover sees one vocabulary.
 
 A spec for plain functions has a graph too: its states are the data the
 problem moves through, and an edge into plain types is data flow only,
@@ -451,6 +526,10 @@ checked against the signatures. pong's graph has four states, one per
 phase of a game, each a refinement of the game's tuple; its four edges
 are proved from the code, so no sequence of key presses ever takes a
 game out of them.
+
+`(spec/mermaid 'my.spec {:graph 'signal})` draws a graph as a mermaid
+`stateDiagram-v2`, and `(spec/plan 'my.spec)` prints it with the rest of
+the plan; see [Other entry points](#other-entry-points).
 
 ### Machines
 
@@ -510,6 +589,55 @@ The table also takes part in the adequacy check as a law would, so a
 machine alone pins its step fn down. `(spec/mermaid 'my.spec {:machine
 'screens})` draws the table as a mermaid `stateDiagram-v2`.
 
+A machine and a graph differ where it matters. A machine's states and
+events are values, `:start` is a value, and its table is exact: every
+pair is run, and a pair the table doesn't list must keep the state. A
+graph's states are types, `:start` is a state's name (or `[state
+value]`), and an edge says where a step may go and that it can: pairs
+the graph doesn't list are unconstrained. Use a machine when the
+meaning is a finite table, and a graph when the states are sets of
+values.
+
+### Flows
+
+`calls` says which fns are called. It doesn't say what they are given: a
+fn can call every layer the spec names and still hand the second one the
+raw input, throwing the first one's work away. `flow` states the path the
+data takes:
+
+```clojure
+(flow handle [req]
+  [req normalize respond :result]
+  [normalize :result])
+```
+
+The vector after the fn names its parameters, by position, so the spec
+never depends on what the code calls them. Each chain after it is a path,
+and every link must reach the next:
+
+- `a` reaches fn `b` when some call the fn makes to `b` is passed a value
+  that comes from `a`: from the parameter `a`, or from what a call to fn
+  `a` returned, directly or through other calls.
+- `a` reaches `:result` when what the fn returns comes from `a`. A
+  branch's test counts, so a check that decides the answer reaches it.
+- A lambda passed to a fn, as in `(map (fn [x] (step x)) xs)`, is given
+  that call's other arguments, and so is a fn passed by name. A loop's
+  bindings carry what each `recur` passes.
+
+The check reads the fn's source. A flow that the code breaks names the
+link:
+
+```
+the flow of `handle` is not the one the spec gives
+  `respond` is never given anything that comes from `normalize`
+  what `handle` returns does not come from `normalize`
+```
+
+A flow names only parameters and fns; a name that is neither, or a
+parameter count that doesn't match, fails the check. Like `calls`, a flow
+may be about a fn of another namespace, such as an effect shell. A fn a
+flow names is a step of the plan, like a graph's edge fns.
+
 ## Running the check
 
 `(writ.spec/check 'my.sort-spec)` returns a report map:
@@ -525,8 +653,11 @@ machine alone pins its step fn down. `(spec/mermaid 'my.spec {:machine
  :gaps        []                ; fns the laws don't pin down
  :rejected    [{:fn isort ...}] ; per fn: its laws and the stand-ins they rejected
  :calls       [{:fn handle :calls [normalize respond] :status :ok} ...]
+ :flows       [{:fn handle :chains ["req -> normalize -> respond -> result"] :status :ok} ...]
+ :graphs      [{:graph sorting :status :ok :states 2 :edges 2} ...]
  :machines    [{:machine screens :status :ok :states 6 :events 7} ...]
- :unspecified []                ; public fns with no ann
+ :unspecified []                ; public fns with no ann: each fails the check
+ :off-graph   []                ; signed public fns no graph, machine or flow names
  :message     "writ.spec: my.sort-spec against my.sort: ok\n  `insert`: ..."}
 ```
 
@@ -534,7 +665,9 @@ It works in three stages, and each runs only if the one before passed.
 
 1. **Static.** writ reads the target's source from the classpath, puts the
    `ann` types on its `defn`s and checks it (see below). If this fails,
-   `:static` carries the error and no law runs.
+   `:static` carries the error and no law runs. Nor does one run when a
+   helper of the spec shares a name with a public fn of the target;
+   `:ambiguous` names it.
 2. **Laws.** Each law gets a `:status`:
    - `:vacuous`: it holds whatever the code does, so it fails; see
      [What a spec should say](#what-a-spec-should-say).
@@ -570,7 +703,11 @@ It works in three stages, and each runs only if the one before passed.
 
 The `calls` forms are checked once the static stage passes, beside the
 laws, and each gets an entry in `:calls` with `:status` `:ok` or
-`:failed`, plus `:missing` and `:extra` when it failed. Each `machine`
+`:failed`, plus `:missing` and `:extra` when it failed (`:unreached` and
+`:reached` for the map form). Each `flow` gets an entry in `:flows`, with
+`:errors` when it failed. A passing report lists the signed public fns
+that no graph, machine or flow names, as `not a step of any graph or
+machine`: a public helper is fine, but a reader should see it. Each `machine`
 gets an entry in `:machines`; a failed one carries `:mismatches`, one
 `{:state :event :expected :actual}` per pair the code gets wrong, and
 `:errors` for the table's own rules.
@@ -887,7 +1024,38 @@ The report map has the same in `:forms`, one entry per form with
 argument and return checks for use at the REPL, and `unstrument` removes
 them. `(spec/sample '(List Nat) {} 5)` shows what a type generates.
 `(spec/call-graph 'my.ns)` and `(spec/mermaid 'my.ns)` read a namespace's
-call graph; see [The call graph](#the-call-graph).
+call graph; see [The call graph](#the-call-graph). `(spec/flow-facts 'my.ns
+'f)` shows what `flow` reads: each call `f` makes, with where each
+argument's value comes from, and where its result comes from.
+
+`(spec/plan 'my.spec)` prints the spec as a plan for a person to read and
+confirm, from the spec alone, so it works before the code exists: each
+graph's states, with a refinement's predicate spelled out, and its steps
+and rules; each signed fn with its signature, the laws that name it, its
+flows and its call set; and the wiring the spec gives fns outside the
+target, such as a shell's.
+
+```
+plan: my.pipeline-spec for my.pipeline
+
+graph `request`
+  states
+    :raw       String
+    :clean     Clean, a String where (= s (cleaned s))
+    :response  (Tuple Keyword String)
+  steps
+    :raw -[normalize]-> :clean
+    :clean -[respond]-> :response
+
+fns
+  handle  [String -> (Tuple Keyword String)]
+    laws: handle-answers-with-the-cleaned-input, ok-exactly-when-short
+    flow: s -> normalize -> respond -> result
+    calls exactly: normalize, respond
+```
+
+`(spec/mermaid 'my.spec {:graph 'g})` draws graph `g` as a mermaid
+`stateDiagram-v2`.
 
 ## What the static check enforces
 
