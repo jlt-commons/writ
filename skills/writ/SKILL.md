@@ -265,6 +265,11 @@ Plain Clojure, with no writ require and no annotations. writ rejects:
     as `(if (< n k) base (f (- n k)))`
   - fields from destructuring or `first`/`nth` under a non-nil test,
     including a `case` on `(first t)`
+  - a field of a field, `(rest (rest xs))` or a nested `match`, with each
+    read guarded at its own depth; a test on a deeper read guards the
+    reads above it
+  - `[:Tag f1 f2]` rebuilt from a matched field's own fields, each at its
+    own index, which is no larger than that field
 
   A test inside `and` counts in the then branch, and each test of an `or`
   is false in its else branch. Recursion with no structural measure

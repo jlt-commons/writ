@@ -345,6 +345,15 @@
         ;; them
         [ctx vacuous] (if vacuous [ctx vacuous] (take-all ctx hyps))
         ctx (assoc ctx :ih (mapv (fn [i] (update i :lhs #(rw/normalize ctx %))) (:ih opts)))
+        ;; an unconditional hypothesis that is a linear comparison is a
+        ;; fact too: the arithmetic reads facts, and a rewrite of the
+        ;; comparison itself never meets 0 <= h + (f t) with 0 <= (f t)
+        ctx (reduce (fn [c {:keys [hyp lhs rhs vars]}]
+                      (if (and (nil? hyp) (empty? vars) (= [:lit true] rhs)
+                               (contains? #{:le :ieq} (t/head lhs)))
+                        (rw/assume c lhs true)
+                        c))
+                    ctx (:ih ctx))
         ctx (assoc ctx :memo (atom {}) :stuck (atom #{}) :int-memo (atom {}))]
     [ctx vacuous (when-not vacuous (rw/normalize ctx g))]))
 

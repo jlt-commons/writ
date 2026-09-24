@@ -2570,3 +2570,64 @@
                           [^:many s :- (List writ.kind/Char)] :- writ.kind/Nat
                           (if (empty? s) 0 (+ (if (= (first s) \{) 1 0) (opens (rest s)))))
                         (writ.defn/defn g [] :- writ.kind/Nat (opens "a{b{"))]))))
+
+;; --- G119: descent through nested matches on declared datatypes -------------
+;;
+;; A field of a field is smaller than the column, as long as each read is
+;; guarded at its own depth (the inner match's tag test guards the inner
+;; read).  Putting a matched node's fields back in their places rebuilds
+;; that node, which is no larger than it (Bend: nested_literal_rebuild).
+
+(deftest descent-through-nested-data-matches
+  (let [tree '(writ.defn/data NatTree (Leaf) (Node Nat NatTree NatTree))
+        nlist '(writ.defn/data NatList (Nil) (Cons Nat NatList))]
+    (testing "a grandchild"
+      (is (nil? (book-err [tree '(writ.defn/defn ^{:writ/descend true} lm [t :- NatTree] :- Nat
+                                   (writ.defn/match t :- NatTree
+                                     (Leaf 0)
+                                     ((Node v l r) (writ.defn/match l :- NatTree
+                                                     (Leaf v)
+                                                     ((Node w ll lr) (lm ll))))))]))))
+    (testing "two cells at a time"
+      (is (nil? (book-err [nlist '(writ.defn/defn ^{:writ/descend true} ev [xs :- NatList] :- Nat
+                                    (writ.defn/match xs :- NatList
+                                      (Nil 0)
+                                      ((Cons h t) (writ.defn/match t :- NatList
+                                                    (Nil h)
+                                                    ((Cons h2 t2) (+ h (ev t2)))))))]))))
+    (testing "a one-layer rebuild of a matched field"
+      (is (nil? (book-err [nlist '(writ.defn/defn ^{:writ/descend true} ev [xs :- NatList] :- Nat
+                                    (writ.defn/match xs :- NatList
+                                      (Nil 0)
+                                      ((Cons h t) (writ.defn/match t :- NatList
+                                                    (Nil h)
+                                                    ((Cons h2 t2) (+ h (ev [:Cons h2 t2])))))))]))))
+    (testing "rebuilding the column itself is not smaller"
+      (is (re-find #"does not descend"
+                   (book-err [nlist '(writ.defn/defn ^{:writ/descend true} ev [xs :- NatList] :- Nat
+                                       (writ.defn/match xs :- NatList
+                                         (Nil 0)
+                                         ((Cons h t) (ev [:Cons h t]))))]))))
+    (testing "a rebuild must put each field back in its place"
+      (is (re-find #"does not descend"
+                   (book-err [tree '(writ.defn/defn ^{:writ/descend true} sw [t :- NatTree] :- Nat
+                                      (writ.defn/match t :- NatTree
+                                        (Leaf 0)
+                                        ((Node v l r) (writ.defn/match l :- NatTree
+                                                        (Leaf v)
+                                                        ((Node w ll lr) (sw [:Node w lr ll]))))))]))))))
+
+(deftest descent-through-nested-seq-reads
+  (is (nil? (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                        (if (seq xs) (if (seq (rest xs)) (f (rest (rest xs))) 0) 0)))))
+  (testing "each read is guarded at its own depth"
+    (is (re-find #"`\(rest xs\)` must first be tested non-empty"
+                 (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                             (if (seq xs) (f (rest (rest xs))) 0))))))
+  (testing "a deeper test guards the reads above it"
+    (is (nil? (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                          (if (seq (rest xs)) (f (rest (rest xs))) 0))))))
+  (testing "a rest below an element read needs the element to be finite"
+    (is (re-find #"finite"
+                 (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                             (if (seq xs) (if (seq (first xs)) (f (rest (first xs))) 0) 0)))))))
