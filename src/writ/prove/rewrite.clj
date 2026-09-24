@@ -70,6 +70,8 @@
                         [:sq [:econs ?h [:elems [:call filter ?f [:sq ?E]]]]]
                         [:call filter ?f [:sq ?E]]]]
     [filter-elems  [:call filter ?f [:sq [:elems ?v]]]  [:call filter ?f ?v]]
+    [filter-app    [:call filter ?f [:sq [:eapp ?A ?B]]]
+                   [:sq [:eapp [:elems [:call filter ?f [:sq ?A]]] [:elems [:call filter ?f [:sq ?B]]]]]]
     [map-nil       [:call map ?f [:nil]]                [:sq [:enil]]]
     [map-empty     [:call map ?f [:sq [:enil]]]         [:sq [:enil]]]
     [map-cons      [:call map ?f [:sq [:econs ?h ?E]]]
@@ -118,6 +120,8 @@
     [every-cons    [:call every? ?f [:sq [:econs ?h ?E]]]
                    [:if [:ap ?f ?h] [:call every? ?f [:sq ?E]] [:lit false]]]
     [every-elems   [:call every? ?f [:sq [:elems ?v]]]  [:call every? ?f ?v]]
+    [every-app     [:call every? ?f [:sq [:eapp ?A ?B]]]
+                   [:if [:call every? ?f [:sq ?A]] [:call every? ?f [:sq ?B]] [:lit false]]]
     [some-nil      [:call some ?f [:nil]]               [:nil]]
     [some-empty    [:call some ?f [:sq [:enil]]]        [:nil]]
     [some-cons     [:call some ?f [:sq [:econs ?h ?E]]]
@@ -415,24 +419,59 @@
 
 (declare boolean-term?)
 
+(def ^:private selecting-fns
+  "clojure.core fns whose value is made of parts of their data arguments
+  and nothing else: no float in, no float out.  A fn argument only picks
+  which parts."
+  '#{filter remove concat list vector vec cons rest next seq take drop reverse
+     sort distinct butlast first second last nth})
+
 (defn float-free?
   "Can this term's value hold no float?  Then two syntactically equal
-  terms are =; with a NaN inside, Clojure's = says they are not."
-  [ctx x]
-  (cond
-    (int-term? ctx x) true
-    (boolean-term? x) true
-    (symbol? x) (float-free-type? ctx (get-in ctx [:types x]))
-    :else
-    (case (head x)
-      :nil true
-      :lit (not (float? (second x)))
-      :sq (float-free? ctx (second x))
-      :enil true
-      :econs (and (float-free? ctx (nth x 1)) (float-free? ctx (nth x 2)))
-      :eapp (and (float-free? ctx (nth x 1)) (float-free? ctx (nth x 2)))
-      :elems (float-free? ctx (second x))
-      false)))
+  terms are =; with a NaN inside, Clojure's = says they are not.  A value
+  built only by picking and arranging parts of float-free values -- a
+  filter, a concat, a fold that does no more, a definition that does no
+  more -- has none either."
+  ([ctx x] (float-free? ctx x #{} #{}))
+  ([ctx x env seen]
+   (let [ff? #(float-free? ctx % env seen)]
+     (cond
+       (int-term? ctx x) true
+       (boolean-term? x) true
+       (symbol? x) (or (contains? env x) (float-free-type? ctx (get-in ctx [:types x])))
+       :else
+       (case (head x)
+         :nil true
+         :bottom true
+         :lit (not (float? (second x)))
+         :sq (ff? (second x))
+         :enil true
+         :econs (and (ff? (nth x 1)) (ff? (nth x 2)))
+         :eapp (and (ff? (nth x 1)) (ff? (nth x 2)))
+         :elems (ff? (second x))
+         :if (and (ff? (nth x 2)) (ff? (nth x 3)))
+         :call (let [[_ f & args] x]
+                 (cond
+                   (contains? selecting-fns f)
+                   (every? ff? (remove #(contains? #{:fn :cfn :dfn} (head %)) args))
+                   ;; a fold whose step makes its value of the accumulator's
+                   ;; and the element's parts
+                   (and (= 'reduce f) (= 3 (count args)) (= :fn (head (first args)))
+                        (= 2 (count (second (first args)))))
+                   (let [[[_ ps body] init coll] args]
+                     (and (ff? init) (ff? coll)
+                          (float-free? ctx body (into env ps) seen)))
+                   :else false))
+         ;; a definition's value, on float-free arguments, when its body
+         ;; makes it of their parts; a recursive call is taken to, which
+         ;; holds of every value the definition returns
+         :app (let [[_ f & args] x
+                    d (get-in ctx [:defs f])]
+                (and (:params d) (= (count args) (count (:params d)))
+                     (every? ff? args)
+                     (or (contains? seen f)
+                         (float-free? ctx (:body d) (set (:params d)) (conj seen f)))))
+         false)))))
 
 (defn- exact-scalar?
   "A value = compares by identity of value: two of them are = exactly when
@@ -466,6 +505,10 @@
           [:if [:call '= (nth ea 1) (nth eb 1)]
                [:call '= [:sq (nth ea 2)] [:sq (nth eb 2)]]
                [:lit false]]
+          ;; the same float-free elements first: the rest decides
+          (and (= :eapp (head ea)) (= :eapp (head eb)) (= (nth ea 1) (nth eb 1))
+               (float-free? ctx (nth ea 1)))
+          [:call '= [:sq (nth ea 2)] [:sq (nth eb 2)]]
           (and (= a b) (float-free? ctx a)) [:lit true]
           :else nil))
       (and (int-term? ctx a) (int-term? ctx b))
@@ -480,6 +523,28 @@
       :else nil)))
 
 ;; --- computed rules --------------------------------------------------------------
+
+(defn- insert-sorted
+  "A fn value inserting x into a sorted list s of integers: the elements
+  below x, then x, then the elements above it -- or at and above it, when
+  duplicates are kept."
+  [above]
+  [:fn '[s x] [:call 'concat
+               [:call 'filter [:fn '[y] [:call '< 'y 'x]] 's]
+               [:call 'list 'x]
+               [:call 'filter [:fn '[y] [:call above 'y 'x]] 's]]])
+
+(defn sort-model
+  "(sort xs) and (sort (distinct xs)) on a list of integers, as a fold
+  inserting each element into the sorted list so far.  Only on integers:
+  two equal integers are the same value, so where an equal element goes
+  does not matter, and < orders them totally.  nil when xs is not known
+  to hold integers."
+  [ctx a]
+  (let [dedup? (and (= :call (head a)) (= 'distinct (second a)) (= 3 (count a)))
+        xs (if dedup? (nth a 2) a)]
+    (when (int-elems? ctx xs)
+      [:call 'reduce (insert-sorted (if dedup? '> '>=)) [:sq t/enil] xs])))
 
 (defn- le [ctx a b]
   [:le (lin->term (lin+ (lin-of ctx b) (lin* -1 (lin-of ctx a))))])
@@ -654,6 +719,7 @@
                              (and (t/lit? a) (not (integer? (second a))))) [:lit false]
                          :else nil))
         reduce (when (= 3 n) (reduce-rule ctx a b (nth args 2)))
+        sort (when (= 1 n) (sort-model ctx a))
         nth (when (and (<= 2 n 3) (t/int-lit? b))
               (nth-rule a (second b) (if (= 3 n) (nth args 2) ::none)))
         nil)))
@@ -708,21 +774,27 @@
   when every guard left open is an integer comparison the prover can
   split on.  An open test on the shape of an unknown value (seq xs,
   first t) means it is too early: the call stays folded until induction
-  or a split reveals that shape.  Only the guards are normalised, never
-  the branches, so a recursive call inside a branch is not unfolded here."
-  [ctx body]
-  (if (= :if (head body))
-    (let [c (normalize ctx (nth body 1))
-          tr (truthiness ctx c)]
-      (cond
-        (true? tr) (settled? ctx (nth body 2))
-        (false? tr) (settled? ctx (nth body 3))
-        (and (= :call (head c)) (= 'not (second c)))
-        (settled? ctx [:if (nth c 2) (nth body 3) (nth body 2)])
-        (splittable? c) (and (settled? (assume ctx c true) (nth body 2))
-                             (settled? (assume ctx c false) (nth body 3)))
-        :else false))
-    true))
+  or a split reveals that shape.  Once a guard has been decided, an open
+  test of what a definition's call returns -- (and (bst? l) ...) after
+  the tag is known -- is not a shape: the call stays folded until its
+  own guards settle.  Only the guards are normalised, never the
+  branches, so a recursive call inside a branch is not unfolded here."
+  ([ctx body] (settled? ctx body false))
+  ([ctx body decided?]
+   (if (= :if (head body))
+     (let [c (normalize ctx (nth body 1))
+           tr (truthiness ctx c)]
+       (cond
+         (true? tr) (settled? ctx (nth body 2) true)
+         (false? tr) (settled? ctx (nth body 3) true)
+         (and (= :call (head c)) (= 'not (second c)))
+         (settled? ctx [:if (nth c 2) (nth body 3) (nth body 2)] decided?)
+         (splittable? c) (and (settled? (assume ctx c true) (nth body 2) decided?)
+                              (settled? (assume ctx c false) (nth body 3) decided?))
+         (and decided? (some #(= :app (head %)) (t/subterms c)))
+         (and (settled? ctx (nth body 2) true) (settled? ctx (nth body 3) true))
+         :else false))
+     true)))
 
 (defn- unfold [ctx x]
   (let [[_ f & args] x
@@ -756,8 +828,11 @@
                          (if (seq vars) (match-term lhs x vars) (when (= x lhs) {})))]
             (let [hyp (some-> hyp (t/subst m))
                   y (t/subst rhs m)]
-              (when (and (or (nil? hyp) (true? (truthiness ctx (normalize ctx hyp))))
-                         (not (loops? x y)))
+              ;; a rewrite to x itself changes nothing, and its hypothesis
+              ;; may hold x: reading it would rewrite x again
+              (when (and (not= x y)
+                         (not (loops? x y))
+                         (or (nil? hyp) (true? (truthiness ctx (normalize ctx hyp)))))
                 (swap! (:used-ih ctx) inc)
                 y))))
         (:ih ctx)))
@@ -795,21 +870,54 @@
         (some-> memo (swap! assoc t r))
         r))))
 
+(defn- conjuncts
+  "The parts of a normalised conjunction: (if a b false) and (if a b a),
+  the shapes `and` lowers to."
+  [h]
+  (if (and (= :if (head h)) (or (= [:lit false] (nth h 3)) (= (nth h 1) (nth h 3))))
+    (concat (conjuncts (nth h 1)) (conjuncts (nth h 2)))
+    [h]))
+
+(defn- bind-free
+  "Every extension of bindings m that gives the variables of hyp that the
+  left side left unbound a value from the facts: a part of hyp that
+  mentions one is matched against a fact known to be true, the way ACL2
+  binds a hypothesis's free variables.  Parts that are integer
+  comparisons go last: their linear form orders terms by name, so they
+  are checked once bound, not matched."
+  [ctx hyp vars m]
+  (let [unbound? (fn [m c] (some #(and (contains? vars %) (not (contains? m %))) (t/vars c)))
+        [plain arith] ((juxt remove filter) #(contains? #{:le :ieq} (head %)) (conjuncts hyp))
+        facts (sort-by pr-str (for [[f v] (:facts ctx) :when (true? v)] f))]
+    (letfn [(go [m cs]
+              (if-let [c (first cs)]
+                (if (unbound? m c)
+                  (mapcat #(some-> (match-term c % vars m) (go (rest cs))) facts)
+                  (go m (rest cs)))
+                [m]))]
+      (go m (concat plain arith)))))
+
 (defn- lemma-rewrite
   "Rewrite x by an earlier proved law: its left side matched against x,
-  its hypothesis, instantiated, normalised to true here."
+  its hypothesis, instantiated, normalised to true here.  A variable of
+  the hypothesis the left side does not bind is bound from the facts."
   [ctx x]
   (some (fn [{:keys [vars hyp lhs rhs name]}]
-          (when-let [m (match-term lhs x vars)]
-            (when (every? #(contains? m %) (t/vars rhs))
-              (when (or (nil? hyp)
-                        (let [h (t/subst hyp m)]
-                          (and (every? #(not (contains? vars %)) (t/vars h))
-                               (true? (truthiness ctx (normalize ctx h))))))
-                (let [y (t/subst rhs m)]
-                  (when-not (loops? x y)
-                    (swap! (:lemmas-used ctx) conj name)
-                    y))))))
+          (when-let [m0 (match-term lhs x vars)]
+            (some (fn [m]
+                    (when (every? #(contains? m %) (t/vars rhs))
+                      (let [y (t/subst rhs m)]
+                        (when (and (not= x y)
+                                   (not (loops? x y))
+                                   (or (nil? hyp)
+                                       (let [h (t/subst hyp m)]
+                                         (and (every? #(not (contains? vars %)) (t/vars h))
+                                              (true? (truthiness ctx (normalize ctx h)))))))
+                          (swap! (:lemmas-used ctx) conj name)
+                          y))))
+                  (if (and hyp (some #(and (contains? vars %) (not (contains? m0 %))) (t/vars hyp)))
+                    (bind-free ctx hyp vars m0)
+                    [m0]))))
         (:lemmas ctx)))
 
 (def ^:private boolean-fns
@@ -864,6 +972,23 @@
                 facts)]
     (assoc ctx :facts facts :memo (atom {}) :stuck (atom #{}) :int-memo (atom {})))))
 
+(defn- fn-height
+  "How deep fn literals nest in t: 0 with none."
+  [t]
+  (if (vector? t)
+    (+ (if (= :fn (head t)) 1 0) (reduce max 0 (map fn-height (rest t))))
+    0))
+
+(defn- canonical-params
+  "A fn literal's parameters, named by their position and by how deep fn
+  literals nest in its body, so two fns that differ only in the names of
+  their parameters are one term, and a fact about one is a fact about the
+  other.  An inner fn's parameters are never named like an outer one's:
+  the outer's height is greater."
+  [ps body]
+  (let [h (inc (fn-height body))]
+    (mapv #(symbol (str "%" h "_" %)) (range (count ps)))))
+
 (defn normalize
   "Rewrite t to normal form under ctx.  An if whose test is open gets its
   branches normalised under the test assumed true, and false."
@@ -896,7 +1021,9 @@
                                   (lin->term (reduce lin+ {:c c :m {}}
                                                      (map (fn [[a k]] (lin* k (lin-of ctx a))) atoms)))
                                   [:lin c (vec atoms)]))
-                         :fn (let [[_ ps body] x] [:fn ps (normalize ctx body)])
+                         :fn (let [[_ ps body] x
+                                   ps* (canonical-params ps body)]
+                               [:fn ps* (normalize ctx (t/subst body (zipmap ps ps*)))])
                          (into [(head x)] (map #(normalize ctx %)) (rest x)))]
                 (if (= :if (head x))
                   ;; a boolean law's left side is often an if: an induction
@@ -1035,3 +1162,22 @@
      (if (:pass? res)
        {:ok true}
        {:ok false :counterexample (first (get-in res [:shrunk :smallest]))}))))
+
+;; --- the models of clojure.core fns against the runtime -------------------------
+
+(defn model-check
+  "Run the sort model on random lists of integers -- lists, vectors and
+  nil, with and without distinct -- against sort itself."
+  ([] (model-check 300 42))
+  ([trials seed]
+   (let [ctx (context {:types '{xs (List Int)}})
+         p (prop/for-all [xs (gen/one-of [(gen/return nil) (gen/list gen-int) (gen/vector gen-int)])
+                          dedup? gen/boolean]
+             (let [call (if dedup? [:call 'sort [:call 'distinct 'xs]] [:call 'sort 'xs])
+                   want (realize (t/evaluate call {'xs xs}))]
+               (and (= want (realize (t/evaluate (sort-model ctx (nth call 2)) {'xs xs})))
+                    (= want (realize (t/evaluate (normalize ctx call) {'xs xs}))))))
+         res (tc/quick-check trials p :seed seed)]
+     (if (:pass? res)
+       {:ok true}
+       {:ok false :counterexample (get-in res [:shrunk :smallest])}))))

@@ -107,10 +107,16 @@
       (reject! "an induction case cannot be proved " (pr-str (:by p))))))
 
 (defn- check-induction
-  "Replay an induction on v: its cases must be the type's cases."
-  [opts g {:keys [on ty cases]}]
+  "Replay an induction on v: its cases must be the type's cases.  A
+  variable that varies in the hypothesis must be one of the goal's, at its
+  own type."
+  [opts g {:keys [on ty cases vary]}]
   (let [cs (or (sc/cases on ty (:tenv opts)) (reject! "`" on "` is not of an inductive type"))
-        declared (get-in opts [:types on])]
+        declared (get-in opts [:types on])
+        _ (doseq [[x xty] vary]
+            (when (or (= x on) (not= xty (get-in opts [:types x])))
+              (reject! "`" x "` cannot vary in the hypothesis of an induction on `" on "`")))
+        opts (cond-> opts (seq vary) (assoc :ih-free vary))]
     (when-not (= (sc/plain declared) ty)
       (reject! "induction on `" on "` as " (pr-str ty) " but it is " (pr-str declared)))
     (when-not (= (map :desc cs) (map :case cases))

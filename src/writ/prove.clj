@@ -13,7 +13,9 @@
   A proof holds for every input on which the law's terms return, as with
   Typed Clojure; writ still runs every law, which catches the inputs where
   a term throws.  A proof that never unfolds one of the target's own
-  definitions says nothing about the code, and is not reported."
+  definitions says nothing about the code, and is not reported -- unless
+  it proves a lemma of a proof namespace, which may be about clojure.core
+  alone."
   (:require [clojure.string :as str]
             [clojure.test.check.generators :as gen]
             [writ.prove.term :as t :refer [head]]
@@ -233,15 +235,27 @@
             :when p]
         {:by :generalizing :ih i :call call :as ys :ty ty :on (t/show call) :proof p}))))
 
+(defn- varying
+  "The variables of opts' :vary, but v, with their types: they stay free
+  in an induction hypothesis on v."
+  [opts v]
+  (into {} (for [x (:vary opts)
+                 :let [ty (get-in opts [:types x])]
+                 :when (and ty (not= x v))]
+             [x ty])))
+
 (defn- by-induction [opts g v ty]
   (when-let [cs (cases v ty (:tenv opts))]
-    (let [steps (for [c cs]
+    (let [free (varying opts v)
+          opts (cond-> opts (seq free) (assoc :ih-free free))
+          steps (for [c cs]
                   (let [[opts* gi] (sc/induction-case opts g v c)]
                     [c (or (prove-all opts* gi)
                            (by-generalizing (dissoc opts* :ih-free) gi (keys (:types c))))]))]
       (when (every? (comp some? second) steps)
-        {:by :induction :on v :ty (plain ty)
-         :cases (mapv (fn [[c p]] {:case (:desc c) :proof p}) steps)}))))
+        (cond-> {:by :induction :on v :ty (plain ty)
+                 :cases (mapv (fn [[c p]] {:case (:desc c) :proof p}) steps)}
+          (seq free) (assoc :vary free))))))
 
 (defn- fuelled
   "f's result, or nil when it runs out of fuel."
@@ -413,9 +427,10 @@
 (defn prove-law
   "Try to prove a law.  prop is the desugared law, its names qualified;
   defs are the translated definitions; target the implementation's ns;
-  lemmas are the laws proved before it, as {:name :prop}.
+  lemmas are the laws proved before it, as {:name :prop}; lemma, true
+  for a lemma of a proof namespace, which may be about clojure.core alone.
   Returns {:proved true :trace :summary :lemmas} or {:proved false :reason}."
-  [{:keys [prop defs tenv target own fuel lemmas rets total hint]}]
+  [{:keys [prop defs tenv target own fuel lemmas rets total hint lemma]}]
   (try
     (let [[bs0 body] (split-foralls prop)
           tctx (tr/context own)
@@ -424,7 +439,7 @@
           unfolded (atom #{})
           lemmas-used (atom #{})
           opts {:defs defs :tenv tenv :types (into {} (map (fn [[x ty]] [x (plain ty)])) bs)
-                :total total
+                :total total :vary (:vary hint)
                 :unfolded unfolded :fuel (or fuel 20000) :lemmas-used lemmas-used
                 :rets (or rets {})
                 :lemmas (vec (mapcat #(lemma-rules % defs tenv own)
@@ -478,13 +493,13 @@
                              [nil #{}]))
           target-used (filter #(= (str target) (namespace %)) used)
           ;; every proof is replayed by the checker before it is reported
-          checked (when (and trace (seq target-used))
+          checked (when (and trace (or lemma (seq target-used)))
                     (check/check-proof (dissoc opts :lemmas-used :unfolded) g trace))]
       (cond
         (nil? trace) (cond-> {:proved false :reason (if @ran-out "the search ran out of fuel" "no proof found")}
                        (seq bs) (merge (when-let [cex (first (keep #(sym/counterexample opts (:hyps g) %) (:goals g)))]
                                          {:counterexample (recompose bs0 cex)})))
-        (empty? target-used) {:proved false :reason "the proof does not use the code"}
+        (and (empty? target-used) (not lemma)) {:proved false :reason "the proof does not use the code"}
         (not (:ok checked)) {:proved false
                              :reason (str "the proof checker rejected the proof: " (:reason checked))}
         :else (let [cited (sort (remove synthetic-lemmas @lemmas-used))]
@@ -501,13 +516,16 @@
 
 (defn definitions
   "Translate the defns of the target and the spec: [defs own].  pairs is
-  [[ns-sym forms] ...]; each ns reads its own plain names first."
+  [[ns-sym forms] ...] or [[ns-sym forms refers] ...]; each ns reads its
+  own plain names first, then the plain names in refers, name ->
+  qualified name."
   [pairs]
-  (let [qualified (into {} (for [[k v] (tr/own-names pairs) :when (namespace k)] [k v]))
+  (let [qualified (into {} (for [[k v] (tr/own-names (map #(take 2 %) pairs)) :when (namespace k)] [k v]))
         defs (into {}
-                   (for [[ns-sym forms] pairs]
-                     (let [own (merge qualified (into {} (for [[k v] (tr/own-names [[ns-sym forms]])
-                                                               :when (nil? (namespace k))]
-                                                           [k v])))]
+                   (for [[ns-sym forms refers] pairs]
+                     (let [own (merge qualified refers
+                                      (into {} (for [[k v] (tr/own-names [[ns-sym forms]])
+                                                     :when (nil? (namespace k))]
+                                                 [k v])))]
                        (tr/defs-of (tr/context own) ns-sym forms))))]
     [defs qualified]))

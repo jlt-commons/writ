@@ -42,6 +42,32 @@
     (is (str/includes? (err '(writ.spec/hint sorted {:color :red}))
                        "unknown keys"))))
 
+(deftest the-tree-holds-a-sorted-set-is-proved-from-its-proof-namespace
+  (let [r (spec/check 'writ.spec-demo.tree-spec {:seed 42 :cache false})
+        l (law-result r 'holds-a-sorted-set)]
+    (is (:ok r) (:message r))
+    (is (= :proved (:status l)) (pr-str l))
+    (is (= ['build-lists] (:lemmas l)))
+    (testing "every lemma is proved, those about clojure.core alone too"
+      (is (every? #(= :proved (:status %)) (:lemmas r)) (pr-str (:lemmas r)))
+      (is (= :proved (:status (first (filter #(= 'none-below (:lemma %)) (:lemmas r)))))))
+    (testing "the fold is proved with its accumulator varying in the hypothesis"
+      (is (re-find #"by induction on xs"
+                   (:proof (first (filter #(= 'build-lists (:lemma %)) (:lemmas r)))))))))
+
+(deftest a-broken-tree-is-not-proved-a-sorted-set
+  (doseq [target '[writ.spec-demo.tree-mirror writ.spec-demo.tree-bad-build]]
+    (let [r (spec/check 'writ.spec-demo.tree-spec {:seed 42 :cache false :target target})]
+      (is (not= :proved (:status (law-result r 'holds-a-sorted-set))) (str target))
+      (is (not-any? :prover-bug (concat (:laws r) (:lemmas r))) (str target)))))
+
+(deftest a-vary-hint-is-checked-when-it-loads
+  (let [err (fn [form] (try (macroexpand-1 form) nil (catch Throwable e (ex-message e))))]
+    (is (str/includes? (err '(writ.spec/hint fold {:vary acc})) ":vary is a vector"))
+    (is (str/includes? (err '(writ.spec/hint fold {:induct xs :vary [xs]}))
+                       "cannot vary in its own hypothesis"))
+    (is (nil? (err '(writ.spec/hint fold {:induct xs :vary [acc]}))))))
+
 (deftest a-proof-found-once-is-reused
   (let [dir (str ".target/writ-cache-test-" (System/currentTimeMillis))
         first-run (spec/check 'writ.spec-demo.court-spec {:seed 42 :cache-dir dir})

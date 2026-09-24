@@ -320,7 +320,7 @@
   (let [r (spec/check tree-spec {:seed 42})]
     (is (:ok r) (:message r))
     (is (= [] (:gaps r)))
-    (is (= :tested (:status (law-result r 'holds-a-sorted-set))))))
+    (is (= :proved (:status (law-result r 'holds-a-sorted-set))))))
 
 ;; --- adequacy for keyword results and pinned arguments ---------------------
 

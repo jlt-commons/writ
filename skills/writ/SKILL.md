@@ -156,9 +156,14 @@ When a law holds but isn't proved, add what the prover needs in
 - A lemma must hold and be proved, or the check fails; it then helps
   prove the spec's laws. It never counts as one of them, and never
   judges a stand-in, so it can't strengthen a weak spec.
-- A hint: `:induct` a variable first, `:use` only these lemmas and laws,
-  `:strategy` `:symbolic` / `:induction` / `:rewriting`, `:fuel` more
-  rewrites. It only steers the search.
+- A lemma may be about clojure.core alone, and its hypothesis may name a
+  variable its conclusion doesn't: the prover takes it from the goal's
+  facts. `defn` helpers (an invariant such as `bst?`) may live in the
+  proof namespace too.
+- A hint: `:induct` a variable first, `:vary [acc]` to let the induction
+  hypothesis hold at any acc (a fold's accumulator), `:use` only these
+  lemmas and laws, `:strategy` `:symbolic` / `:induction` / `:rewriting`,
+  `:fuel` more rewrites. It only steers the search.
 - The usual reasons a law isn't proved: recursion that needs a lemma about
   a helper (write the lemma), a law about a recursive fn stated over its
   whole output where a pointwise statement would do, or a form outside

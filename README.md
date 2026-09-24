@@ -653,12 +653,38 @@ A lemma is a law about the code: it is tested, and it must be proved, or
 the check fails. Once proved, the spec's laws may cite it. It is reported
 apart, it counts toward no law of the spec, and the adequacy check never
 judges a stand-in by it, so a lemma can't make a weak spec look strong.
+A lemma may be about clojure.core alone, such as what a bound on a list
+says about a `filter` of it.
+
+A proof namespace may define helpers for its lemmas with `defn`, such as
+an invariant the code keeps. The prover reads them as it reads the
+target's, and a helper that refers to the target's fns reads those of
+the target under check.
+
+A lemma's hypothesis may name a variable its conclusion doesn't. The
+prover finds that variable's value in the facts of the goal at hand, the
+way ACL2 does:
+
+```clojure
+(lemma none-below
+  (forall [x Nat, v Nat, xs (List Nat)]
+    (=> (and (every? #(> % v) xs) (<= x v)) (= (filter #(< % x) xs) ()))))
+```
+
+rewrites `(filter #(< % x) r)` to `()` wherever the facts say every
+element of `r` is above some `v` with `x <= v`.
 
 A hint steers the search and nothing more: `:induct` the variable to try
-induction on first, `:use` the only lemmas and laws a proof may cite,
-`:strategy` one of `:symbolic`, `:induction` or `:rewriting`, and `:fuel`
-the rewrites one attempt may make. A proof a hint leads to is checked
-like any other.
+induction on first, `:vary` the other variables the induction hypothesis
+holds at every value of (an accumulator a fold passes on), `:use` the
+only lemmas and laws a proof may cite, `:strategy` one of `:symbolic`,
+`:induction` or `:rewriting`, and `:fuel` the rewrites one attempt may
+make. A proof a hint leads to is checked like any other.
+
+`writ.spec-demo.tree-proof` in the tests proves the tree's
+`holds-a-sorted-set` this way: a `bst?` invariant, lemmas that `insert`
+keeps it and that listing the tree after an insert is inserting into the
+list, and a fold lemma with the tree varying.
 
 ### Proofs
 
@@ -688,6 +714,11 @@ When a case still isn't closed, the prover tries two things:
   replaces the recursive call that brings in with a fresh variable, and
   proves that more general goal by an induction of its own.
   `permutation` is proved this way, with `(isort xs-t)` generalised.
+- **Sorting.** On a list of integers, `(sort xs)` and
+  `(sort (distinct xs))` are a fold that inserts each element into the
+  sorted list so far: the elements below it, it, the elements above it
+  (at or above, when duplicates stay). `writ.prove.rewrite/model-check`
+  runs the model against `sort` itself.
 - **An accumulator.** A fold that grows an accumulator by addition from
   0, as a `loop` or a `reduce`, is first proved to give acc plus the fold
   from 0, from any integer acc, by induction with acc left free in the
