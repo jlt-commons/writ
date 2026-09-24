@@ -15,21 +15,94 @@
   a term throws.  A proof that never unfolds one of the target's own
   definitions says nothing about the code, and is not reported."
   (:require [clojure.string :as str]
+            [clojure.test.check.generators :as gen]
             [writ.prove.term :as t :refer [head]]
             [writ.prove.rewrite :as rw]
             [writ.prove.translate :as tr]
             [writ.prove.check :as check]
+            [writ.prove.smt :as smt]
+            [writ.prove.symbolic :as sym]
             [writ.prove.scheme :as sc :refer [split-foralls goal plain cases truthy? falsy?
                                                solve-eq assume-hyp subst-all instance ih-for
                                                useful-ih replace-term lemma-rules]]))
 
 ;; --- proving a goal ---------------------------------------------------------------------
+
+(declare prove-goal)
 ;; Every step records what the checker needs to replay it: writ.prove.check
 ;; follows the trace with writ.prove.scheme and the rewriter, and searches
 ;; for nothing.
 
-(defn- split-candidate [n]
-  (first (filter #(contains? #{:le :ieq} (head %)) (rw/open-conditions n))))
+(defn- split-candidate
+  "An open integer comparison to split on: in the goal, or in a fact that
+  is still an if, such as a disjunction taken as a hypothesis."
+  ([n] (split-candidate n nil))
+  ([n ctx]
+   (first (filter #(contains? #{:le :ieq} (head %))
+                  (concat (rw/open-conditions n)
+                          (for [[f v] (sort-by (comp pr-str key) (:facts ctx))
+                                :when (and (true? v) (= :if (head f)))
+                                c (rw/open-conditions f)
+                                :when (not (contains? (:facts ctx) c))]
+                            c))))))
+
+(def ^:private enum-limit
+  "The most values a bounded integer is split into, one case each."
+  16)
+
+(defn- enum-candidate
+  "An integer variable that an unmodelled call takes, such as
+  (bit-shift-left 1 k), whose facts bound it to a few values, as [k lo
+  hi].  A case per value puts a literal in the call, which the rewriter
+  computes."
+  [ctx n]
+  (first
+    (for [x (sort-by pr-str (distinct (t/subterms n)))
+          :when (and (= :call (head x))
+                     (not (contains? '#{= not not= < <= > >= + - * inc dec zero? pos? neg?} (second x))))
+          v (drop 2 x)
+          :when (and (symbol? v) (rw/int-term? ctx v))
+          :let [bound (fn [sign]
+                        (first (for [[f tv] (:facts ctx)
+                                     :when (and (true? tv) (= :le (head f)))
+                                     :let [d (second f)]
+                                     :when (and (= :lin (head d)) (= [[v sign]] (nth d 2)))]
+                                 (* (- sign) (second d)))))
+                lo (or (bound 1) (when (= 'Nat (get-in ctx [:types v])) 0))
+                hi (bound -1)]
+          :when (and lo hi (<= 1 (- hi lo) enum-limit))]
+      [v lo hi])))
+
+(defn- by-enumeration
+  "Prove g by one case per value of v from lo to hi, which the facts
+  bound it to: each case puts the value in for v."
+  [opts g hyps depth [v lo hi]]
+  (let [ps (mapv (fn [k]
+                   (let [[o g* hs] (subst-all opts g hyps {v [:lit k]})]
+                     (prove-goal o g* hs (dec depth))))
+                 (range lo (inc hi)))]
+    (when (every? some? ps)
+      {:by :enumeration :on v :from lo :to hi :cases ps})))
+
+(defn- data-var
+  "A variable of a data type the goal or a fact takes apart, as (first v)
+  or (= v ...): splitting it into its constructors reveals the tag."
+  [opts n ctx]
+  (first (for [x (sort-by pr-str (distinct (mapcat t/subterms (cons n (keys (:facts ctx))))))
+               :when (and (= :call (head x)) (contains? '#{first =} (second x)))
+               v (drop 2 x)
+               :when (and (symbol? v) (sc/data-cases opts v))]
+           v)))
+
+(defn- by-data-cases
+  "Prove g by splitting data variable v into one case per constructor."
+  [opts g hyps depth v]
+  (let [ps (mapv (fn [[value types]]
+                   (let [[o g* hs] (subst-all (update opts :types merge types) g hyps {v value})]
+                     (prove-goal o g* hs (dec depth))))
+                 (sc/data-cases opts v))]
+    (when (every? some? ps)
+      {:by :data-cases :on v :cases ps})))
 
 (def ^:dynamic *stuck*
   "When bound to an atom, collects the goals a search could not close, as
@@ -41,8 +114,6 @@
   a case split could reveal."
   [opts n]
   (first (filter #(map? (get-in opts [:types %])) (sort-by str (t/vars n)))))
-
-(declare prove-goal)
 
 (defn- by-list-cases
   "Prove g by splitting element-list variable v into empty and a head and
@@ -58,28 +129,45 @@
       {:by :list-cases :on v :empty empty :cons more})))
 
 (defn- prove-goal
-  "Prove boolean term g under hyps, splitting on open integer comparisons,
-  and on the shape of an unknown list of elements.  Returns a trace or nil."
+  "Prove boolean term g under hyps.  In order: a data value's tag is split
+  into its constructors; integer arithmetic through and through goes to
+  the solver whole; an open integer comparison is split into its two
+  outcomes; a bounded integer an unmodelled call takes is split into its
+  values; an unknown list of elements into its two shapes; and whatever
+  is left open goes to the solver.  Returns a trace or nil."
   [opts g hyps depth]
-  (let [[ctx vacuous n] (sc/case-context opts g hyps)]
+  (let [[ctx vacuous n] (sc/case-context opts g hyps)
+        split (delay (split-candidate n ctx))
+        solve (delay (smt/prove ctx n))
+        solved (fn [] (when-let [c @solve] {:by :solver :certificate c}))]
     (swap! (:unfolded opts) into @(:unfolded ctx))
-    (when (and *stuck* (not vacuous) (not (truthy? n)) (or (zero? depth) (nil? (split-candidate n))))
+    (when (and *stuck* (not vacuous) (not (truthy? n)) (or (zero? depth) (nil? @split)))
       (swap! *stuck* conj {:goal n :facts (:facts ctx)}))
     (cond
       vacuous {:by :hypothesis-false}
       (truthy? n) {:by :rewriting}
-      (zero? depth) nil
-      (nil? (split-candidate n))
-      (when-let [v (elems-var opts n)]
-        (by-list-cases opts g hyps depth v))
+      (zero? depth) (solved)
       :else
-      (when-let [c (split-candidate n)]
-        (let [yes (if-let [[x v] (and (= :ieq (head c)) (solve-eq (second c)))]
-                    (let [[o g* hs] (subst-all opts g hyps {x v})]
-                      (prove-goal o g* hs (dec depth)))
-                    (prove-goal opts g (conj hyps c) (dec depth)))
-              no (prove-goal opts g (conj hyps [:call 'not c]) (dec depth))]
-          (when (and yes no) {:by :split :on c :then yes :else no}))))))
+      (if-let [v (data-var opts n ctx)]
+        (by-data-cases opts g hyps depth v)
+        (or ;; each data case, once its tags are known: the code run
+            ;; symbolically, one small formula for the solver
+            (when-not (:symbolic-tried opts)
+              (when-let [[c used] (sym/prove opts hyps g)]
+                (swap! (:unfolded opts) into used)
+                {:by :symbolic :certificate c}))
+            (when (smt/pure? ctx n) (solved))
+            (if-let [c @split]
+              (let [opts (assoc opts :symbolic-tried true)
+                    yes (if-let [[x v] (and (= :ieq (head c)) (solve-eq (second c)))]
+                          (let [[o g* hs] (subst-all opts g hyps {x v})]
+                            (prove-goal o g* hs (dec depth)))
+                          (prove-goal opts g (conj hyps c) (dec depth)))
+                    no (when yes (prove-goal opts g (conj hyps [:call 'not c]) (dec depth)))]
+                (when (and yes no) {:by :split :on c :then yes :else no}))
+              (or (when-let [e (enum-candidate ctx n)] (by-enumeration opts g hyps depth e))
+                  (when-let [v (elems-var opts n)] (by-list-cases opts g hyps depth v))
+                  (solved))))))))
 
 (defn- prove-all
   "Prove every goal (under the hyps) in one context of opts."
@@ -88,6 +176,33 @@
     (when (every? some? ps) ps)))
 
 (declare by-induction)
+
+(defn- sample-gen
+  "A generator for values of a prover type, or nil."
+  [ty]
+  (cond
+    (= 'Nat ty) gen/nat
+    (= 'Int ty) gen/small-integer
+    (= 'Bool ty) gen/boolean
+    (and (map? ty) (:elems ty)) (some-> (sample-gen (:elems ty)) gen/list)
+    (and (seq? ty) (contains? '#{List Vec} (first ty))) (some-> (sample-gen (second ty)) gen/list)
+    :else nil))
+
+(defn- plausible?
+  "Does goal gi survive a few random values of its variables?  A
+  generalisation can make a goal false; testing it first, as ACL2s does,
+  saves searching for a proof that is not there.  Only a value that makes
+  the hypotheses true and a goal false counts; a throw is no evidence."
+  [opts gi]
+  (let [vs (vec (sort-by str (reduce into #{} (map t/vars (concat (:hyps gi) (:goals gi))))))
+        gens (mapv #(sample-gen (get-in opts [:types %])) vs)]
+    (or (some nil? gens)
+        (not-any? (fn [i]
+                    (let [env (zipmap vs (map #(gen/generate % (mod i 20) i) gens))]
+                      (try (and (every? #(t/evaluate % env) (:hyps gi))
+                                (not-every? #(t/evaluate % env) (:goals gi)))
+                           (catch Throwable _ false))))
+                  (range 30)))))
 
 (defn- by-generalizing
   "Prove an induction case by using an equality hypothesis the other way
@@ -113,7 +228,8 @@
                   ty (get-in opts [:rets (second call)])
                   g* (sc/generalization opts gi ih call ys)
                   opts* (-> opts (assoc :generalized? true :ih []) (update :types assoc ys ty))
-                  p (when g* (or (prove-all opts* g*) (by-induction opts* g* ys ty)))]
+                  p (when (and g* (plausible? opts* g*))
+                      (or (prove-all opts* g*) (by-induction opts* g* ys ty)))]
             :when p]
         {:by :generalizing :ih i :call call :as ys :ty ty :on (t/show call) :proof p}))))
 
@@ -214,8 +330,13 @@
                 (keep #(when (and (map? %) (= :induction (:by %))) (:on %)))
                 first)
         cs (map (comp pr-str t/show) (conditions trace))]
-    (str (if on (str "by induction on " on) "by rewriting")
+    (str (cond on (str "by induction on " on)
+               (some #(and (map? %) (= :symbolic (:by %))) (tree-seq coll? seq trace)) "by symbolic evaluation"
+               :else "by rewriting")
          (when (seq cs) (str ", splitting on " (str/join " and " cs)))
+         (when (some #(and (map? %) (= :solver (:by %))) (tree-seq coll? seq trace))
+           ", with the solver")
+         (when (some #(and (map? %) (= :symbolic (:by %))) (tree-seq coll? seq trace)) ", with the solver")
          (when-let [vs (seq (case-vars trace))]
            (str ", with cases on " (str/join " and " vs)))
          (when-let [gs (seq (distinct (keep (fn [x] (when (and (map? x) (= :generalizing (:by x)))
@@ -226,6 +347,16 @@
                                                        (:on x)))
                                            (tree-seq coll? seq trace))))]
            (str ", generalising the accumulator of " (str/join " and " (map pr-str as)))))))
+
+(defn- recompose
+  "A counterexample over the expanded binders, as values of the law's own:
+  a Tuple binder's value is the vector of its components'."
+  [bs0 cex]
+  (letfn [(value [x ty]
+            (if (and (seq? ty) (= 'Tuple (first ty)))
+              (vec (map-indexed (fn [i cty] (value (symbol (str x "-" i)) (plain cty))) (rest ty)))
+              (get cex x)))]
+    (into {} (for [[x ty] bs0] [x (value x (plain ty))]))))
 
 (defn- expand-tuples
   "Each binder of a Tuple type as a vector of fresh variables, one per
@@ -242,12 +373,49 @@
         (recur (rest todo) (conj out [x ty]) g))
       [out g])))
 
+(defn- symbolic-cases
+  "Prove goal g under hyps by splitting each data variable into its
+  constructors, and running every case symbolically: small formulas, one
+  per combination of tags, where one formula for all of them would make
+  the solver search the tags too.  The same trace a case split on data
+  and a symbolic leaf make, so the checker replays it as those."
+  [opts hyps g]
+  (if-let [v (first (filter #(sc/data-cases opts %)
+                            (sort-by str (reduce into (t/vars g) (map t/vars hyps)))))]
+    (let [ps (mapv (fn [[value types]]
+                     (let [[o g* hs] (subst-all (update opts :types merge types) g hyps {v value})]
+                       (symbolic-cases o hs g*)))
+                   (sc/data-cases opts v))]
+      (when (every? some? ps)
+        {:by :data-cases :on v :cases ps}))
+    (when-let [[c used] (sym/prove opts hyps g)]
+      (swap! (:unfolded opts) into used)
+      {:by :symbolic :certificate c})))
+
+(defn- by-symbolic-cases
+  "Every goal by symbolic-cases, when the code runs symbolically at all."
+  [opts {:keys [hyps goals]}]
+  (when (every? #(sym/formula opts hyps %) goals)
+    (let [ps (mapv #(symbolic-cases opts hyps %) goals)]
+      (when (every? some? ps)
+        {:by :cases :proofs ps}))))
+
+(defn- by-symbolic
+  "Prove every goal by running it on symbolic values and handing the one
+  formula to the solver: no case splits, so a step fn with many
+  conditions is one query."
+  [opts {:keys [hyps goals]}]
+  (let [rs (mapv #(sym/prove opts hyps %) goals)]
+    (when (every? some? rs)
+      (swap! (:unfolded opts) into (mapcat second rs))
+      {:by :symbolic :certificates (mapv first rs)})))
+
 (defn prove-law
   "Try to prove a law.  prop is the desugared law, its names qualified;
   defs are the translated definitions; target the implementation's ns;
   lemmas are the laws proved before it, as {:name :prop}.
   Returns {:proved true :trace :summary :lemmas} or {:proved false :reason}."
-  [{:keys [prop defs tenv target own fuel lemmas rets]}]
+  [{:keys [prop defs tenv target own fuel lemmas rets total hint]}]
   (try
     (let [[bs0 body] (split-foralls prop)
           tctx (tr/context own)
@@ -256,18 +424,39 @@
           unfolded (atom #{})
           lemmas-used (atom #{})
           opts {:defs defs :tenv tenv :types (into {} (map (fn [[x ty]] [x (plain ty)])) bs)
+                :total total
                 :unfolded unfolded :fuel (or fuel 20000) :lemmas-used lemmas-used
                 :rets (or rets {})
-                :lemmas (vec (mapcat #(lemma-rules % defs tenv own) lemmas))}
+                :lemmas (vec (mapcat #(lemma-rules % defs tenv own)
+                                     (if-let [use (:use hint)]
+                                       (filter #(contains? (set use) (:name %)) lemmas)
+                                       lemmas)))}
           ;; an attempt that runs out of fuel fails on its own; the others
           ;; still get their turn
+          ran-out (atom false)
           attempt (fn [f] (reset! unfolded #{}) (reset! lemmas-used #{})
                     (let [r (try (f)
                                  (catch clojure.lang.ExceptionInfo e
-                                   (if (:writ.prove.rewrite/fuel (ex-data e)) nil (throw e))))]
+                                   (if (:writ.prove.rewrite/fuel (ex-data e))
+                                     (do (reset! ran-out true) nil)
+                                     (throw e))))]
                       [r @unfolded]))
-          tries (concat [#(some->> (prove-all opts g) (hash-map :by :cases :proofs))]
-                        (for [[v ty] bs] #(by-induction opts g v ty)))
+          symbolic [#(by-symbolic-cases opts g) #(by-symbolic opts g)]
+          rewriting [#(some->> (prove-all opts g) (hash-map :by :cases :proofs))]
+          ;; a hint's variable first
+          bs-order (if-let [v (:induct hint)]
+                     (concat (filter #(= v (first %)) bs) (remove #(= v (first %)) bs))
+                     bs)
+          induction (for [[v ty] bs-order] #(by-induction opts g v ty))
+          tries (cond
+                  ;; that nothing throws is known only from running the code
+                  ;; symbolically, where every throw is noted
+                  total symbolic
+                  (= :symbolic (:strategy hint)) symbolic
+                  (= :rewriting (:strategy hint)) rewriting
+                  (= :induction (:strategy hint)) induction
+                  (:induct hint) (concat induction symbolic rewriting)
+                  :else (concat [(first symbolic)] rewriting [(second symbolic)] induction))
           [trace used] (or (first (filter first (map attempt tries))) [nil #{}])
           ;; a fold into an accumulator: prove it adds, then try again with that
           [trace used] (if trace
@@ -292,13 +481,16 @@
           checked (when (and trace (seq target-used))
                     (check/check-proof (dissoc opts :lemmas-used :unfolded) g trace))]
       (cond
-        (nil? trace) {:proved false :reason "no proof found"}
+        (nil? trace) (cond-> {:proved false :reason (if @ran-out "the search ran out of fuel" "no proof found")}
+                       (seq bs) (merge (when-let [cex (first (keep #(sym/counterexample opts (:hyps g) %) (:goals g)))]
+                                         {:counterexample (recompose bs0 cex)})))
         (empty? target-used) {:proved false :reason "the proof does not use the code"}
         (not (:ok checked)) {:proved false
                              :reason (str "the proof checker rejected the proof: " (:reason checked))}
         :else (let [cited (sort (remove synthetic-lemmas @lemmas-used))]
                 {:proved true :trace trace
                  :summary (str (summary trace)
+                               (when total ", and it never throws")
                                (when (seq cited) (str ", citing " (str/join ", " cited))))
                  :lemmas (vec cited)})))
     (catch clojure.lang.ExceptionInfo e

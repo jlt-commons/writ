@@ -3,7 +3,7 @@
   constants, max and min, abs, not=, every? and some, a comparison of
   three, and contains? on a set of keywords."
   (:require [writ.spec-demo.court :refer [H PH]]
-            [writ.spec :refer [spec data ann law refine]]))
+            [writ.spec :refer [spec data ann law refine graph]]))
 
 (spec writ.spec-demo.court {:require :proved})
 
@@ -12,6 +12,12 @@
 (ann move     [Int Key -> Int])
 (ann safe?    [Keyword -> Bool])
 (ann distance [Int Int -> Nat])
+
+(graph court
+  {:states {:paddle Int, :gap Nat, :method Keyword, :verdict Bool}
+   :edges  {:paddle {[move Key] #{:paddle}
+                     [distance Int] #{:gap}}
+            :method {[safe?] #{:verdict}}}})
 
 (def top (- H PH))
 

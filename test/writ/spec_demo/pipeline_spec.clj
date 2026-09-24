@@ -2,7 +2,7 @@
   "The contract for writ.spec-demo.pipeline. The laws say what a request
   gets back; the `calls` forms say how the layers fit together."
   (:require [clojure.string :as str]
-            [writ.spec :refer [spec ann law calls]]))
+            [writ.spec :refer [spec ann law calls graph]]))
 
 (spec writ.spec-demo.pipeline)
 
@@ -10,6 +10,11 @@
 (ann valid?    [String -> Bool])
 (ann respond   [String -> (Tuple Keyword String)])
 (ann handle    [String -> (Tuple Keyword String)])
+
+(graph request
+  {:states {:raw String, :clean String, :valid Bool, :response (Tuple Keyword String)}
+   :edges  {:raw   {[normalize] #{:clean}, [handle] #{:response}}
+            :clean {[valid?] #{:valid}, [respond] #{:response}}}})
 
 (calls normalize [str/lower-case str/trim])
 (calls valid?    [])

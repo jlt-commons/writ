@@ -24,3 +24,6 @@
 
 (law a-light-counts-up-while-it-shows
   (forall [l Green] (=> (< (second l) GREEN) (= (tick l) [:Green (inc (second l))]))))
+
+;; a rare value: one tag and an exact count together, generated reliably
+(refine Stopped [l (Tuple Keyword Nat)] (and (= :Red (first l)) (= RED (second l))))

@@ -1,11 +1,15 @@
 (ns writ.spec-demo.total-spec
-  (:require [writ.spec :refer [spec ann law]]))
+  (:require [writ.spec :refer [spec ann law graph]]))
 
 (spec writ.spec-demo.total)
 
 (ann total           [(List Nat) -> Nat])
 (ann size            [(List Nat) -> Nat])
 (ann total-by-reduce [(List Nat) -> Nat])
+
+(graph summing
+  {:states {:items (List Nat), :sum Nat, :count Nat}
+   :edges  {:items {[total] #{:sum}, [total-by-reduce] #{:sum}, [size] #{:count}}}})
 
 (law total-of-two (forall [a Nat, b Nat] (= (+ a b) (total (list a b)))))
 (law total-sums (forall [xs (List Nat)] (= (total xs) (apply + xs))))

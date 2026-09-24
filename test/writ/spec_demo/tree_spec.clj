@@ -4,7 +4,7 @@
   The problem: a set of nats that keeps its elements in order. The central
   law says exactly that -- a tree built by inserting xs lists the distinct
   elements of xs in ascending order -- against clojure.core as the model."
-  (:require [writ.spec :refer [spec data ann law]]))
+  (:require [writ.spec :refer [spec data ann law graph]]))
 
 (spec writ.spec-demo.tree)
 
@@ -13,6 +13,11 @@
 (ann size    [Tree -> Nat])
 (ann to-list [Tree -> (List Nat)])
 (ann insert  [Nat Tree -> Tree])
+
+(graph tree
+  {:states {:item Nat, :tree Tree, :listed (List Nat), :size Nat}
+   :edges  {:item {[insert Tree] #{:tree}}
+            :tree {[to-list] #{:listed}, [size] #{:size}}}})
 
 (defn strictly-ascending? [xs]
   (or (empty? xs) (apply < xs)))

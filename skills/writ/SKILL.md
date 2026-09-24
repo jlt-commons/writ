@@ -1,13 +1,15 @@
 ---
 name: writ
 description: >-
-  Use when writing a writ spec -- the problem statement as checkable laws
-  about what code means and how it calls (writ.spec:
-  spec/ann/data/law/calls/machine) -- or the plain Clojure implementation it
+  Use when writing a writ spec -- the problem statement as a state graph
+  and checkable laws about what code means and how it calls (writ.spec:
+  spec/graph/refine/ann/data/law/calls/machine) -- or its proof namespace
+  (proof-of/lemma/hint), or the plain Clojure implementation it
   constrains, or when reading a writ.spec report or any
   "Writ:" error (purity, termination, ordering, arity, types, tagged data,
-  failing, vacuous or gapped laws, call graph mismatches). Also for the
-  annotated writ.defn surface (w/defn, ^:many, w/match, w/law, w/proof).
+  failing, unproved, vacuous or gapped laws, graph rules, call graph
+  mismatches). Also for the annotated writ.defn surface (w/defn, ^:many,
+  w/match, w/law, w/proof).
 ---
 
 # writ
@@ -32,13 +34,61 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
 - A report that fails is the next thing to fix. Read the whole message: it
   names the rule or law, the input, and the values.
 
+## Writing a spec, in order
+
+1. `(spec my.ns {:require :proved})` -- the namespace it constrains; ask
+   for proof.
+2. The state graph: the problem's states as types, refinements most
+   often, and the fns that step between them. Every spec has one; write
+   it before the laws. See [The state graph](#the-state-graph).
+3. `ann` for each public fn.
+4. Laws for what each step means.
+5. Then the implementation. If a law holds but isn't proved, write a
+   lemma or hint in the proof namespace (see
+   [The proof namespace](#the-proof-namespace)); never weaken the law.
+
+## The state graph
+
+```clojure
+(refine Green  [l (Tuple Keyword Nat)] (and (= :Green (first l)) (<= (second l) GREEN)))
+(refine Yellow [l (Tuple Keyword Nat)] (and (= :Yellow (first l)) (<= (second l) YELLOW)))
+(refine Red    [l (Tuple Keyword Nat)] (and (= :Red (first l)) (<= (second l) RED)))
+
+(graph signal
+  {:start  [:green [:Green 0]]                 ; a state, or [state value]
+   :states {:green Green, :yellow Yellow, :red Red}
+   :edges  {:green  {[tick] #{:green :yellow}} ; [fn ArgType ...] -> targets
+            :yellow {[tick] #{:yellow :red}}
+            :red    {[tick] #{:red :green}}}
+   :before [[:yellow :red]]})                  ; also :never [[a b]], :final [s]
+```
+
+- `(refine Name [x Base] pred)` is a type: values of Base where pred
+  holds. Use it in `ann`, `forall`, states, other refinements. It defines
+  `Name?`. Refine the parts (a Paddle, a Ball) rather than folding random
+  Ints into range inside laws.
+- Each edge's fn must fit by its `ann`: first param = the state's base
+  type, then the arg types; the return type = the targets' base type.
+- An edge into refinements is a law named `graph:state:fn`: every value
+  of the state goes, by the fn, into one of the targets, and the fn never
+  throws. It is tested and proved like any law.
+- An edge into plain types, like `{:unsorted {[isort] #{:sorted}}}` over
+  `(List Nat)`, is data flow only, checked against the signatures. A spec
+  of plain functions still has a graph: the data the problem moves
+  through.
+- `:start`, `:final`, `:never`, `:before` are rules of the graph itself;
+  with every edge proved they hold for every run of the code.
+
 ## A spec
 
 ```clojure
 (ns my.sort-spec
-  (:require [writ.spec :refer [spec data ann law]]))
+  (:require [writ.spec :refer [spec data ann law graph]]))
 
-(spec my.sort)                                   ; the namespace it constrains
+(spec my.sort {:require :proved})                ; the namespace it constrains
+
+(graph sorting {:states {:unsorted (List Nat), :sorted (List Nat)}
+                :edges  {:unsorted {[isort] #{:sorted}}}})
 
 (ann insert [Nat (List Nat) -> (List Nat)])      ; one per public fn
 (ann isort  [(List Nat) -> (List Nat)])
@@ -84,6 +134,35 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
   namespace, through the spec's aliases. Called or passed as a value both
   count. clojure.core, host members, self-recursion and locals that
   shadow a fn do not. See [The call graph](#the-call-graph).
+
+## The proof namespace
+
+When a law holds but isn't proved, add what the prover needs in
+`my/sort_proof.clj` (found by name for `my.sort-spec`), not in the spec:
+
+```clojure
+(ns my.sort-proof
+  (:require [writ.spec :refer [proof-of lemma hint]]))
+
+(proof-of my.sort-spec)
+
+(lemma insert-keeps-sorted          ; a law about the code; must be proved
+  (forall [x Nat, xs (List Nat)]
+    (=> (my.sort-spec/ascending? xs) (my.sort-spec/ascending? (insert x xs)))))
+
+(hint sorted {:induct xs :use [insert-keeps-sorted]})
+```
+
+- A lemma must hold and be proved, or the check fails; it then helps
+  prove the spec's laws. It never counts as one of them, and never
+  judges a stand-in, so it can't strengthen a weak spec.
+- A hint: `:induct` a variable first, `:use` only these lemmas and laws,
+  `:strategy` `:symbolic` / `:induction` / `:rewriting`, `:fuel` more
+  rewrites. It only steers the search.
+- The usual reasons a law isn't proved: recursion that needs a lemma about
+  a helper (write the lemma), a law about a recursive fn stated over its
+  whole output where a pointwise statement would do, or a form outside
+  the prover (the report names it; restate the law if you can).
 
 ## Machines
 
@@ -256,6 +335,16 @@ law runs until it is fixed. After that, each law has a `:status`:
   A law written with modelled forms and the spec's own helpers is more
   likely to be proved.
 - `:witnessed`: an `exists` law, and a value was found.
+- A failure "found by the solver, when no test did" is a real
+  counterexample: the solver found values that break the law, and running
+  the code on them confirmed it. Fix the code at those values.
+- `graph `g`: ... ` lines: edges proved, and edges checked as data flow;
+  `graph `g` breaks its own rules` is the graph's own `:never`, `:before`,
+  `:final` or reachability failing; fix the graph or the code, whichever
+  is wrong, and say which.
+- ``declares no state graph``: add the graph first.
+- `:lemmas` in the report: the proof namespace's lemmas; each must be
+  `:proved`.
 - `:unproved`: the spec (`(spec ns {:require :proved})`) or the law
   (`{:require :proved}`) requires proof, and the law is only tested. Get
   it proved: restate it with forms the prover models, or add the lemma it

@@ -2,11 +2,15 @@
   "The contract for writ.spec-demo.classify. The sentinels are pinned by
   closed laws because a generated Int never reaches -127, and one
   quantified law says what every other count means."
-  (:require [writ.spec :refer [spec ann law]]))
+  (:require [writ.spec :refer [spec ann law graph]]))
 
 (spec writ.spec-demo.classify)
 
 (ann classify-read [Int Bool -> Keyword])
+
+(graph reading
+  {:states {:count Int, :status Keyword}
+   :edges  {:count {[classify-read Bool] #{:status}}}})
 
 (law zero-is-decided-by-the-eof-flag
   (forall [e Bool] (= (classify-read 0 e) (if e :eof :idle))))

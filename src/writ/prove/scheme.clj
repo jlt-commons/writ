@@ -105,13 +105,14 @@
 
 (defn assume-hyp
   "[ctx vacuous?] with hypothesis h, already normalised, taken as true.
-  (if c a false) holds when c and a do, and (if c false b) when c does not
-  and b does, so each part becomes a fact of its own."
+  (if c a false) holds when c and a do, as does (if c a c), the shape
+  `and` lowers to; (if c false b) holds when c does not and b does.  So
+  each part becomes a fact of its own."
   [ctx h]
   (cond
     (truthy? h) [ctx false]
     (falsy? h) [ctx true]
-    (and (= :if (head h)) (falsy? (nth h 3)))
+    (and (= :if (head h)) (or (falsy? (nth h 3)) (= (nth h 1) (nth h 3))))
     (let [[c1 v1] (assume-hyp ctx (nth h 1))]
       (if v1 [c1 true] (assume-hyp c1 (rw/normalize c1 (nth h 2)))))
     (and (= :if (head h)) (falsy? (nth h 2)))
@@ -211,12 +212,29 @@
   under them, and the goal g normalised there.  vacuous? when a hypothesis
   is false, and then there is nothing to prove."
   [opts g hyps]
-  (let [[ctx vacuous] (reduce (fn [[c vac] h]
-                                (if vac [c vac] (assume-hyp c (rw/normalize c h))))
-                              [(rw/context (dissoc opts :ih)) false] hyps)
+  (let [take-all (fn [ctx0 hs]
+                   (reduce (fn [[c vac] h]
+                             (if vac [c vac] (assume-hyp c (rw/normalize c h))))
+                           [ctx0 false] hs))
+        [ctx vacuous] (take-all (rw/context (dissoc opts :ih)) hyps)
+        ;; a hypothesis read before a later one decided its test (an or
+        ;; whose first case a split ruled out) is read again under all of
+        ;; them
+        [ctx vacuous] (if vacuous [ctx vacuous] (take-all ctx hyps))
         ctx (assoc ctx :ih (mapv (fn [i] (update i :lhs #(rw/normalize ctx %))) (:ih opts)))
         ctx (assoc ctx :memo (atom {}) :stuck (atom #{}) :int-memo (atom {}))]
     [ctx vacuous (when-not vacuous (rw/normalize ctx g))]))
+
+(defn data-cases
+  "One case per constructor of v's data type, as [[value types] ...]; nil
+  when v is not of a data type.  A case split, not induction: no case
+  gets a hypothesis."
+  [opts v]
+  (let [ty (get-in opts [:types v])
+        h (if (seq? ty) (first ty) ty)
+        d (when (symbol? h) (get-in opts [:tenv h]))]
+    (when (and d (:ctors d) (not (:tvar d)))
+      (mapv (juxt :value :types) (cases v ty (:tenv opts))))))
 
 (defn list-cases
   "The two shapes of an unknown list of elements v: empty, and a head and

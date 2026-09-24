@@ -29,3 +29,6 @@
 .claude/
 AGENTS.md
 CLAUDE.md
+
+# writ proof cache
+.writ-cache/

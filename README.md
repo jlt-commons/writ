@@ -5,11 +5,12 @@ is the problem statement written so a machine can check it: signatures for
 the public functions, and laws that say what their results mean. It lives
 in its own namespace, and the code never mentions writ.
 
-It is built for code an LLM writes. A person writes the spec, which is the
-intent. The agent writes the implementation. writ is the gate between
-them. Its report says what to fix: the rule that was broken, or the law
-that failed, the smallest input that fails it, and the value each side
-produced.
+It is built for code an LLM writes. The spec is the intent: the problem's
+states, the steps between them, and what each step means. An agent, or a
+person, writes it first; then the implementation. writ is the gate
+between them. Its report says what to fix: the rule that was broken, or
+the law that failed, the smallest input that fails it, and the value each
+side produced.
 
 A spec is not a test suite. Tests pin down examples: this input gives that
 output. A spec states what must hold for every input: the output is
@@ -20,9 +21,15 @@ laws don't pin down, naming a trivial stand-in that would pass.
 
 The static rules come from [Bend](https://github.com/HigherOrderCO/Bend):
 pure code only, recursion that provably terminates, definitions in order,
-types that fit. Behaviour is checked by running the laws, through
-[test.check](https://github.com/clojure/test.check), against inputs
-generated from the spec's types.
+types that fit. Behaviour is checked two ways. The laws run, through
+[test.check](https://github.com/clojure/test.check), on inputs generated
+from the spec's types. And writ proves them from the code: by rewriting
+and induction, or by running the code on symbolic values and handing the
+result to a solver. A proof holds for every input, not the ones a test
+happened to try. Every proof is replayed by a small checker before it is
+reported, and the solver's answers come with certificates that checker
+verifies, so the search is never trusted. The report says which laws are
+proved and which are only tested, and a spec can demand proof.
 
 writ runs on [jolt](https://github.com/jolt-lang/jolt).
 
@@ -30,15 +37,21 @@ writ runs on [jolt](https://github.com/jolt-lang/jolt).
 
 ```
 src/my/sort.clj           the implementation: plain Clojure, no writ
-test/my/sort_spec.clj     the contract: spec, data, ann, law
+test/my/sort_spec.clj     the contract: spec, graph, refine, ann, law
+test/my/sort_proof.clj    optional: lemmas and hints that help the prover
 test/my/sort_test.clj     runs the check
 ```
 
-1. Write the spec. It names the namespace it constrains, signs the public
-   fns and states what they mean. This is the part a person owns.
-2. The agent writes the implementation as ordinary Clojure.
-3. Run the check. If it fails, hand the report back to the agent and repeat.
-4. Keep the check in the test suite, so it gates every change.
+1. Declare the state graph. Every spec has one: the problem's states, as
+   types -- refinements most often -- and the fns that step between them.
+   It is the first thing a spec says, and writ proves each of its edges.
+2. State what each step means, as laws, and ask for proof with
+   `(spec my.sort {:require :proved})`.
+3. Write the implementation as ordinary Clojure.
+4. Run the check. If it fails, the report says what to fix. If a law holds
+   but is not proved, help the prover with a lemma or a hint in the proof
+   namespace; don't weaken the law.
+5. Keep the check in the test suite, so it gates every change.
 
 writ is a test dependency. The spec and the check live on the test
 classpath, so production code never loads writ.
@@ -80,12 +93,17 @@ The spec:
 
 ```clojure
 (ns my.sort-spec
-  (:require [writ.spec :refer [spec ann law]]))
+  (:require [writ.spec :refer [spec ann law graph]]))
 
-(spec my.sort)
+(spec my.sort {:require :proved})
 
 (ann insert      [Nat (List Nat) -> (List Nat)])
 (ann isort       [(List Nat) -> (List Nat)])
+
+;; the problem's data flow: a list goes in, a sorted list comes out
+(graph sorting
+  {:states {:unsorted (List Nat), :sorted (List Nat)}
+   :edges  {:unsorted {[isort] #{:sorted}}}})
 
 (defn ascending? [xs]
   (or (empty? xs) (apply <= xs)))
@@ -370,6 +388,70 @@ spec has `calls` forms:
   with "it uses `f`, which writ cannot check", so one effect deep in a
   call chain shows up at every caller above it.
 
+### Refinements
+
+A refinement is a type and a predicate:
+
+```clojure
+(refine Paddle [y Int] (<= 0 y (- H PH)))
+(refine Ball   [b (Tuple Column Row Pace Spin)] true)
+(refine Green  [l (Tuple Keyword Nat)] (and (= :Green (first l)) (<= (second l) GREEN)))
+```
+
+It goes wherever a type goes: in an `ann`, a `forall`, a graph's states,
+another refinement. Its values are generated to satisfy it -- an integer
+range is found once and sampled near its bounds and the spec's own
+numbers, where code tends to break -- so a law never folds random inputs
+into shape. The prover takes the predicate as a hypothesis, and the
+static check sees the base type. `refine` also defines the predicate, as
+`Paddle?`, for laws to use.
+
+### The state graph
+
+Every spec declares its graph, and it comes first. Its states are types;
+its edges are the fns that step between them:
+
+```clojure
+(graph signal
+  {:start  [:green [:Green 0]]
+   :states {:green Green, :yellow Yellow, :red Red}
+   :edges  {:green  {[tick] #{:green :yellow}}
+            :yellow {[tick] #{:yellow :red}}
+            :red    {[tick] #{:red :green}}}
+   :before [[:yellow :red]]})
+```
+
+An edge's key is the fn and the types of the arguments after the state:
+`[move-paddle Key]` is `(move-paddle state key)` for every `Key`. writ
+checks the graph three ways:
+
+- **Data flow.** Each edge's fn must take its state's type and return its
+  targets' type, by its `ann`.
+- **Each edge is a law.** An edge into refinements is an obligation named
+  for the graph, the state and the fn, `signal:yellow:tick`, run and
+  proved like any law: the fn takes every value of its state into one of
+  the states it names, and it never throws. A step that breaks it is
+  reported with the state it breaks on:
+
+  ```
+  law `signal:yellow:tick` fails for
+    l = [:Yellow 5]
+    a tick from yellow must land in yellow or red
+  ```
+- **The graph's own rules.** `:start` names a state, or `[state value]`
+  with a value in it; every state must be reachable from it; `:final`
+  states must be reachable from every state; `:never [a b]` says no path
+  leads from a to b, and `:before [a b]` that every path from the start
+  to b passes a. With every edge proved, these hold for every run of the
+  code, not only for the table.
+
+A spec for plain functions has a graph too: its states are the data the
+problem moves through, and an edge into plain types is data flow only,
+checked against the signatures. pong's graph has four states, one per
+phase of a game, each a refinement of the game's tuple; its four edges
+are proved from the code, so no sequence of key presses ever takes a
+game out of them.
+
 ### Machines
 
 Some code is a state machine: a screen flow, a protocol, an order's
@@ -499,7 +581,16 @@ replays a run (default random, reported per law), and `:max-size` is the
 largest generated size (default 50). `:adequacy false` skips the third
 stage, for example while a spec is still being written, and
 `:prove false` skips the prover. `:require` sets the evidence every law
-needs, in place of the spec's own.
+needs, in place of the spec's own. `:proof` names the proof namespace
+(`false` for none), and `:fuel` gives the prover more rewrites per
+attempt.
+
+Proofs are cached in `.writ-cache/`, one file per spec. A cached proof is
+used only when the law, its hint and lemmas, and the source of the code,
+the spec, the proof namespace and writ itself are all exactly as they
+were when it was found and checked, so a check that changes nothing
+proves nothing again. `:cache false` turns it off; `:cache-dir` puts it
+elsewhere. Add `.writ-cache/` to `.gitignore`.
 
 ### Requiring proof
 
@@ -537,6 +628,37 @@ go unnoticed:
 A closed law that evaluates to true, and an `exists` law with a witness,
 count as proved: running pure, terminating code on fixed inputs decides
 them.
+
+### The proof namespace
+
+When a law holds but the prover can't find its proof, it needs a lemma or
+a hint, and those don't belong in the spec: the spec is the contract, and
+lemmas are how it is proved. They go in the proof namespace, found by
+name (`my.sort-proof` for `my.sort-spec`) or given as check's `:proof`:
+
+```clojure
+(ns my.sort-proof
+  (:require [writ.spec :refer [proof-of lemma hint]]))
+
+(proof-of my.sort-spec)
+
+(lemma insert-keeps-sorted
+  (forall [x Nat, xs (List Nat)]
+    (=> (my.sort-spec/ascending? xs) (my.sort-spec/ascending? (insert x xs)))))
+
+(hint sorted {:induct xs :use [insert-keeps-sorted]})
+```
+
+A lemma is a law about the code: it is tested, and it must be proved, or
+the check fails. Once proved, the spec's laws may cite it. It is reported
+apart, it counts toward no law of the spec, and the adequacy check never
+judges a stand-in by it, so a lemma can't make a weak spec look strong.
+
+A hint steers the search and nothing more: `:induct` the variable to try
+induction on first, `:use` the only lemmas and laws a proof may cite,
+`:strategy` one of `:symbolic`, `:induction` or `:rewriting`, and `:fuel`
+the rewrites one attempt may make. A proof a hint leads to is checked
+like any other.
 
 ### Proofs
 
@@ -639,7 +761,51 @@ The prover covers:
   `defn`s
 
 Anything else leaves the law tested, with `:unproved` saying why, for
-example "outside the prover: the name `min`".
+example "outside the prover: `frequencies`".
+
+### Symbolic evaluation and the solver
+
+Rewriting splits a goal at every `if`, and a step fn with a dozen
+conditions makes thousands of cases. So writ also runs the code once, on
+symbolic values, the way [Rosette](https://emina.github.io/rosette/)
+does: both branches of an `if` run, and their values merge under its
+test. Integers merge into one value defined once, vectors of one length
+merge element by element, and a data value whose constructor depends on
+the branch is kept as a union of guarded values. Data values are split
+into their constructors first, so each case is a small formula. What
+comes out is one formula: the law holds, and, for a graph's edges, the
+code never throws.
+
+That formula goes to `writ.solve`, a solver written for writ in plain
+Clojure: linear integer arithmetic (with `mod` and `quot` by a constant),
+uninterpreted functions, and sets of unknown size as predicates. Two sets
+are equal when an element the solver may choose is in both or neither, so
+a law about every world of the Game of Life is one query:
+`the-plane-has-no-favoured-place` is proved for every world, however
+large, not sampled. The solver's search is not trusted. An unsatisfiable
+formula comes with a certificate -- case splits down to Farkas
+combinations, whose sums a few lines of arithmetic check -- and
+`writ.solve.cert` verifies it, as the proof checker does for every step.
+
+When the solver finds the formula invalid, its model is a counterexample.
+writ turns it back into Clojure values and runs the law on them; if the
+law fails there, that is the report, even when no test found it:
+
+```
+law `the-left-paddle-stops-the-ball` fails for
+  b  = [3 3 -2 0]
+  ly = 0
+  ry = 4
+  (held-by-left? ly (advance b ly ry)) => false
+  (advance b ly ry) => [1 3 -2 0]
+  (found by the solver, when no test did, and confirmed by running the code)
+```
+
+Symbolic evaluation covers the non-recursive code: arithmetic, `if`,
+`case`, `let`, destructuring, vectors of known length, data values, sets
+built from literals and sets of unknown size filtered, mapped by a
+translation, or tested for membership, and calls of pure core fns on
+literal data. Recursion is left to rewriting and induction.
 
 ### Which fns qualify
 
@@ -778,7 +944,13 @@ of forms, and `writ.book/check-files` checks source files as one book.
 - `writ.prove`: the proof search; `writ.prove.term`, `writ.prove.rewrite`
   and `writ.prove.translate` hold the terms, the rewrite rules and the
   translation from Clojure; `writ.prove.scheme` the steps a proof is made
-  of, and `writ.prove.check` the checker that replays every proof
+  of, and `writ.prove.check` the checker that replays every proof;
+  `writ.prove.symbolic` runs code on symbolic values, and
+  `writ.prove.smt` hands open goals to the solver
+- `writ.solve`: the certifying solver for linear integer arithmetic and
+  uninterpreted functions; `writ.solve.pre` turns formulas into clauses,
+  `writ.solve.search` and `writ.solve.simplex` search, and
+  `writ.solve.cert` checks certificates without searching
 - `writ.book`: runs every rule over a namespace's forms
 - `writ.check`: quantities, termination, ordering, effects, arity
 - `writ.types`: type checking and tagged data
