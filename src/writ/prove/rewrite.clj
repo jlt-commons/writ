@@ -207,6 +207,15 @@
       (= :sq (head c)) (elems-ok? (second c))
       :else false)))
 
+(declare int-term?)
+
+(defn- division?
+  "quot, mod or rem of an integer by a nonzero integer literal: an integer."
+  [ctx t]
+  (and (= :call (head t)) (contains? '#{quot mod rem} (second t)) (= 4 (count t))
+       (t/int-lit? (nth t 3)) (not (zero? (second (nth t 3))))
+       (int-term? ctx (nth t 2))))
+
 (defn int-term?
   "Is t known to be an integer?  Literals, linear forms, counts, variables
   typed Nat or Int, and a term a fact, hypothesis or proved lemma says is
@@ -218,6 +227,7 @@
       (and (= :call (head t)) (= 'count (second t)))
       (and (= :call (head t)) (= 'apply (second t)) (= [:cfn '+] (nth t 2 nil))
            (int-elems? ctx (nth t 3 nil)))
+      (division? ctx t)
       (and (contains? #{:app :call} (head t)) (proved-integer? ctx t))))
 
 (defn- nat-atom? [ctx a]
@@ -288,6 +298,22 @@
             (recur (concat rest combined) budget))
           false)))))
 
+(defn- division-bounds
+  "What is known of a division atom, as constraints c + sum k*x >= 0.
+  With |k| - 1 = j: (mod n k) is 0..j for k > 0 and -j..0 for k < 0;
+  (rem n k) is -j..j; and n - k*(quot n k), the remainder, is -j..j."
+  [ctx a]
+  (when (division? ctx a)
+    (let [[_ f n [_ k]] a
+          j (dec (abs k))
+          between (fn [lf lo hi] [(lin+ lf {:c (- lo) :m {}}) (lin+ (lin* -1 lf) {:c hi :m {}})])
+          self {:c 0 :m {a 1}}]
+      (case f
+        mod (if (pos? k) (between self 0 j) (between self (- j) 0))
+        rem (between self (- j) j)
+        quot (when-let [ln (lin-of ctx n)]
+               (between (lin+ ln (lin* (- k) self)) (- j) j))))))
+
 (defn- known-constraints
   "The integer facts in ctx, as constraints c + sum k*x >= 0, with each
   Nat atom they or `extra` mention known to be at least 0."
@@ -300,7 +326,9 @@
                          nil)]
                 lf)
         atoms (distinct (mapcat (comp keys :m) (concat facts extra)))]
-    (concat facts (for [a atoms :when (nat-atom? ctx a)] {:c 0 :m {a 1}}))))
+    (concat facts
+            (for [a atoms :when (nat-atom? ctx a)] {:c 0 :m {a 1}})
+            (mapcat #(division-bounds ctx %) atoms))))
 
 (defn decide-le
   "true / false / nil for 0 <= d, from its form, Nat atoms and the facts."
@@ -357,7 +385,7 @@
   (case (head c)
     :nil false
     :lit (not (false? (second c)))
-    (:sq :fn :cfn) true
+    (:sq :fn :cfn :dfn) true
     :if (let [a (truthiness ctx (nth c 2)) b (truthiness ctx (nth c 3))]
           (when (and (some? a) (= a b)) a))
     :call (if (contains? seq-makers (second c))
@@ -514,12 +542,57 @@
       (= :elems (head e)) [:call 'reduce f init (second e)]
       :else nil)))
 
+(def ^:private pure-fns
+  "clojure.core fns that compute a value from plain data and nothing else,
+  so a call of one on closed values is its value."
+  '#{sort distinct reverse hash-set set sort-by count vec str name keyword
+     subs frequencies max min abs quot mod rem inc dec + - * nth first second
+     last rest butlast take drop concat interpose})
+
+(defn- closed-value
+  "The Clojure value of a closed term built from literals, or ::none."
+  [x]
+  (case (head x)
+    :lit (second x)
+    :nil nil
+    :sq (let [vs (loop [e (second x), out []]
+                   (case (head e)
+                     :enil out
+                     :econs (let [v (closed-value (nth e 1))] (if (= ::none v) nil (recur (nth e 2) (conj out v))))
+                     nil))]
+          (if (nil? vs) ::none (apply list vs)))
+    :call (if (= 'hash-set (second x))
+            (let [vs (map closed-value (drop 2 x))] (if (some #{::none} vs) ::none (set vs)))
+            ::none)
+    ::none))
+
+(defn- value-term
+  "The term for a plain value: a literal, a sequential or a set of them."
+  [v]
+  (cond (sequential? v) (let [ts (map value-term v)] (when (every? some? ts) (t/seq-term ts)))
+        (set? v) (let [ts (map value-term (sort-by pr-str v))] (when (every? some? ts) (into [:call 'hash-set] ts)))
+        (or (map? v) (fn? v)) nil
+        :else (t/lit v)))
+
+(defn- ground-call
+  "A pure core fn applied to closed values, computed: the code is pure,
+  so running it is its meaning.  nil when it is not closed or throws."
+  [x]
+  (when (and (= :call (head x)) (contains? pure-fns (second x)))
+    (let [vs (map closed-value (drop 2 x))]
+      (when (not-any? #{::none} vs)
+        (try (value-term (let [r (apply @(resolve (symbol "clojure.core" (name (second x)))) vs)]
+                           (if (seq? r) (doall r) r)))
+             (catch Throwable _ nil))))))
+
 (defn- computed
   "The computed rules: a rewrite of t, or nil."
   [ctx x]
   (case (head x)
     :call
-    (let [[_ f & args] x
+    (or
+     (when-not (= 'hash-set (second x)) (ground-call x))
+     (let [[_ f & args] x
           n (count args)
           [a b] args]
       (case f
@@ -568,6 +641,10 @@
                  [:sq (reduce (fn [e v] [:eapp [:elems v] e])
                               [:elems (last args)] (reverse (butlast args)))])
         identity (when (= 1 n) a)
+        (bit-shift-left bit-shift-right)
+        (when (and (= 2 n) (t/int-lit? a) (t/int-lit? b) (<= 0 (second b) 62))
+          [:lit ((case f bit-shift-left bit-shift-left bit-shift-right bit-shift-right)
+                 (second a) (second b))])
         (quot mod rem) (when (and (= 2 n) (all-num-lits? args) (integer? (second a))
                                   (integer? (second b)) (not (zero? (second b))))
                          [:lit ((case f quot quot mod mod rem rem) (second a) (second b))])
@@ -579,14 +656,15 @@
         reduce (when (= 3 n) (reduce-rule ctx a b (nth args 2)))
         nth (when (and (<= 2 n 3) (t/int-lit? b))
               (nth-rule a (second b) (if (= 3 n) (nth args 2) ::none)))
-        nil))
+        nil)))
 
     :ap (let [[_ f & args] x]
           (cond
             (and (= :fn (head f)) (= (count (second f)) (count args)))
             (t/subst (nth f 2) (zipmap (second f) args))
-            ;; a core fn value applied is a call of it
+            ;; a core fn value applied is a call of it, and a defn's an app
             (= :cfn (head f)) (into [:call (second f)] args)
+            (= :dfn (head f)) (into [:app (second f)] args)
             :else nil))
 
     :le (let [d (decide ctx x)] (when (some? d) [:lit d]))

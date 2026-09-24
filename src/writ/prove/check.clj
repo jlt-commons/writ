@@ -22,7 +22,9 @@
   this namespace: not the search, its heuristics or its bookkeeping."
   (:require [writ.prove.term :as t :refer [head]]
             [writ.prove.rewrite :as rw]
-            [writ.prove.scheme :as sc]))
+            [writ.prove.scheme :as sc]
+            [writ.prove.smt :as smt]
+            [writ.prove.symbolic :as sym]))
 
 (defn- reject! [& msg]
   (throw (ex-info (apply str msg) {::rejected true})))
@@ -30,13 +32,22 @@
 (declare check-goal check-cases check-induction)
 
 (defn- check-goal
-  "Replay the proof of boolean goal g under hyps."
+  "Replay the proof of boolean goal g under hyps.  The goal is normalised
+  only for the steps that read it: a case split on data and a symbolic
+  leaf do not, and normalising a large goal is where time goes."
   [opts g hyps p]
-  (let [[_ vacuous n] (sc/case-context opts g hyps)]
+  (let [cc (delay (sc/case-context opts g hyps))
+        vacuous (delay (second @cc))
+        n (delay (nth @cc 2))]
     (case (:by p)
-      :hypothesis-false (when-not vacuous (reject! "a hypothesis said to be false is not"))
-      :rewriting (when-not (or vacuous (sc/truthy? n))
-                   (reject! "the goal does not rewrite to true: " (pr-str (t/show n))))
+      :hypothesis-false (when-not @vacuous (reject! "a hypothesis said to be false is not"))
+      :symbolic (when-not (sym/verify opts hyps g (:certificate p))
+                  (reject! "the solver's certificate does not prove " (pr-str (t/show g))))
+      :solver (let [[ctx _ n] (sc/case-context opts g hyps)]
+                (when-not (or @vacuous (smt/verify ctx n (:certificate p)))
+                  (reject! "the solver's certificate does not prove " (pr-str (t/show n)))))
+      :rewriting (when-not (or @vacuous (sc/truthy? @n))
+                   (reject! "the goal does not rewrite to true: " (pr-str (t/show @n))))
       :split (let [c (:on p)]
                (if-let [[x v] (and (= :ieq (head c)) (sc/solve-eq (second c)))]
                  (let [[o g* hs] (sc/subst-all opts g hyps {x v})]
@@ -47,6 +58,25 @@
                     (when-not (map? (get-in opts [:types v]))
                       (reject! "`" v "` is not a list of elements"))
                     (doseq [[[value types] sub] (map vector (sc/list-cases opts v) [(:empty p) (:cons p)])]
+                      (let [[o g* hs] (sc/subst-all (update opts :types merge types) g hyps {v value})]
+                        (check-goal o g* hs sub))))
+      :enumeration (let [{v :on lo :from hi :to cs :cases} p
+                         [ctx] (sc/case-context opts g hyps)
+                         holds? #(= [:lit true] (rw/normalize ctx %))]
+                     (when-not (and (symbol? v) (integer? lo) (integer? hi) (<= lo hi)
+                                    (holds? [:call '<= [:lit lo] v]) (holds? [:call '<= v [:lit hi]]))
+                       (reject! "the facts do not bound `" v "` to " lo ".." hi))
+                     (when-not (= (count cs) (inc (- hi lo)))
+                       (reject! "the cases on `" v "` are not one per value"))
+                     (doseq [[k sub] (map vector (range lo (inc hi)) cs)]
+                       (let [[o g* hs] (sc/subst-all opts g hyps {v [:lit k]})]
+                         (check-goal o g* hs sub))))
+      :data-cases (let [v (:on p)
+                        cs (or (sc/data-cases opts v)
+                               (reject! "`" v "` is not of a data type"))]
+                    (when-not (= (count cs) (count (:cases p)))
+                      (reject! "the cases on `" v "` are not one per constructor"))
+                    (doseq [[[value types] sub] (map vector cs (:cases p))]
                       (let [[o g* hs] (sc/subst-all (update opts :types merge types) g hyps {v value})]
                         (check-goal o g* hs sub))))
       (reject! "a goal cannot be proved " (pr-str (:by p))))))
@@ -119,6 +149,13 @@
       (case (:by trace)
         :cases (check-all opts g (:proofs trace))
         :induction (check-induction opts g trace)
+        :symbolic (let [{:keys [hyps goals]} g
+                        cs (:certificates trace)]
+                    (when-not (= (count cs) (count goals))
+                      (reject! "a certificate for each goal is missing"))
+                    (doseq [[gl c] (map vector goals cs)]
+                      (when-not (sym/verify opts hyps gl c)
+                        (reject! "the solver's certificate does not prove " (pr-str (t/show gl))))))
         :with (let [rules (check-accumulator opts (:lemma trace))
                     opts* (update opts :lemmas into rules)
                     inner (:proof trace)]

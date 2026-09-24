@@ -2,11 +2,15 @@
   "classify-spec without its one quantified law over n. Every law still
   holds, but they only ever call classify-read with n = 0, -1, -2 or -127,
   so nothing says what 5 or -50 means."
-  (:require [writ.spec :refer [spec ann law]]))
+  (:require [writ.spec :refer [spec ann law graph]]))
 
 (spec writ.spec-demo.classify)
 
 (ann classify-read [Int Bool -> Keyword])
+
+(graph reading
+  {:states {:count Int, :status Keyword}
+   :edges  {:count {[classify-read Bool] #{:status}}}})
 
 (law zero-is-decided-by-the-eof-flag
   (forall [e Bool] (= (classify-read 0 e) (if e :eof :idle))))

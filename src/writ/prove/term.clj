@@ -18,6 +18,7 @@
     [:app f a ...]         a fn of the target or the spec applied
     [:fn [p ...] body]     a fn value
     [:cfn f]               the clojure.core fn f, as a value
+    [:dfn f]               the target's or the spec's fn f, as a value
     [:ap f a ...]          a fn value applied
     [:if c a b]            Clojure's if: b when c is nil or false
     [:lin c [[t k] ...]]   the integer c + k*t + ...
@@ -62,7 +63,7 @@
     (not (vector? t)) #{}
     (= :fn (head t)) (let [[_ ps body] t] (apply disj (vars body) ps))
     (= :lin (head t)) (into #{} (mapcat (fn [[a _]] (vars a))) (nth t 2))
-    (contains? #{:lit :cfn} (head t)) #{}
+    (contains? #{:lit :cfn :dfn} (head t)) #{}
     ;; a call's head is the name of a fn, not a variable
     (contains? #{:call :app} (head t)) (into #{} (mapcat vars) (drop 2 t))
     :else (into #{} (mapcat vars) (rest t))))
@@ -76,7 +77,7 @@
   (cond
     (symbol? t) (get m t t)
     (not (vector? t)) t
-    (contains? #{:lit :nil :enil :bottom :cfn} (head t)) t
+    (contains? #{:lit :nil :enil :bottom :cfn :dfn} (head t)) t
     (= :fn (head t)) (let [[_ ps body] t
                            m* (apply dissoc m ps)
                            free (into #{} (comp (filter #(contains? (vars body) (key %)))
@@ -92,7 +93,7 @@
     :else (into [(first t)] (map #(subst % m)) (rest t))))
 
 (defn subterms [t]
-  (tree-seq (fn [x] (and (vector? x) (not (lit? x)) (not= :cfn (head x))))
+  (tree-seq (fn [x] (and (vector? x) (not (lit? x)) (not (contains? #{:cfn :dfn} (head x)))))
             (fn [x] (case (head x)
                       :lin (map first (nth x 2))
                       (:call :app) (drop 2 x)
@@ -133,6 +134,7 @@
          :fn (let [[_ ps body] t]
                (fn [& args] (evaluate body (merge env (zipmap ps args)) res)))
          :cfn @(resolve (symbol "clojure.core" (name (second t))))
+         :dfn @(res (second t))
          :ap (apply (ev (second t)) (map ev (drop 2 t)))
          :if (if (ev (nth t 1)) (ev (nth t 2)) (ev (nth t 3)))
          :lin (reduce + (second t) (map (fn [[a k]] (* k (ev a))) (nth t 2)))
@@ -177,6 +179,7 @@
       :app (apply list (symbol (name (second t))) (map show (drop 2 t)))
       :fn (list 'fn (nth t 1) (show (nth t 2)))
       :cfn (second t)
+      :dfn (symbol (name (second t)))
       :ap (apply list (show (second t)) (map show (drop 2 t)))
       :if (list 'if (show (nth t 1)) (show (nth t 2)) (show (nth t 3)))
       :lin (let [[p n] (show-lin (second t) (nth t 2))]

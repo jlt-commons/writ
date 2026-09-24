@@ -15,7 +15,9 @@
   "The clojure.core fns the prover models."
   '#{seq first rest next second empty? count cons list vector vec concat
      filter map not = not= < <= > >= + - * inc dec zero? pos? neg? nth identity apply
-     reduce integer? max min abs every? some quot mod rem contains? boolean})
+     reduce integer? max min abs every? some quot mod rem contains? boolean
+     bit-shift-left bit-shift-right set hash-set into mapcat
+     sort distinct reverse last butlast take drop str name keyword})
 
 (def value-fns
   "The clojure.core fns that may be passed as values: the modelled ones,
@@ -32,9 +34,16 @@
 (defn- scalar? [x]
   (or (nil? x) (number? x) (string? x) (keyword? x) (char? x) (boolean? x)))
 
+(defn- plain-data?
+  "A scalar, or a sequential of plain data, or a set of scalars."
+  [x]
+  (or (scalar? x)
+      (and (sequential? x) (every? plain-data? x))
+      (and (set? x) (every? scalar? x))))
+
 (defn- constant
   "The value of a def the name refers to, when it is plain data the prover
-  can hold: a scalar, or a sequential or set of them.  Code is pure, so a
+  can hold: a scalar, a sequential of plain data, or a set of scalars.  Code is pure, so a
   def's value is fixed once its namespace is loaded; nil otherwise."
   [ctx s]
   (let [v (try (if (namespace s)
@@ -43,8 +52,7 @@
                (catch Throwable _ nil))]
     (when (and (var? v) (bound? v) (not (:dynamic (meta v))))
       (let [x @v]
-        (when (or (scalar? x)
-                  (and (or (sequential? x) (set? x)) (every? scalar? x)))
+        (when (plain-data? x)
           [x])))))
 
 (defn- member-set
@@ -91,9 +99,7 @@
            (case k
              :local (into [:ap v] args)
              :own (into [:app v] args)
-             :core (if (= 'contains? v)
-                     (outside! "contains? on anything but a set of literals")
-                     (into [:call v] args))
+             :core (into [:call v] args)
              (outside! (str "`" (:name f) "`"))))
     :fn (into [:ap (term-of ctx env f)] args)
     (outside! "calling a computed value")))
@@ -106,6 +112,7 @@
            (cond (nil? v) t/tnil
                  (and (seq? v) (empty? v)) [:sq t/enil]
                  (sequential? v) (t/value->term v)
+                 (and (set? v) (every? scalar? v)) (into [:call 'hash-set] (map t/lit (sort-by pr-str v)))
                  (coll? v) (outside! (str "the literal " (pr-str v)))
                  :else [:lit v]))
     :ref (let [s (:name ast)]
@@ -114,11 +121,12 @@
                       (contains? #{nil "clojure.core"} (namespace s))
                       (contains? value-fns (symbol (name s))))
                  [:cfn (symbol (name s))]
-                 (or (contains? (:own ctx) s) (call-head ctx env s))
+                 (contains? (:own ctx) s) [:dfn (get (:own ctx) s)]
+                 (call-head ctx env s)
                  (outside! (str "`" s "` passed as a value"))
                  :else (if-let [[x] (constant ctx s)]
                          (if (set? x)
-                           (outside! (str "the set `" s "` outside contains?"))
+                           (into [:call 'hash-set] (map t/lit (sort-by pr-str x)))
                            (t/value->term x))
                          (outside! (str "the name `" s "`")))))
     :if [:if (term-of ctx env (:test ast)) (term-of ctx env (:then ast)) (term-of ctx env (:else ast))]
@@ -168,6 +176,7 @@
                 (invoke-term ctx env f (mapv #(term-of ctx env %) (:args ast)))))
 
     :vec (t/seq-term (mapv #(term-of ctx env %) (:items ast)))
+    :set (into [:call 'hash-set] (map #(term-of ctx env %) (:items ast)))
     :case (case-term ctx env ast)
     (outside! (str "`" (name (:op ast)) "`"))))
 

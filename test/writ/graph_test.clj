@@ -82,3 +82,29 @@
                      "unknown keys"))
   (is (str/includes? (expansion-error '(writ.spec/refine Row [y] (pos? y)))
                      "(refine Name [x BaseType] predicate)")))
+
+(deftest a-spec-must-declare-its-graph
+  (let [r (spec/check 'writ.spec-demo.no-graph-spec {:seed 42})]
+    (is (not (:ok r)))
+    (is (str/includes? (:message r) "`writ.spec-demo.no-graph-spec` declares no state graph"))
+    (is (str/includes? (:message r) "(graph name {:states {state Type ...} :edges {state {[fn ArgType ...] #{state ...}}}})"))))
+
+(deftest a-graph-over-plain-compound-types-is-data-flow
+  (require 'writ.spec-demo.flow-spec)
+  (let [r (spec/check 'writ.spec-demo.flow-spec {:seed 42})]
+    (is (:ok r) (:message r))
+    (is (= [{:graph 'sorting :status :ok :states 2 :edges 1}] (:graphs r)))))
+
+(deftest a-graph-step-is-proved-never-to-throw
+  (let [r (spec/check 'writ.spec-demo.signal-spec {:seed 42})
+        l (law-result r 'signal:yellow:tick)]
+    (is (= :proved (:status l)))
+    (is (true? (:total l)))
+    (is (str/includes? (:proof l) "and it never throws"))))
+
+(deftest a-step-that-throws-is-caught
+  (let [r (spec/check 'writ.spec-demo.signal-spec {:seed 42 :target 'writ.spec-demo.signal-throw})
+        l (law-result r 'signal:yellow:tick)]
+    (is (not (:ok r)))
+    (is (= :failed (:status l)) (pr-str l))
+    (is (str/includes? (:message r) "l = [:Yellow 5]"))))

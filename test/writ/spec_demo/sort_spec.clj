@@ -5,12 +5,17 @@
   element. The laws say that and nothing about how it is done, and they
   measure the result with the spec's own vocabulary (`ascending?`,
   `occurrences`), never with the implementation's."
-  (:require [writ.spec :refer [spec ann law]]))
+  (:require [writ.spec :refer [spec ann law graph]]))
 
 (spec writ.spec-demo.sort)
 
 (ann insert [Nat (List Nat) -> (List Nat)])
 (ann isort  [(List Nat) -> (List Nat)])
+
+(graph sorting
+  {:states {:item Nat, :unsorted (List Nat), :sorted (List Nat)}
+   :edges  {:unsorted {[isort] #{:sorted}}
+            :item     {[insert (List Nat)] #{:sorted}}}})
 
 (defn ascending? [xs]
   (or (empty? xs) (apply <= xs)))

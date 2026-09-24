@@ -9,11 +9,13 @@
             writ.prove-test
             writ.evidence-test
             writ.graph-test
-            writ.solve-test))
+            writ.solve-test
+            writ.symbolic-test
+            writ.proof-test))
 
 (def test-namespaces
   '[writ.check-test writ.book-test writ.gaps-test writ.spec-test writ.prove-test writ.evidence-test
-    writ.graph-test writ.solve-test])
+    writ.graph-test writ.solve-test writ.symbolic-test writ.proof-test])
 
 (defn -main [& _]
   (let [{:keys [fail error]} (apply t/run-tests test-namespaces)]

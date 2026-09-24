@@ -361,3 +361,27 @@
   (is (= [:lit -3] (norm [:call 'rem [:lit -3] [:lit 5]])))
   (testing "a division by zero is left alone, not folded"
     (is (= [:call 'quot [:lit 1] [:lit 0]] (norm [:call 'quot [:lit 1] [:lit 0]])))))
+
+(deftest division-by-a-literal-is-bounded
+  (let [ctx (rw/context {:types {'n 'Int}})
+        holds? (fn [x] (= [:lit true] (rw/normalize ctx x)))]
+    (testing "mod by a positive k is 0 to k-1, by a negative k is k+1 to 0"
+      (is (holds? [:call '<= [:lit 0] [:call 'mod 'n [:lit 7]]]))
+      (is (holds? [:call '<= [:call 'mod 'n [:lit 7]] [:lit 6]]))
+      (is (holds? [:call '<= [:call 'mod 'n [:lit -7]] [:lit 0]]))
+      (is (holds? [:call '<= [:lit -6] [:call 'mod 'n [:lit -7]]])))
+    (testing "quot by k is within |k|-1 of n/k, rem within |k|-1 of 0"
+      (is (holds? [:call '<= [:call '* [:lit 7] [:call 'quot 'n [:lit 7]]] [:call '+ 'n [:lit 6]]]))
+      (is (holds? [:call '<= [:call '- 'n [:lit 6]] [:call '* [:lit 7] [:call 'quot 'n [:lit 7]]]]))
+      (is (holds? [:call '<= [:call 'rem 'n [:lit 7]] [:lit 6]])))
+    (testing "nothing more: mod is not always 0"
+      (is (not (holds? [:call '= [:call 'mod 'n [:lit 7]] [:lit 0]]))))
+    (testing "an untyped operand is not an integer"
+      (is (not (holds? [:call '<= [:lit 0] [:call 'mod 'x [:lit 7]]]))))))
+
+(deftest division-bounds-agree-with-the-runtime
+  (doseq [n (range -40 41), k (remove zero? (range -9 10))]
+    (let [j (dec (abs k))]
+      (is (if (pos? k) (<= 0 (mod n k) j) (<= (- j) (mod n k) 0)) [n k])
+      (is (<= (- j) (rem n k) j) [n k])
+      (is (<= (- j) (- n (* k (quot n k))) j) [n k]))))
