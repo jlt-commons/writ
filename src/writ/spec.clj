@@ -1499,6 +1499,18 @@
      'Keyword (set (filter keyword? lits))
      'String (set (filter string? lits))}))
 
+(defn- such-that-opts
+  "How hard to look for a value of a refinement.  A value can be rare --
+  a tag and an exact score together -- so it tries many times, and says
+  which refinement starved if it still finds none."
+  [nm]
+  {:max-tries 5000
+   :ex-fn (fn [_] (ex-info (str "writ could not generate a value of refinement `" nm
+                                "`: its predicate rejected 5000 candidates. Refine its parts"
+                                " (a refined field, a narrower base type) so values are built"
+                                " to fit rather than filtered.")
+                           {:writ/error true}))})
+
 (defn- refine-gen
   "Values of a refinement.  An integer one is found once across a window
   and generated in its range, so a narrow range is never starved; any
@@ -1513,7 +1525,7 @@
           (empty? ok)
           (fail! "refinement `" name "` has no value between " (- int-window) " and " int-window)
           (or (= (first ok) (- int-window)) (= (peek ok) int-window))
-          (gen/such-that pred (type->gen b tenv) 200)
+          (gen/such-that pred (type->gen b tenv) (such-that-opts name))
           :else
           (let [lo (first ok) hi (peek ok)
                 spread (if (= (count ok) (inc (- hi lo)))
@@ -1529,7 +1541,7 @@
                 edges (vec (sort (filter ok-set (concat [(first ok) (peek ok)]
                                                         (get-in tenv [::spec-ints] [])))))]
             (gen/frequency [[3 spread] [1 (gen/elements edges)]]))))
-      (gen/such-that pred (type->gen base (assoc tenv ::bias (::bias-of-refine tenv))) 200))))
+      (gen/such-that pred (type->gen base (assoc tenv ::bias (::bias-of-refine tenv))) (such-that-opts name)))))
 
 (defn- type-env-of
   "The data types and refinements of a spec entry.  Refinements sit under

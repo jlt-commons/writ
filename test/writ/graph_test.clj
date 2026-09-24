@@ -108,3 +108,7 @@
     (is (not (:ok r)))
     (is (= :failed (:status l)) (pr-str l))
     (is (str/includes? (:message r) "l = [:Yellow 5]"))))
+
+(deftest a-rare-refinement-is-still-generated
+  (let [tenv (spec/type-env 'writ.spec-demo.signal-spec)]
+    (is (every? #(= [:Red 30] %) (spec/sample 'Stopped tenv 1000)))))
