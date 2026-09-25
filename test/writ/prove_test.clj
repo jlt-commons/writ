@@ -546,3 +546,16 @@
       (is (if (pos? k) (<= 0 (mod n k) j) (<= (- j) (mod n k) 0)) [n k])
       (is (<= (- j) (rem n k) j) [n k])
       (is (<= (- j) (- n (* k (quot n k))) j) [n k]))))
+
+(deftest terms-sort-in-the-order-they-print
+  (let [xs ['b [:lit 2] 'a [:lit 10] [:call 'f 'x] "s" :k]]
+    (is (= (sort-by pr-str xs) (t/sort-printed xs)))
+    (is (= (sort-by (comp pr-str key) {'b 1 'a 2 [:lit 1] 3})
+           (t/sort-printed key {'b 1 'a 2 [:lit 1] 3})))))
+
+(deftest a-summary-reads-a-shared-trace-once
+  (let [split {:by :split :on [:le [:lin 0 [['x 1]]]] :proofs []}
+        shared {:by :cases :proofs [split split]}
+        trace {:by :symbolic :proofs [shared shared {:by :solver} {:by :list-cases :on 'xs}]}]
+    (is (= "by symbolic evaluation, splitting on (<= 0 x), with the solver, with cases on xs"
+           (prover/summary trace)))))
