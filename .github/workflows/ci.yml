@@ -40,5 +40,12 @@ jobs:
           sudo apt-get install -y liblz4-1 zlib1g libtinfo6
           curl -sL https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash -s -- --version "$JOLT_VERSION"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      # proofs found before; writ takes one only when writ, the spec and the
+      # code are all unchanged, so an older cache is safe to start from
+      - uses: actions/cache@v4
+        with:
+          path: examples/.writ-cache
+          key: writ-cache-${{ matrix.example }}-${{ hashFiles('src/**', 'examples/src/**', 'examples/test/**') }}
+          restore-keys: writ-cache-${{ matrix.example }}-
       - name: ${{ matrix.example }}
         run: cd examples && jolt -M:test ${{ matrix.example }}.core-test
