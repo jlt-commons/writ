@@ -683,9 +683,10 @@
   "Compile and cache term fns: (ev vars term env) runs `term` with the
   variables bound from env."
   [spec-ns]
+  ;; keyed by the printed term: '(a b) and '[a b] are =, but not the same term
   (let [cache (atom {})]
     (fn [vars term env]
-      (let [k [vars term]
+      (let [k (pr-str [vars term])
             f (or (get @cache k)
                   (let [f (binding [*ns* (the-ns spec-ns)]
                             (eval (list 'fn (vec vars) term)))]
