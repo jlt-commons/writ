@@ -45,7 +45,7 @@
   ([n ctx]
    (first (filter #(contains? #{:le :ieq} (head %))
                   (concat (rw/open-conditions n)
-                          (for [[f v] (sort-by (comp pr-str key) (:facts ctx))
+                          (for [[f v] (t/sort-printed key (:facts ctx))
                                 :when (and (true? v) (= :if (head f)))
                                 c (rw/open-conditions f)
                                 :when (not (contains? (:facts ctx) c))]
@@ -62,7 +62,7 @@
   computes."
   [ctx n]
   (first
-    (for [x (sort-by pr-str (distinct (t/subterms n)))
+    (for [x (t/sort-printed (distinct (t/subterms n)))
           :when (and (= :call (head x))
                      (not (contains? '#{= not not= < <= > >= + - * inc dec zero? pos? neg?} (second x))))
           v (drop 2 x)
@@ -93,7 +93,7 @@
   "A variable of a data type the goal or a fact takes apart, as (first v)
   or (= v ...): splitting it into its constructors reveals the tag."
   [opts n ctx]
-  (first (for [x (sort-by pr-str (distinct (mapcat t/subterms (cons n (keys (:facts ctx))))))
+  (first (for [x (t/sort-printed (distinct (mapcat t/subterms (cons n (keys (:facts ctx))))))
                :when (and (= :call (head x)) (contains? '#{first =} (second x)))
                v (drop 2 x)
                :when (and (symbol? v) (sc/data-cases opts v))]
@@ -332,37 +332,40 @@
              :trace {:by :accumulator :call call :c-acc c-acc :acc acc :law-vars (vec law-vars)
                      :on (t/show call) :integer p1 :adds p2}}))))))
 
-(defn- case-vars [trace]
-  (distinct (keep (fn [x] (when (and (map? x) (= :list-cases (:by x))) (:on x)))
-                  (tree-seq coll? seq trace))))
-
-(defn- conditions [trace]
-  (distinct (keep (fn [x] (when (and (map? x) (= :split (:by x))) (:on x)))
-                  (tree-seq coll? seq trace))))
+(defn- trace-steps
+  "The steps of a proof trace, the maps that say :by, in the order a
+  preorder walk meets them.  A trace shares its subterms, so a subtree seen
+  once is not walked again: tree-seq would expand the sharing, twenty times
+  the distinct nodes in pong's traces."
+  [trace]
+  (let [seen (volatile! #{})
+        out (volatile! [])]
+    (letfn [(walk [x]
+              (when (and (coll? x) (not (contains? @seen x)))
+                (vswap! seen conj x)
+                (when (and (map? x) (contains? x :by)) (vswap! out conj x))
+                (doseq [c (seq x)] (walk c))))]
+      (walk trace))
+    @out))
 
 (defn summary
   "A proof trace in one line."
   [trace]
-  (let [on (->> (tree-seq coll? seq trace)
-                (keep #(when (and (map? %) (= :induction (:by %))) (:on %)))
-                first)
-        cs (map (comp pr-str t/show) (conditions trace))]
+  (let [steps (trace-steps trace)
+        ons (fn [by] (distinct (keep #(when (= by (:by %)) (:on %)) steps)))
+        by? (fn [by] (some #(= by (:by %)) steps))
+        on (first (ons :induction))
+        cs (map (comp pr-str t/show) (ons :split))]
     (str (cond on (str "by induction on " on)
-               (some #(and (map? %) (= :symbolic (:by %))) (tree-seq coll? seq trace)) "by symbolic evaluation"
+               (by? :symbolic) "by symbolic evaluation"
                :else "by rewriting")
          (when (seq cs) (str ", splitting on " (str/join " and " cs)))
-         (when (some #(and (map? %) (= :solver (:by %))) (tree-seq coll? seq trace))
-           ", with the solver")
-         (when (some #(and (map? %) (= :symbolic (:by %))) (tree-seq coll? seq trace)) ", with the solver")
-         (when-let [vs (seq (case-vars trace))]
+         (when (or (by? :solver) (by? :symbolic)) ", with the solver")
+         (when-let [vs (seq (ons :list-cases))]
            (str ", with cases on " (str/join " and " vs)))
-         (when-let [gs (seq (distinct (keep (fn [x] (when (and (map? x) (= :generalizing (:by x)))
-                                                       (:on x)))
-                                           (tree-seq coll? seq trace))))]
+         (when-let [gs (seq (ons :generalizing))]
            (str ", generalising " (str/join " and " (map pr-str gs))))
-         (when-let [as (seq (distinct (keep (fn [x] (when (and (map? x) (= :accumulator (:by x)))
-                                                       (:on x)))
-                                           (tree-seq coll? seq trace))))]
+         (when-let [as (seq (ons :accumulator))]
            (str ", generalising the accumulator of " (str/join " and " (map pr-str as)))))))
 
 (defn- recompose

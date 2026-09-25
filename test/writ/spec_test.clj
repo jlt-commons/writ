@@ -601,3 +601,12 @@
   (let [r (spec/check 'writ.spec-demo.flow-spec {:seed 42})]
     (is (= '[insert] (:off-graph r)))
     (is (str/includes? (:message r) "not a step of any graph or machine: insert"))))
+
+(deftest a-quoted-list-and-vector-are-different-terms
+  ;; '(a b) and '[a b] are = in Clojure, so a cache keyed on the term alone
+  ;; ran a law about the list with the fn compiled for the vector
+  (let [ev (@#'spec/evaluator 'writ.spec-test)]
+    (is (true? (ev [] '(vector? (quote [a b])) {})))
+    (is (false? (ev [] '(vector? (quote (a b))) {})))
+    (is (= {:k [1]} (ev [] '(quote {:k [1]}) {})))
+    (is (list? (:k (ev [] '(quote {:k (1)}) {}))))))

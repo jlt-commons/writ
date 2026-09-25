@@ -683,9 +683,10 @@
   "Compile and cache term fns: (ev vars term env) runs `term` with the
   variables bound from env."
   [spec-ns]
+  ;; keyed by the printed term: '(a b) and '[a b] are =, but not the same term
   (let [cache (atom {})]
     (fn [vars term env]
-      (let [k [vars term]
+      (let [k (pr-str [vars term])
             f (or (get @cache k)
                   (let [f (binding [*ns* (the-ns spec-ns)]
                             (eval (list 'fn (vec vars) term)))]
@@ -783,6 +784,8 @@
       (let [[_ [x t] body] p] (recur body (conj bs [x t])))
       [bs p])))
 
+(def ^:private witness-trials 1000)
+
 (defn- test-law
   [ctx {:keys [name prop]} {:keys [trials seed max-size]}]
   (let [[bs body] (leading-foralls prop)
@@ -797,13 +800,18 @@
            :detail (or (:detail r) [[body "the hypothesis does not hold"]])}))
 
       ;; existential: a witness is a counterexample to its negation, so
-      ;; test.check finds it and shrinks it to the simplest one
+      ;; test.check finds it and shrinks it to the simplest one.  The search
+      ;; stops at the first, so a rare one -- a pong game a point from won,
+      ;; with the ball past the paddle -- is looked for harder than a law
+      ;; is tested: at least witness-trials values
       (and (empty? bs) (head? body "exists"))
       (let [[ebs inner] (leading-exists body)
             xs (mapv first ebs)
             ctx* (assoc ctx :vars xs)
-            res (qc (prop/for-all* (mapv #(type->gen (second %) (:tenv ctx)) ebs)
-                                   (fn [& vs] (not= :pass (:result (holds ctx* inner (zipmap xs vs)))))))]
+            res (tc/quick-check (max trials witness-trials)
+                  (prop/for-all* (mapv #(type->gen (second %) (:tenv ctx)) ebs)
+                                   (fn [& vs] (not= :pass (:result (holds ctx* inner (zipmap xs vs))))))
+                  :seed seed :max-size max-size)]
         (if (:pass? res)
           {:law name :status :failed :counterexample {} :seed (:seed res)
            :detail [[(list 'exists (vec (apply concat ebs)) '...)

@@ -2,18 +2,48 @@ name: ci
 
 on: push
 
+# pinned: "latest" is looked up on the GitHub API, which rate-limits the
+# parallel jobs, and a new release would change what CI runs on
+env:
+  JOLT_VERSION: v0.8.12
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install jolt
         run: |
           sudo apt-get update
           sudo apt-get install -y liblz4-1 zlib1g libtinfo6
-          curl -sL https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash
+          curl -sL https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash -s -- --version "$JOLT_VERSION"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: writ tests
         run: jolt -M:test
-      - name: examples tests
-        run: cd examples && jolt -M:test
+
+  # one job per example, so they run side by side
+  examples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        example: [fetch, life, pong, screens, shortener]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jolt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblz4-1 zlib1g libtinfo6
+          curl -sL https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash -s -- --version "$JOLT_VERSION"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      # proofs found before; writ takes one only when writ, the spec and the
+      # code are all unchanged, so an older cache is safe to start from
+      - uses: actions/cache@v4
+        with:
+          path: examples/.writ-cache
+          key: writ-cache-${{ matrix.example }}-${{ hashFiles('src/**', 'examples/src/**', 'examples/test/**') }}
+          restore-keys: writ-cache-${{ matrix.example }}-
+      - name: ${{ matrix.example }}
+        run: cd examples && jolt -M:test ${{ matrix.example }}.core-test
