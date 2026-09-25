@@ -5,6 +5,7 @@ on: push
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install jolt
@@ -15,5 +16,22 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: writ tests
         run: jolt -M:test
-      - name: examples tests
-        run: cd examples && jolt -M:test
+
+  # one job per example, so they run side by side
+  examples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        example: [fetch, life, pong, screens, shortener]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install jolt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y liblz4-1 zlib1g libtinfo6
+          curl -sL https://raw.githubusercontent.com/jolt-lang/jolt/main/install | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: ${{ matrix.example }}
+        run: cd examples && jolt -M:test ${{ matrix.example }}.core-test
