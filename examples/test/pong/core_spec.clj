@@ -142,6 +142,15 @@
 
 (law a-game-starts-level (= [0 0] (scores (new-game))))
 
+;; ...and with a serve: counting down, the ball on its way right, the paddles
+;; centred. Without it, a new-game that returned any level game passed, since
+;; the one other law naming it compares step's call of it with itself
+(law a-game-starts-with-a-serve
+  (let [[phase ball ly ry] (new-game)]
+    (and (= :Serving (first phase)) (pos? (second phase))
+         (= ball (serve [:Right]))
+         (= ly (quot (- H PH) 2)) (= ry (quot (- H PH) 2)))))
+
 (defn one-point-at-most? [before after]
   (let [[a b] before [a2 b2] after]
     (and (<= a a2) (<= b b2) (<= (+ a2 b2) (inc (+ a b))))))
