@@ -112,7 +112,7 @@
            (cond (nil? v) t/tnil
                  (and (seq? v) (empty? v)) [:sq t/enil]
                  (sequential? v) (t/value->term v)
-                 (and (set? v) (every? scalar? v)) (into [:call 'hash-set] (map t/lit (sort-by pr-str v)))
+                 (and (set? v) (every? scalar? v)) (into [:call 'hash-set] (map t/lit (t/sort-printed v)))
                  (coll? v) (outside! (str "the literal " (pr-str v)))
                  :else [:lit v]))
     :ref (let [s (:name ast)]
@@ -126,7 +126,7 @@
                  (outside! (str "`" s "` passed as a value"))
                  :else (if-let [[x] (constant ctx s)]
                          (if (set? x)
-                           (into [:call 'hash-set] (map t/lit (sort-by pr-str x)))
+                           (into [:call 'hash-set] (map t/lit (t/sort-printed x)))
                            (t/value->term x))
                          (outside! (str "the name `" s "`")))))
     :if [:if (term-of ctx env (:test ast)) (term-of ctx env (:then ast)) (term-of ctx env (:else ast))]
@@ -172,7 +172,7 @@
                 ;; an order fixed by the values so a term is always the same
                 (let [x (term-of ctx env (second (:args ast)))]
                   (reduce (fn [else m] [:if [:call '= x (t/lit m)] [:lit true] else])
-                          [:lit false] (reverse (sort-by pr-str members))))
+                          [:lit false] (reverse (t/sort-printed members))))
                 (invoke-term ctx env f (mapv #(term-of ctx env %) (:args ast)))))
 
     :vec (t/seq-term (mapv #(term-of ctx env %) (:items ast)))

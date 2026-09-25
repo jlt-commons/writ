@@ -251,7 +251,7 @@
 (defn- lin* [k a] {:c (* k (:c a)) :m (into {} (map (fn [[x v]] [x (* k v)])) (:m a))})
 
 (defn lin->term [{:keys [c m]}]
-  (let [pairs (vec (sort-by (comp pr-str first) (remove (comp zero? second) m)))]
+  (let [pairs (vec (t/sort-printed first (remove (comp zero? second) m)))]
     (cond (empty? pairs) [:lit c]
           (and (zero? c) (= 1 (count pairs)) (= 1 (second (first pairs)))) (ffirst pairs)
           :else [:lin c pairs])))
@@ -635,7 +635,7 @@
   "The term for a plain value: a literal, a sequential or a set of them."
   [v]
   (cond (sequential? v) (let [ts (map value-term v)] (when (every? some? ts) (t/seq-term ts)))
-        (set? v) (let [ts (map value-term (sort-by pr-str v))] (when (every? some? ts) (into [:call 'hash-set] ts)))
+        (set? v) (let [ts (map value-term (t/sort-printed v))] (when (every? some? ts) (into [:call 'hash-set] ts)))
         (or (map? v) (fn? v)) nil
         :else (t/lit v)))
 
@@ -938,7 +938,7 @@
   [ctx hyp vars m]
   (let [unbound? (fn [m c] (some #(and (contains? vars %) (not (contains? m %))) (t/vars c)))
         [plain arith] ((juxt remove filter) #(contains? #{:le :ieq} (head %)) (conjuncts hyp))
-        facts (sort-by pr-str (for [[f v] (:facts ctx) :when (true? v)] f))]
+        facts (t/sort-printed (for [[f v] (:facts ctx) :when (true? v)] f))]
     (letfn [(go [m cs]
               (if-let [c (first cs)]
                 (if (unbound? m c)
