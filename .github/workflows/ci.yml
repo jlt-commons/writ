@@ -25,9 +25,7 @@ jobs:
   # one job per example, so they run side by side
   examples:
     runs-on: ubuntu-latest
-    # pong's checks prove every edge of its graph from the code, the slowest
-    # thing the suite does
-    timeout-minutes: ${{ matrix.example == 'pong' && 180 || 60 }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
