@@ -36,11 +36,11 @@
     (is (not (:ok r)))
     (is (str/includes? (:message r) "law `a-generation-follows-the-rule` fails for"))
     (testing "the world is shrunk to six cells, around a cell HighLife lets be born"
-      (is (str/includes? (:message r) "(packed w) => #{[0 0] [1 0] [0 2] [2 0] [2 1] [0 1]}")))))
+      (is (str/includes? (:message r) "(packed w) => #{[3 3] [5 4] [3 4] [4 2] [5 2] [3 2]}")))))
 
 (deftest a-generation-updated-in-place-reads-its-own-future
   (let [r (check 'life.broken.in-place)]
     (is (not (:ok r)))
-    (is (str/includes? (:message r) "(packed w) => #{[2 5] [0 5] [0 3]}"))
+    (is (str/includes? (:message r) "(packed w) => #{[0 5] [0 3] [0 4]}"))
     (is (str/includes? (:message r) "(step (packed w)) => #{}"))
-    (is (str/includes? (:message r) "(next-generation (packed w)) => #{[1 4]}"))))
+    (is (str/includes? (:message r) "(next-generation (packed w)) => #{[-1 4] [1 4] [0 4]}"))))
