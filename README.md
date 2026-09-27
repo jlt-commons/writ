@@ -968,10 +968,19 @@ uninterpreted functions, and sets of unknown size as predicates. Two sets
 are equal when an element the solver may choose is in both or neither, so
 a law about every world of the Game of Life is one query:
 `the-plane-has-no-favoured-place` is proved for every world, however
-large, not sampled. The solver's search is not trusted. An unsatisfiable
-formula comes with a certificate -- case splits down to Farkas
-combinations, whose sums a few lines of arithmetic check -- and
-`writ.solve.cert` verifies it, as the proof checker does for every step.
+large, not sampled. The search is DPLL(T) with conflict-driven clause
+learning, as SMT solvers do it: two watched literals, first-UIP learning
+with non-chronological backjumps, VSIDS decisions with phase saving, Luby
+restarts, and the simplex of Dutertre and de Moura as the theory, with
+branch-and-bound and Gomory cuts for integrality. Clauses that share no
+variable are solved apart first, as KLEE does. The search is not trusted.
+An unsatisfiable formula comes with a certificate -- the learned clauses
+in order, each justified by reverse unit propagation, a Farkas
+combination or a cut, ending with the empty clause, as a DRUP or LRAT
+checker reads a SAT solver's proof -- and `writ.solve.cert` verifies it,
+as the proof checker does for every step. (`{:engine :dpll}` selects the
+older tree search, whose certificates are case splits down to Farkas
+combinations; both are checked.)
 
 When the solver finds the formula invalid, its model is a counterexample.
 writ turns it back into Clojure values and runs the law on them; if the
@@ -1166,7 +1175,8 @@ of forms, and `writ.book/check-files` checks source files as one book.
   `writ.prove.smt` hands open goals to the solver
 - `writ.solve`: the certifying solver for linear integer arithmetic and
   uninterpreted functions; `writ.solve.pre` turns formulas into clauses,
-  `writ.solve.search` and `writ.solve.simplex` search, and
+  `writ.solve.cdcl` (clause learning, the default) or `writ.solve.search`
+  (the tree search) and `writ.solve.simplex` search, and
   `writ.solve.cert` checks certificates without searching
 - `writ.book`: runs every rule over a namespace's forms
 - `writ.check`: quantities, termination, ordering, effects, arity
