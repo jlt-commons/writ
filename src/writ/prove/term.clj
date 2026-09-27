@@ -51,6 +51,11 @@
   (cond
     (nil? v) tnil
     (vector? v) (with-meta (seq-term (map value->term v)) {:vector true})
+    ;; a map literal is the map built from its entries, in an order fixed by
+    ;; how they print, so the term is always the same
+    (map? v) (into [:call 'hash-map]
+                   (mapcat (fn [[k x]] [(value->term k) (value->term x)])
+                           (sort-by (comp pr-str key) v)))
     (sequential? v) (seq-term (map value->term v))
     :else [:lit v]))
 

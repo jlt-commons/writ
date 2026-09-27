@@ -217,7 +217,21 @@ When a law holds but isn't proved, add what the prover needs in
   may choose, which only adds models; arithmetic on one is left to
   testing. A vector literal is known to be a vector and a `list`, `cons`,
   `map` or `rest` result known not to be, so `vector?`, `sequential?` and
-  `get` on them are decided.
+  `get` on them are decided. A constant's kind (keyword, symbol, string,
+  char) is known, so `keyword?` and `symbol?` are decided too.
+- Maps are modelled: literals, `assoc`, `dissoc`, `merge`, `get`, `(:k m)`,
+  `(m k)`, `contains?`, `count` and equality by entries, keys symbolic or
+  not; `keys` and `vals` are unordered, so `every?` over them works and an
+  order-sensitive use gives up. A map of unknown size (a `(Map K V)`
+  variable) is outside.
+- A recursive definition is unfolded, exactly, while a literal drives it --
+  a pattern walked to its end, a vector of known length -- up to a depth
+  and a count; past them the law is left to testing.
+- A branch that gives up is dropped when the solver shows its path cannot
+  be taken under the law's hypothesis, so `(=> (not (vector? x)) ...)`
+  proves even though the code's vector branch walks elements the prover
+  cannot see. An unknown answer (`vector?` of an opaque value, its `first`)
+  is the same each time it is asked of the same value.
 - The usual reasons a law isn't proved: recursion that needs a lemma about
   a helper (write the lemma), a law about a recursive fn stated over its
   whole output where a pointwise statement would do, or a form outside

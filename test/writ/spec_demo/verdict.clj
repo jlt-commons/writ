@@ -17,3 +17,28 @@
   "The value in an [:ok value] vector, else :bad -- a list is not one."
   [ret]
   (if (and (vector? ret) (= 2 (count ret)) (= :ok (first ret))) (get ret 1) :bad))
+
+(defn with-reason
+  "m with its :reason set."
+  [m r]
+  (assoc m :reason r))
+
+(defn reason-of
+  "m's :reason, or :none."
+  [m]
+  (get m :reason :none))
+
+(defn count-tags
+  "How many keywords xs holds."
+  [xs]
+  (if (empty? xs) 0 (+ (if (keyword? (first xs)) 1 0) (count-tags (rest xs)))))
+
+(defn tags
+  "The keywords in x when it is a vector, else none."
+  [x]
+  (if (vector? x) (count-tags x) 0))
+
+(defn kind
+  "What kind of constant x is."
+  [x]
+  (cond (keyword? x) :kw (symbol? x) :sym :else :other))

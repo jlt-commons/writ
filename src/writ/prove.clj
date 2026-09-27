@@ -128,8 +128,11 @@
         prove (fn [value types]
                 (let [[o g* hs] (subst-all (update opts :types merge types) g hyps {v value})]
                   (prove-goal o g* hs (dec depth))))
-        empty (prove ev et)
-        more (when empty (prove cv ct))]
+        ;; the open case first: without induction it is the one that
+        ;; fails, at the bottom of the split, and the closed lists before
+        ;; it grow with the depth, so they are not solved for nothing
+        more (prove cv ct)
+        empty (when more (prove ev et))]
     (when (and empty more)
       {:by :list-cases :on v :empty empty :cons more})))
 
