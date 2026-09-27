@@ -22,6 +22,7 @@
   writ.solve.pre and writ.solve.cert, and a model is checked by `eval-formula`."
   (:require [writ.solve.pre :as pre]
             [writ.solve.search :as search]
+            [writ.solve.cdcl :as cdcl]
             [writ.solve.simplex :as simplex]
             [writ.solve.cert :as cert]))
 
@@ -51,15 +52,20 @@
 (defn check
   "Is formula f satisfiable?  {:result :sat :model m}, {:result :unsat
   :certificate c} or {:result :unknown :reason s}.  opts: :budget, the
-  most decisions and branch-and-bound splits to make."
+  most decisions and conflicts to make, and :engine, :cdcl (clause
+  learning, the default) or :dpll (the tree search, kept for comparison)."
   [f decls opts]
   (let [{:keys [clauses apps]} (pre/preprocess f decls)
-        budget (or (:budget opts) default-budget)]
+        budget (or (:budget opts) default-budget)
+        sopts {:budget budget :max-pivots (* 100 (max budget 100))}]
     (try
-      (let [r (search/solve clauses {:budget budget :max-pivots (* 100 (max budget 100))})]
+      (let [r (if (= :dpll (:engine opts))
+                (search/solve clauses sopts)
+                (cdcl/solve clauses sopts))]
         (if (:sat r)
           {:result :sat :model (model f decls apps r)}
-          {:result :unsat :certificate {:claim :unsat :proof (:proof r)}}))
+          {:result :unsat :certificate {:claim :unsat
+                                        :proof (if (:lemmas r) {:lemmas (:lemmas r)} (:proof r))}}))
       (catch clojure.lang.ExceptionInfo e
         (if (or (::search/budget (ex-data e)) (::simplex/budget (ex-data e)))
           {:result :unknown :reason (ex-message e)}
