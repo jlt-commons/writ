@@ -300,14 +300,26 @@
                  (not (contains? (:bound info) s)))
         (symbol (name s))))))
 
+;; A place is a column and the path of structural reads below it, each
+;; read a template like (nth % 2) or (rest %).  A fact about a place also
+;; holds of every place above it: a read of nil or () is nil or (), so a
+;; value below that is non-nil or non-empty leaves the ones above it
+;; non-empty.
+
 (defn- shrink-step
-  "[step operand]: step is :dec, :inc or a set of structural needs.  A
-  lookup with a default is not a step: the default can hand the value back."
+  "[step operand read]: step is :dec, :inc or a set of structural needs;
+  read is the structural read as a template over %, nil when an argument
+  other than the operand is not a literal.  A lookup with a default is not
+  a step: the default can hand the value back."
   [t info]
   (let [h (core-head t info)
         args (:args t)
         n (count args)
-        [a b] args]
+        [a b] args
+        lit? (fn [x] (= :lit (:op x)))
+        hole? (fn [x] (= '% x))
+        read (fn [& xs] (when (every? (fn [x] (or (hole? x) (lit? x))) xs)
+                          (apply list h (map (fn [x] (if (hole? x) x (lit-val x))) xs))))]
     (case h
       dec (when (= n 1) [:dec a])
       inc (when (= n 1) [:inc a])
@@ -318,35 +330,65 @@
               (and (= n 2) (= 1 (lit-val a))) [:inc b]
               :else nil)
       (rest pop next nnext butlast first second last peek ffirst)
-      (when (= n 1) [(get shrink-needs h) a])
+      (when (= n 1) [(get shrink-needs h) a (read '%)])
       ;; a literal nil default cannot hand the column back: the read is
       ;; an element or nil, both below a non-nil column
-      (nth get) (when (or (= n 2) (and (= n 3) (= :lit (:op (nth args 2)))
+      (nth get) (when (or (= n 2) (and (= n 3) (lit? (nth args 2))
                                        (nil? (lit-val (nth args 2)))))
-                  [#{:nil} a])
-      drop (when (and (= n 2) (pos-int-lit? a)) [#{:empty :finite} b])
-      nthrest (when (and (= n 2) (pos-int-lit? b)) [#{:empty :finite} a])
-      nthnext (when (and (= n 2) (pos-int-lit? b)) [#{:nil :finite} a])
-      subvec (when (and (<= 2 n 3) (pos-int-lit? b)) [#{:empty :finite} a])
+                  [#{:nil} a (read '% b)])
+      drop (when (and (= n 2) (pos-int-lit? a)) [#{:empty :finite} b (read a '%)])
+      nthrest (when (and (= n 2) (pos-int-lit? b)) [#{:empty :finite} a (read '% b)])
+      nthnext (when (and (= n 2) (pos-int-lit? b)) [#{:nil :finite} a (read '% b)])
+      subvec (when (and (<= 2 n 3) (pos-int-lit? b))
+               [#{:empty :finite} a (apply read '% (rest args))])
       nil)))
 
-(defn- numeric-only? [o] (every? vector? (:needs o)))
+(def ^:private finite-reads
+  "Reads that keep a finite collection finite."
+  '#{rest pop next nnext butlast drop nthrest nthnext subvec})
+
+(declare origin)
+
+(defn- num-need? [need] (and (vector? need) (= :num (first need))))
+
+(defn- numeric-only? [o] (every? num-need? (:needs o)))
+
+(defn- rebuild-origin
+  "A tagged vector, [:Tag f1 .. fn], whose fields are the fields of one
+  place, each read back at its own index, rebuilds that place: it is no
+  larger than it.  The rebuilt value is always non-nil, so it never feeds
+  a fact, and nothing is read below it."
+  [t info stop]
+  (let [items (when (and (= :vec (:op t)) (keyword? (lit-val (first (:items t)))))
+                (rest (:items t)))
+        os (map #(origin % info stop) items)
+        at (fn [i o] (when (and o (:exact? o) (zero? (:net o 0))
+                                (= (list 'nth '% (inc i)) (peek (:path o))))
+                       [(:col o) (pop (:path o))]))
+        places (map-indexed at os)]
+    (when (and (seq items) (every? some? places) (apply = places))
+      (let [[c p] (first places)]
+        {:col c :net 0 :path p :strict? (boolean (seq p)) :exact? false
+         :rebuilt? true :needs (into #{} (mapcat :needs) os)}))))
 
 (defn- origin
   "Where `t` comes from, relative to the column names in `stop`:
-  {:col c :net 0 :strict? false} for an unchanged copy of column c;
-  {:col c :strict? true :needs #{..}} for a strict subterm, where needs
-  are what each step requires of the column; for a dec/inc chain, :net is
-  how far below c the value sits and each dec at depth k needs [:num k]
-  (c minus k proven positive).  Copies, (seq x), let chains, destructure
-  and match temporaries are followed; a loop binder outside `stop` is
-  opaque (recur rebinds it)."
+  {:col c :net 0 :strict? false :path []} for an unchanged copy of column
+  c; {:col c :strict? true :path p :needs #{..}} for a strict subterm at
+  the place [c p], where needs are what each read requires of the place
+  it reads (a bare need is on the column, [:at q need] on the place
+  [c q]); for a dec/inc chain, :net is how far below c the value sits and
+  each dec at depth k needs [:num k] (c minus k proven positive).  :exact?
+  is false when the value is at or below its place, not exactly there;
+  nothing is read below such a value.  Copies, (seq x), let chains,
+  destructure and match temporaries are followed; a loop binder outside
+  `stop` is opaque (recur rebinds it)."
   [t info stop]
   (cond
     (ref? t)
     (let [n (:name t)]
       (cond
-        (contains? stop n) {:col n :net 0 :strict? false :needs #{}}
+        (contains? stop n) {:col n :net 0 :strict? false :needs #{} :path [] :exact? true}
         (contains? (:loops info) n) nil
         (contains? (:binds info) n) (origin (get (:binds info) n) info stop)
         :else nil))
@@ -359,42 +401,57 @@
           coercion? (contains? '#{seq? vector? map?} (core-head (:test t) info))]
       (cond
         (and a b (= (:col a) (:col b)) (= (:net a 0) (:net b 0)))
-        {:col (:col a) :net (:net a 0) :strict? (and (:strict? a) (:strict? b))
-         :needs (into (:needs a) (:needs b))}
+        (let [pa (:path a) pb (:path b)
+              common (vec (map first (take-while (fn [[x y]] (= x y)) (map vector pa pb))))]
+          {:col (:col a) :net (:net a 0) :strict? (and (:strict? a) (:strict? b))
+           :needs (into (:needs a) (:needs b)) :path common
+           :exact? (and (:exact? a) (:exact? b) (= pa pb))
+           :rebuilt? (or (:rebuilt? a) (:rebuilt? b))})
         (and coercion? (or a b) (not (and a b)))
         (assoc (or a b) :strict? false :needs #{} :net 0)
         :else nil))
 
     (= :invoke (:op t))
-    (if-let [[step x] (shrink-step t info)]
+    (if-let [[step x read] (shrink-step t info)]
       (when-let [o (origin x info stop)]
         (case (if (vector? step) (first step) step)
           :dec (when (numeric-only? o)
                  (let [k (:net o 0)]
-                   {:col (:col o) :net (inc k) :strict? true
-                    :needs (conj (:needs o) [:num k])}))
+                   (assoc o :net (inc k) :strict? true
+                          :needs (conj (:needs o) [:num k]))))
           :sub (when (numeric-only? o)
                  (let [k (:net o 0) d (second step)]
-                   {:col (:col o) :net (+ k d) :strict? true
-                    :needs (into (:needs o) (for [j (range d)] [:num (+ k j)]))}))
+                   (assoc o :net (+ k d) :strict? true
+                          :needs (into (:needs o) (for [j (range d)] [:num (+ k j)])))))
           ;; inc undoes a dec; back at (or past) the column is not smaller
           :inc (when (and (numeric-only? o) (pos? (:net o 0)))
                  (let [k (dec (:net o 0))]
                    (assoc o :net k :strict? (pos? k))))
-          (when (and (numeric-only? o) (zero? (:net o 0)) (empty? (:needs o)))
-            {:col (:col o) :net 0 :strict? true :needs (into (:needs o) step)})
-          ))
+          ;; a structural read, at any depth of reads before it
+          (when (and (zero? (:net o 0)) (:exact? o) (not-any? num-need? (:needs o)))
+            (let [p (:path o)]
+              {:col (:col o) :net 0 :strict? true :path (if read (conj p read) p)
+               :exact? (some? read)
+               :needs (into (:needs o) (map #(if (empty? p) % [:at p %])) step)}))))
       (when (and (= 'seq (core-head t info)) (= 1 (count (:args t))))
         (origin (first (:args t)) info stop)))
 
+    (= :vec (:op t)) (rebuild-origin t info stop)
+
     :else nil))
+
+(defn- place-of
+  "The place a fact about `o`'s value is about: its column, or [c path]."
+  [o]
+  (when (and o (not (:rebuilt? o)))
+    (if (empty? (:path o)) (:col o) [(:col o) (:path o)])))
 
 (defn- test-facts
   "[then else]: the facts a branch test proves about columns, as sets of
   [:pos c k] / [:nonzero c k] (c minus k is positive / nonzero),
-  [:nonempty c], [:nonnil c] and [:eq c v]."
+  [:nonempty place], [:nonnil place] and [:eq c v]."
   [test info stop]
-  (let [col (fn [e] (:col (origin e info stop)))
+  (let [col (fn [e] (place-of (origin e info stop)))
         num (fn [e] (let [o (origin e info stop)]
                       (when (and o (numeric-only? o)) [(:col o) (:net o 0)])))
         num-fact (fn [f e] (if-let [[c k] (num e)] #{[f c k]} #{}))
@@ -471,31 +528,44 @@
 
 (defn- case-clause-facts
   "Facts a `case` clause proves: when its test constants are all non-nil,
-  the scrutinee is non-nil there, and so is the column an element read
-  like (first x) took it from -- (first nil) is nil."
+  the scrutinee is non-nil there, and so is every place above it -- (first
+  nil) is nil."
   [ast clause info stop]
   (let [test (:test clause)
         consts (if (seq? test) test [test])
-        scrut (:scrut ast)
-        col (fn [e] (:col (origin e info stop)))]
-    (if (and (seq consts) (every? some? consts))
-      (into #{}
-            (comp (remove nil?) (map (fn [c] [:nonnil c])))
-            [(col scrut)
-             (when (contains? '#{first second last peek nth get ffirst}
-                              (core-head scrut info))
-               (col (first (:args scrut))))])
+        place (place-of (origin (:scrut ast) info stop))]
+    (if (and place (seq consts) (every? some? consts))
+      #{[:nonnil place]}
       #{})))
 
+(defn- split-place [place] (if (vector? place) place [place []]))
+
+(defn- prefix? [p q]
+  (and (<= (count p) (count q)) (= (seq p) (seq (take (count p) q)))))
+
+(defn- place-proven?
+  "A fact of one of `kinds` at the place [c p], or any fact strictly below
+  it: whatever is below a nil or empty place is nil or empty too."
+  [kinds c p facts]
+  (some (fn [[k place]]
+          (when (contains? #{:nonnil :nonempty} k)
+            (let [[fc fp] (split-place place)]
+              (and (= fc c) (prefix? p fp)
+                   (or (> (count fp) (count p)) (contains? kinds k))))))
+        facts))
+
 (defn- proven? [need c facts info]
-  (if (vector? need)
+  (if (num-need? need)
     (let [k (second need)]
       (or (contains? facts [:pos c k])
           (and (contains? (:nat info) c) (contains? facts [:nonzero c k]))))
-    (case need
-      :empty (contains? facts [:nonempty c])
-      :nil (or (contains? facts [:nonnil c]) (contains? facts [:nonempty c]))
-      :finite (contains? (:finite info) c))))
+    (let [[p need] (if (vector? need) [(second need) (nth need 2)] [[] need])]
+      (case need
+        :empty (place-proven? #{:nonempty} c p facts)
+        :nil (place-proven? #{:nonnil :nonempty} c p facts)
+        ;; below the column, only reads that keep a collection finite
+        :finite (and (contains? (:finite info) c)
+                     (every? #(contains? finite-reads (first %)) p))))))
 
 (defn- literal-smaller? [a c facts]
   (let [v (lit-val a)]
@@ -503,13 +573,20 @@
          (some (fn [f] (and (= :eq (first f)) (= c (second f)) (< v (nth f 2))))
                facts))))
 
+(defn- place-text
+  "The place [c p] as the Clojure form that reads it."
+  [c p]
+  (reduce (fn [e read] (map (fn [x] (if (= '% x) e x)) read)) (display c) p))
+
 (defn- need-text [need c]
-  (let [c (display c)]
-    (if (vector? need)
-      (let [k (second need)
-            v (if (zero? k) (str "`" c "`") (str "`" c "` minus " k))]
-        (str "`" c "` must first be tested so that " v " is positive (a `pos?` "
-             "test), or nonzero (a `zero?` test) when `" c "` is a Nat"))
+  (if (num-need? need)
+    (let [c (display c)
+          k (second need)
+          v (if (zero? k) (str "`" c "`") (str "`" c "` minus " k))]
+      (str "`" c "` must first be tested so that " v " is positive (a `pos?` "
+           "test), or nonzero (a `zero?` test) when `" c "` is a Nat"))
+    (let [[p need] (if (vector? need) [(second need) (nth need 2)] [[] need])
+          c (pr-str (place-text c p))]
       (case need
         :empty (str "`" c "` must first be tested non-empty (a `seq` or `empty?` test)")
         :nil (str "`" c "` must first be tested non-nil (a truthiness, `some?` or `seq` test)")

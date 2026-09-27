@@ -2445,6 +2445,28 @@
        (spit (cache-file dir spec-ns) (pr-str {:sources sources :proofs proofs}))
        (catch Throwable _ nil)))
 
+(defn- cached-contracts
+  "The contracts proved for target, from the cache when they were proved
+  from the same writ, code, signatures and data; they depend on nothing
+  else, so a change to a law or a proof namespace keeps them."
+  [dir target key prove]
+  (let [f (when dir (io/file dir (str "contracts--" target ".edn")))
+        hit (try (when (and f (.exists f))
+                   (let [c (edn/read-string (slurp f))]
+                     (when (= key (:key c)) (:rules c))))
+                 (catch Throwable _ nil))]
+    (or hit
+        (let [rules (prove)
+              data {:key key :rules rules}]
+          ;; kept only when it reads back as itself
+          (when f
+            (try (let [text (pr-str data)]
+                   (when (= data (edn/read-string text))
+                     (.mkdirs (io/file dir))
+                     (spit f text)))
+                 (catch Throwable _ nil)))
+          rules))))
+
 (defn- refuted
   "The law's failure at the counterexample the solver found, confirmed by
   running the law there; nil when there is none, or running it holds."
@@ -2552,10 +2574,13 @@
                           [(symbol (str target) (str nm)) {:params (mapv plain (:params sig)) :ret (plain (:ret sig))}]))
           ;; what each signed fn returns, proved from its code once: the
           ;; laws' lemmas are instantiated only at terms of their types
-          contracts (delay (let [[ds] @defs] (prover/prove-contracts {:defs ds :tenv tenv :sigs sigs})))
+          cache-dir (when-not (= false (:cache opts)) (or (:cache-dir opts) ".writ-cache"))
+          contracts (delay (let [[ds] @defs]
+                             (cached-contracts cache-dir target
+                                               [@writ-version (book/read-forms (source-url target)) sigs tenv]
+                                               #(prover/prove-contracts {:defs ds :tenv tenv :sigs sigs}))))
           ;; a proof found before, from the same law, lemmas, code, spec,
           ;; proof namespace and writ, is the same proof
-          cache-dir (when-not (= false (:cache opts)) (or (:cache-dir opts) ".writ-cache"))
           sources (delay (pr-str [@writ-version
                                   (map second (lib-pairs target))
                                   (book/read-forms (source-url spec-ns))
