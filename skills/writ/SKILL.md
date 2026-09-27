@@ -97,6 +97,12 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
 - An edge into plain types of their own is data flow only, checked
   against the signatures. A spec of plain functions still has a graph:
   the data the problem moves through.
+- An edge argument written `'name` is not a type but the spec's own value
+  of that name, passed as is: `[scan (Vec Pattern) 'yes Nat]` hands
+  `scan` the spec's `yes` guard, since a fn cannot be generated.
+- `:tested {state "why"}` lets the edges out of a state off proof, as
+  `{:require :tested :because "why"}` does for a law. A report says so when
+  such an edge gets proved after all, so the marker can go.
 - `:start`, `:final`, `:never`, `:before` are rules of the graph itself.
   With every edge proved, `:never` and `:before` hold for every run of the
   code. Reachability and `:final` say each step can happen, not that a
@@ -141,7 +147,11 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
   declared data. `(List T)` is any seq: list, vector, lazy seq or nil.
   A generated `Int` stays within -50..50 and a `Nat` within 0..50 (the
   default `:max-size`), so a quantified law never reaches a value like
-  `-127`. Anchor such values with a law that names them.
+  `-127`. Anchor such values with a law that names them. A quarter of the
+  time a `Keyword`, `Int`, `Nat` or `Any` is instead one of the literals the
+  target's code mentions (with each integer's neighbours), and an `Any` is
+  sometimes a vector tagged with one of its keywords, so a branch on
+  `(= :normal reason)` or `(case (first ret) :reply ...)` is reached.
 - A law is built from:
   - `(= a b)`
   - `(and P ...)`
@@ -155,13 +165,18 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
   a target public fn: the check fails and says to rename the helper.
   Laws cannot quantify over fn types, because no generator exists for
   them.
-- `(calls f [g str/join])`: `f`'s direct calls are exactly this set. A
+- `(calls f [g str/join])`: `f`'s direct calls are exactly this set.
+  Multi-arity fns and macros are read too: a macro calls what it calls as
+  it expands and what its expansion names. Name another namespace's fns
+  in full (`ensemble.signal/on-signal`) when that namespace is not written
+  yet, so the spec loads, and `plan` runs, before the code exists. A
   simple name is a target fn; a qualified one is a fn of another
   namespace, through the spec's aliases. Called or passed as a value both
   count. clojure.core, host members, self-recursion and locals that
   shadow a fn do not. `(calls f {:through [g] :not [h]})` states reach
-  instead: `f` reaches `g` through any chain of its namespace's fns, and
-  never reaches `h`. See [The call graph](#the-call-graph).
+  instead: `f` reaches `g` through any chain of calls, into the project
+  namespaces `f`'s namespace requires as well (not clojure.* or jolt.*),
+  and never reaches `h`. See [The call graph](#the-call-graph).
 - `(flow f [param ...] [link link ...] ...)`: the path data takes through
   `f`. See [Flows](#flows).
 
@@ -194,6 +209,15 @@ When a law holds but isn't proved, add what the prover needs in
   hypothesis hold at any acc (a fold's accumulator), `:use` only these
   lemmas and laws, `:strategy` `:symbolic` / `:induction` / `:rewriting`,
   `:fuel` more rewrites. It only steers the search.
+- The prover reads the target and the project namespaces it requires, so a
+  pure core split over several namespaces is proved as one. A value of
+  type `Any` is modelled as an integer, a constant, a boolean, nil, or an
+  opaque value that can only be passed along and compared. A numeric test
+  or a lookup on an opaque value is some boolean or some value the solver
+  may choose, which only adds models; arithmetic on one is left to
+  testing. A vector literal is known to be a vector and a `list`, `cons`,
+  `map` or `rest` result known not to be, so `vector?`, `sequential?` and
+  `get` on them are decided.
 - The usual reasons a law isn't proved: recursion that needs a lemma about
   a helper (write the lemma), a law about a recursive fn stated over its
   whole output where a pointwise statement would do, or a form outside
@@ -419,7 +443,12 @@ law runs until it is fixed. After that, each law has a `:status`:
 
 Each law also has `:evidence`, `:proof` (proved, evaluated, witnessed) or
 `:test`, and the report's `:proof` counts them:
-`{:require :tested :proved 6 :tested 1 :laws 7}`.
+`{:require :tested :proved 6 :general 4 :tested 1 :laws 7}`. `:general`
+is how many of the proved laws are `forall` laws, true for every input;
+the rest hold on particular values (a closed law, an `exists` witness), and
+the summary line says so: `6 of 7 laws proved (4 for every input, 2 on
+particular values)`. A spec whose proofs are mostly particular values says
+little beyond its examples, however many laws it proves.
 
 A passing report lists, per signed fn, how many laws call it and how many
 stand-ins of each kind they rejected:

@@ -53,7 +53,8 @@
             [writ.prove :as prover]
             [clojure.test.check :as tc]
             [clojure.test.check.generators :as gen]
-            [clojure.test.check.properties :as prop]))
+            [clojure.test.check.properties :as prop]
+            [clojure.test.check.rose-tree :as rose]))
 
 (defn- fail! [& msg]
   (throw (ex-info (str "Writ: " (apply str msg)) {:writ/error true})))
@@ -256,7 +257,7 @@
          (-register! '~(ns-name *ns*) :refine '~{:name nm :var v :base base :pred pred
                                                  :pred-name pred-name}))))
 
-(def ^:private graph-keys #{:states :edges :start :never :before :final})
+(def ^:private graph-keys #{:states :edges :start :never :before :final :tested})
 
 (def ^:private projections
   "clojure.core fns an edge may use to take a state out of a tuple state:
@@ -283,7 +284,11 @@
   fit: it takes the state's base type, and returns the targets' base
   type.  :start is a state, or [state value] with a value in it.
   :never [a b], :before [a b] and :final are rules of the graph itself,
-  as for `machine`; with every edge proved they hold for every run."
+  as for `machine`; with every edge proved they hold for every run.
+
+  :tested {state \"why\"} lets the edges out of state off proof, as a law's
+  {:require :tested :because \"why\"} does: their obligations are tested,
+  and every report shows the reason."
   [nm m]
   (let [where (str "`graph " nm "`")]
     (when-not (simple-sym? nm)
@@ -295,6 +300,13 @@
     (let [states (set (keys (:states m)))
           known! (fn [what s] (when-not (contains? states s)
                                 (fail! where ": " what " names " (pr-str s) ", which is not a state")))]
+      (when-let [t (:tested m)]
+        (when-not (map? t)
+          (fail! where ": :tested is {state \"why it cannot be proved yet\"}, had " (pr-str t)))
+        (doseq [[st why] t]
+          (known! ":tested" st)
+          (when-not (and (string? why) (not (str/blank? why)))
+            (fail! where ": :tested " (pr-str st) " needs the reason its edges cannot be proved yet"))))
       (doseq [[from es] (:edges m)]
         (known! "an edge" from)
         (when-not (map? es)
@@ -559,6 +571,21 @@
 
 (declare type->gen)
 
+(defn- int-rose
+  "n with the shrinks test.check gives an integer: 0 first, then halfway
+  back to n, and so on, each shrinking again."
+  [n]
+  (rose/make-rose n (map (fn [d] (int-rose (- n d)))
+                         (take-while #(not= 0 %) (iterate #(quot % 2) n)))))
+
+(defn- seed-gen
+  "One of a code's literals.  gen/elements shrinks only to the literals
+  listed before it, so a failing 251 stays near 251; an integer literal
+  here shrinks as any integer does, toward the smallest that still fails."
+  [seeds]
+  (gen/gen-fmap (fn [r] (rose/bind r #(if (integer? %) (int-rose %) (rose/pure %))))
+                (gen/elements seeds)))
+
 (defn- data-gen
   "A data value is a vector headed by its constructor keyword: [:Leaf],
   [:Node l v r].  Recursive fields get half the size, and at size 0 only
@@ -592,6 +619,21 @@
       (and (symbol? t) (seq (get-in tenv [::bias t])))
       (gen/frequency [[1 (type->gen t (update tenv ::bias dissoc t))]
                       [3 (gen/elements (vec (get-in tenv [::bias t])))]])
+
+      ;; a law's own values: now and then, one of the scalars the target's
+      ;; code mentions, since the code branches on exactly those
+      (and (symbol? t) (seq (get-in tenv [::seeds t])))
+      (let [seeds (vec (get-in tenv [::seeds t]))
+            plain (type->gen t (update tenv ::seeds dissoc t))
+            tags (vec (filter keyword? seeds))]
+        (gen/frequency
+          (cond-> [[3 plain] [1 (seed-gen seeds)]]
+            ;; code that dispatches on a tag, (case (first ret) :reply ...),
+            ;; wants tagged vectors: one of its keywords, then a few values
+            (and (= 'Any t) (seq tags))
+            (conj [1 (gen/fmap (fn [[k xs]] (into [k] xs))
+                               (gen/tuple (gen/elements tags)
+                                          (gen/vector (gen/one-of [plain (seed-gen seeds)]) 0 4)))]))))
 
       (symbol? t)
       (case t
@@ -1188,15 +1230,33 @@
         (remove locals (filter symbol? (tree-seq coll? seq body)))))))
 
 (defn- graph-of
-  "{f #{callee}} for each defn in `forms`, in the terms of `callee`."
+  "{f #{callee}} for each defn and defmacro in `forms`, in the terms of
+  `callee`.  A macro calls what it calls as it expands and what its
+  expansion names, so an effect shell's receive or with-x macro can be
+  held to the layers it must go through."
   [forms]
   (let [nsf (first (filter #(head? % "ns") forms))
         names (assoc-in (ns-names nsf) [:aliases :self] (second nsf))
-        defns (keep #(when (ck/defn-form? %) (defn-parts %)) forms)
+        defns (keep #(when (or (ck/defn-form? %) (head? % "defmacro")) (defn-parts %)) forms)
         own (set (map :name defns))]
-    (into {} (for [{nm :name params :params body :body} defns
-                   :when (vector? params)]
-               [nm (disj (into #{} (keep #(callee % own names)) (body-refs params body own))
+    (into {} (for [{nm :name params :params body :body head :head} defns
+                   :let [arities (cond (vector? params) [[params body]]
+                                       (seq? params) (for [a (cons params body)
+                                                           :when (and (seq? a) (vector? (first a)))]
+                                                       [(first a) (rest a)]))]
+                   :when (seq arities)]
+               ;; a multi-arity fn calls whatever any of its arities calls;
+               ;; one arity delegating to another is self-reference, left out
+               [nm (disj (into (into #{} (comp (mapcat (fn [[ps b]] (body-refs ps b own)))
+                                               (keep #(callee % own names)))
+                                     arities)
+                               ;; what a macro's expansion names: syntax-quote
+                               ;; qualifies it, so it reads as quoted symbols
+                               (when (= "defmacro" (name head))
+                                 (keep #(when (and (symbol? %) (namespace %)
+                                                   (not= "clojure.core" (namespace %)))
+                                          (callee % own names))
+                                       (tree-seq coll? seq body))))
                          nm)]))))
 
 (defn- home
@@ -1374,13 +1434,36 @@
                (seq errors) (assoc :errors (vec errors)))))))
 
 (defn call-graph
-  "The call graph of a namespace, read from its source without loading
-  it: {f #{g ...}} for each of its defns.  A callee is one of its own fns
+  "The call graph of a namespace, read from its source: {f #{g ...}} for
+  each of its defns and macros.  The namespace is loaded only so that
+  ::alias/k keywords read as they compile; nothing of it is run.  A callee is one of its own fns
   by simple name, or a fn of another namespace, qualified in full.
   clojure.core, host members and self-recursion are left out.  Effect
   code is read too; nothing here is checked."
   [ns-sym]
   (graph-of (book/read-forms (source-url ns-sym))))
+
+(defn- wide-graph
+  "The call graph across the project namespaces reachable from ns-sym,
+  every fn by its qualified name, so a reach can go from a shell through
+  the core it calls into the helpers that core calls.  clojure.* and
+  jolt.* are left out, as is a namespace whose source cannot be read."
+  [ns-sym forms forms-of]
+  (loop [todo [[ns-sym forms]], seen #{}, g {}]
+    (if-let [[n fs] (first todo)]
+      (if (contains? seen n)
+        (recur (rest todo) seen g)
+        (let [local (graph-of fs)
+              q (fn [x] (if (namespace x) x (symbol (str n) (str x))))
+              g (into g (for [[f cs] local] [(q f) (set (map q cs))]))
+              libs (distinct (for [cs (vals local), c cs
+                                   :let [lib (some-> (namespace c) symbol)]
+                                   :when (and lib (not (re-find #"^(clojure|jolt)\." (str lib)))
+                                              (not (contains? seen lib)))]
+                               lib))
+              more (keep (fn [lib] (when-let [fs (try (forms-of lib) (catch Throwable _ nil))] [lib fs])) libs)]
+          (recur (concat (rest todo) more) (conj seen n) g)))
+      g)))
 
 (defn- check-calls
   "Each `calls` form against the call graph of the namespace its fn is in:
@@ -1388,6 +1471,10 @@
   [{:keys [target calls]} forms forms-of]
   (vec (for [[qf gs] (sort-by (comp str first) calls)]
          (let [[hns f] (home target qf)
+               ;; a fn of f's own namespace, however it is written, is the
+               ;; graph's simple name
+               own (fn [g] (if (= (namespace g) (str hns)) (symbol (name g)) g))
+               gs (if (map? gs) (update-vals gs #(mapv own %)) (mapv own gs))
                graph (graph-of (if (= hns target) forms (forms-of hns)))
                actual (get graph f)
                names (if (map? gs) (apply concat (vals gs)) gs)
@@ -1403,8 +1490,15 @@
                           " defines no fn `" unknown "`")}
 
              (map? gs)
-             (let [missing (vec (remove #(reach-path graph f %) (:through gs)))
-                   reached (vec (keep #(reach-path graph f %) (:not gs)))]
+             ;; reach is read across namespaces: a shell reaches a helper
+             ;; through the core it calls
+             (let [wide (wide-graph hns (if (= hns target) forms (forms-of hns)) forms-of)
+                   q (fn [x] (if (namespace x) x (symbol (str hns) (str x))))
+                   ;; a path names the shell's own fns simply, as the spec does
+                   plain (fn [x] (if (= (namespace x) (str hns)) (symbol (name x)) x))
+                   reach (fn [g] (some->> (reach-path wide (q f) (q g)) (mapv plain)))
+                   missing (vec (remove reach (:through gs)))
+                   reached (vec (keep reach (:not gs)))]
                (if (and (empty? missing) (empty? reached))
                  {:fn qf :calls gs :status :ok}
                  {:fn qf :calls gs :status :failed :unreached missing :reached reached}))
@@ -1547,6 +1641,13 @@
 
 (defn- insert-at [v i x] (vec (concat (take i v) [x] (drop i v))))
 
+(defn- fixed-arg?
+  "An edge argument written 'name: not a type to generate, but the spec's
+  own value of that name, passed as is -- how an edge gives a fn a fn
+  argument, a comparator or a guard, which cannot be generated."
+  [a]
+  (and (seq? a) (= 'quote (first a)) (symbol? (second a))))
+
 (defn- subst-var
   "`form` with free occurrences of symbol `x` replaced by `e`.  A binder
   of `x` in a let, fn, loop or quantifier stops it."
@@ -1588,21 +1689,25 @@
                    ref-of #(let [t (plain (ty %))] (when (symbol? t) (get refs t)))]
              :when (every? ref-of tos)
              :let [v (or (:var (ref-of from)) 's)
-                   avs (reduce (fn [acc [i t]] (conj acc (arg-var t i (set (conj acc v)))))
+                   avs (reduce (fn [acc [i t]]
+                                 (conj acc (if (fixed-arg? t) (second t) (arg-var t i (set (conj acc v))))))
                                [] (map-indexed vector args))
-                   binders (vec (concat [v (ty from)] (interleave avs args)))
+                   binders (vec (concat [v (ty from)]
+                                        (mapcat (fn [a t] (when-not (fixed-arg? t) [a t])) avs args)))
                    call (apply list f (insert-at avs pos v))
                    ;; each target's predicate, of the call itself: the law
                    ;; reads as the spec would write it, (ascending? (isort xs)),
                    ;; the shape the prover takes apart
                    in (fn [t] (let [r (ref-of t)] (subst-var (:pred r) (:var r) call)))
                    lands (fn [ts] (if (next ts) (cons 'or (map in ts)) (in (first ts))))]
-             law (cons {:name (symbol (str gname ":" (name from) ":" f))
-                        :prop (list 'forall binders (lands tos))
-                        :explain (str "a " f " from " (name from) " must land in "
-                                      (str/join " or " (map name tos)))
-                        :graph gname
-                        :total true}
+             law (cons (cond-> {:name (symbol (str gname ":" (name from) ":" f))
+                                :prop (list 'forall binders (lands tos))
+                                :explain (str "a " f " from " (name from) " must land in "
+                                              (str/join " or " (map name tos)))
+                                :graph gname
+                                :total true}
+                         (get-in m [:tested from])
+                         (assoc :opts {:require :tested :because (get-in m [:tested from])}))
                        (for [t tos]
                          {:name (symbol (str gname ":" (name from) ":" f "->" (name t)))
                           :prop (list 'exists binders (lands [t]))
@@ -1670,7 +1775,10 @@
                        (when-not (fits? (base (ty from)) (first ps))
                          [(str edge " passes `" f "` a " (pr-str (base (ty from)))
                                ", but its ann takes " (pr-str (first ps)))])
-                       (for [[a p] (map vector (map base args) (rest ps)) :when (not (fits? a p))]
+                       (for [[a p] (map vector args (rest ps))
+                             :when (not (fixed-arg? a))
+                             :let [a (base a)]
+                             :when (not (fits? a p))]
                          (str edge " passes `" f "` a " (pr-str a) ", but its ann takes " (pr-str p)))
                        (for [t tos :when (not (fits? (base (:ret sig)) (base (ty t))))]
                          (str edge " " (pr-str t) " expects a " (pr-str (base (ty t)))
@@ -1945,6 +2053,28 @@
      'Keyword (set (filter keyword? lits))
      'String (set (filter string? lits))}))
 
+(declare lib-pairs)
+
+(defn- code-seeds
+  "Per scalar type, the values a target's code mentions -- its own and that
+  of the project namespaces it requires, where the prover reads it too: its
+  keyword literals and its integer literals with their neighbours.  A law
+  generates these now and then, so a branch on `(= :normal reason)` or
+  `(< n 3)` is reached even when the type is as wide as Keyword or Any.
+  Strings are left out: a namespace's strings are mostly its docs."
+  [target]
+  (try
+    (let [forms (remove #(head? % "ns") (mapcat second (lib-pairs target)))
+          xs (tree-seq coll? seq forms)
+          kws (set (filter #(and (keyword? %) (nil? (namespace %))) xs))
+          ints (set (filter #(and (integer? %) (<= -1000 % 1000)) xs))
+          near (set (mapcat (fn [n] [(dec n) n (inc n)]) ints))]
+      {'Keyword kws
+       'Int near
+       'Nat (set (filter #(>= % 0) near))
+       'Any (into kws near)})
+    (catch Throwable _ {})))
+
 (defn- such-that-opts
   "How hard to look for a value of a refinement.  A value can be rare --
   a tag and an exact score together -- so it tries many times, and says
@@ -2136,6 +2266,9 @@
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
        (when (and proof (pos? (:laws proof)))
          (str "\n  " (:proved proof) " of " (:laws proof) " laws proved"
+              (when (and (:general proof) (pos? (:proved proof)))
+                (str " (" (:general proof) " for every input, "
+                     (- (:proved proof) (:general proof)) " on particular values)"))
               (when (= :proved (:require proof)) " (the spec requires proof)")
               (when-let [ts (seq (filter #(= :test (:evidence %)) laws))]
                 (str "; tested, not proved: " (str/join ", " (map :law ts))))))
@@ -2143,8 +2276,11 @@
                     (str "\n  lemma `" l "` proved " p)))
        (apply str (for [{l :law p :proof st :status} laws :when (= :proved st)]
                     (str "\n  law `" l "` proved " p)))
-       (apply str (for [{l :law b :because} laws :when b]
-                    (str "\n  law `" l "` is only tested: " b)))
+       (apply str (for [{l :law b :because st :status} laws :when b]
+                    (if (= :proved st)
+                      (str "\n  law `" l "` is marked {:require :tested}, but it is now proved;"
+                           " drop the marker so a regression is caught")
+                      (str "\n  law `" l "` is only tested: " b))))
        (when ok
          (apply str (for [{f :fn n :laws imps :rejected} rejected]
                       (str "\n  `" f "`: " n (if (= 1 n) " law, " " laws, ")
@@ -2361,6 +2497,36 @@
                     [bs p])))]
     (= (canon p) (canon q))))
 
+(defn- lib-pairs
+  "The target and the project namespaces it requires, transitively, as
+  prover pairs [ns forms refers]: refers maps each alias-qualified or
+  referred name a namespace uses to the fn it names.  A required namespace
+  whose source is not on the classpath -- clojure.core's, jolt's, a
+  library's jar -- is left out, and a call into it stays outside."
+  [target]
+  (loop [todo [target], seen #{}, out []]
+    (if-let [n (first todo)]
+      (if (contains? seen n)
+        (recur (rest todo) seen out)
+        (let [forms (try (book/read-forms (source-url n)) (catch Throwable _ nil))
+              nsf (first (filter #(head? % "ns") forms))]
+          (if (nil? nsf)
+            (recur (rest todo) (conj seen n) out)
+            (let [{:keys [aliases refers]} (ns-names nsf)
+                  libs (distinct (concat (vals aliases) (map (comp symbol namespace) (vals refers))))
+                  project? (fn [lib] (not (re-find #"^(clojure|jolt)\." (str lib))))
+                  deps (filter project? libs)
+                  defs-in (fn [lib] (set (for [f (try (book/read-forms (source-url lib)) (catch Throwable _ nil))
+                                               :when (and (seq? f) (contains? '#{defn defn-} (first f)))]
+                                           (second f))))
+                  ref-map (merge
+                            (into {} (for [[a lib] aliases :when (project? lib)
+                                           f (defs-in lib)]
+                                       [(symbol (str a) (str f)) (symbol (str lib) (str f))]))
+                            (into {} (for [[r q] refers :when (project? (symbol (namespace q)))] [r q])))]
+              (recur (concat (rest todo) deps) (conj seen n) (conj out [n forms ref-map]))))))
+      out)))
+
 (defn- prove-laws
   "Try to prove each law that ran.  A tested law the prover proves becomes
   :proved; a law it cannot prove keeps :tested with the reason.  A law
@@ -2370,8 +2536,8 @@
     results
     (let [proof-ns (::proof-ns opts)
           defs (delay (prover/definitions
-                        (cond-> [[target (book/read-forms (source-url target))]
-                                 [spec-ns (mapv refine->defn (book/read-forms (source-url spec-ns)))]]
+                        (cond-> (conj (lib-pairs target)
+                                      [spec-ns (mapv refine->defn (book/read-forms (source-url spec-ns)))])
                           ;; a proof namespace's own defns, reading the
                           ;; target's fns it refers by their plain names --
                           ;; the fns of the target checked, when a stand-in
@@ -2391,7 +2557,7 @@
           ;; proof namespace and writ, is the same proof
           cache-dir (when-not (= false (:cache opts)) (or (:cache-dir opts) ".writ-cache"))
           sources (delay (pr-str [@writ-version
-                                  (book/read-forms (source-url target))
+                                  (map second (lib-pairs target))
                                   (book/read-forms (source-url spec-ns))
                                   (some-> (::proof-ns opts) source-url book/read-forms)]))
           cached (atom (if cache-dir (load-proofs cache-dir [spec-ns target] @sources) {}))
@@ -2510,6 +2676,9 @@
 (defn- proof-coverage [results level]
   {:require level
    :proved (count (filter #(= :proof (:evidence %)) results))
+   ;; of those, the ones about every input: a closed law, run on the values
+   ;; it names, is an example however it was proved
+   :general (count (filter #(and (= :proof (:evidence %)) (::general %)) results))
    :tested (count (filter #(= :test (:evidence %)) results))
    :laws (count results)})
 
@@ -2575,7 +2744,7 @@
                                                                       (plain (:ret s)))
                                                        k)))
                                anns)
-             ctx {:ev (evaluator spec-ns) :tenv tenv}
+             ctx {:ev (evaluator spec-ns) :tenv (assoc tenv ::seeds (code-seeds target))}
              ;; only what this check wrapped is unwrapped after it, so a
              ;; caller's own instrument stays in place
              wrapped (wrap! e)
@@ -2649,7 +2818,9 @@
                          {:fn f :survivors s}))
              lemma-results (mapv #(-> % (dissoc :prop :lemma) (set/rename-keys {:law :lemma}))
                                  (filter :lemma results))
-             results (mapv #(dissoc % :prop) (remove :lemma results))
+             ;; whether each law is about every input, read before :prop goes
+             results (mapv #(cond-> (dissoc % :prop) (head? (:prop %) "forall") (assoc ::general true))
+                           (remove :lemma results))
              target-forms (book/read-forms (source-url target))
              forms-of (memoize #(book/read-forms (source-url %)))
              call-results (check-calls e target-forms forms-of)
