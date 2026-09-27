@@ -5,7 +5,7 @@ on: push
 # pinned: "latest" is looked up on the GitHub API, which rate-limits the
 # parallel jobs, and a new release would change what CI runs on
 env:
-  JOLT_VERSION: v0.8.12
+  JOLT_VERSION: v0.8.13
 
 jobs:
   test:
