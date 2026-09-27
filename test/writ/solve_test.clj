@@ -206,10 +206,24 @@
     (is (seq (farkas-leaves c)))
     (is (rejected? f {} (perturb-multiplier c)))
     (is (rejected? [:and [:< 'x 'y] [:< 'y 'z]] {} c) "a certificate for another formula"))
-  (let [f [:and [:or [:< 'x 0] [:> 'x 5]] [:<= 0 'x 5]]
-        c (:certificate (s/check f {} {}))]
-    (is (s/verify f {} c))
-    (is (rejected? f {} (drop-branch c))))
+  (testing "a tree proof, from the DPLL search"
+    (let [f [:and [:or [:< 'x 0] [:> 'x 5]] [:<= 0 'x 5]]
+          c (:certificate (s/check f {} {:engine :dpll}))]
+      (is (s/verify f {} c))
+      (is (rejected? f {} (drop-branch c)))))
+  (testing "a lemma list, from the CDCL search"
+    ;; refuted only by arithmetic, so the empty clause needs the lemmas before it
+    (let [f [:and [:or [:< 'x 'y] [:< 'x 0]] [:< 'y 'z] [:< 'z 'x] [:<= 0 'x]]
+          c (:certificate (s/check f {} {}))
+          ls (:lemmas (:proof c))]
+      (is (s/verify f {} c))
+      (is (seq ls))
+      (is (rejected? f {} (assoc-in c [:proof :lemmas] (vec (rest ls)))) "a lemma dropped")
+      (is (rejected? f {} (assoc-in c [:proof :lemmas] (vec (butlast ls)))) "no empty clause at the end")
+      (is (rejected? f {} (assoc-in c [:proof :lemmas] [[[] {:rup true}]])) "the empty clause alone")
+      (is (rejected? f {} (assoc-in c [:proof :lemmas] (into [[[[:le {'x 1} -100]] {:rup true}]] ls)))
+          "a lemma that does not follow")
+      (is (rejected? f {} (perturb-multiplier c)) "a Farkas multiplier changed")))
   (let [f [:= [:* 2 'x] 1]
         c (:certificate (s/check f {} {}))]
     (is (rejected? f {} (assoc c :proof {:farkas []})))

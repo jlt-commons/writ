@@ -17,6 +17,24 @@
                               their sum weighted by rationals k >= 0 is
                               0 <= c for a constant c < 0
 
+  or a list of learned clauses, as a CDCL search derives them:
+
+    {:lemmas [[clause justification] ...]}
+
+  each clause following from the clauses before it (the formula's, then the
+  lemmas already checked), by one of
+
+    {:rup true}               reverse unit propagation: with every literal of
+                              the clause false, unit propagation over the
+                              clauses so far falsifies one of them
+    {:farkas [[l k] ...]}     the clause is the negations of the l, whose
+                              combination is 0 <= a negative constant
+    {:cut [[l k] ...] :lit m} the clause is m and the negations of the l, and
+                              m is their Chvatal-Gomory cut
+
+  and the last is the empty clause.  These are the checks a DRUP or LRAT
+  proof checker makes for a SAT solver, plus the arithmetic ones.
+
   Each is plainly sound.  A split covers every integer assignment, since
   over the integers a.x <= c or -a.x <= -c - 1, and a boolean is true or
   false.  A clause false everywhere on a branch leaves the branch without
@@ -99,6 +117,55 @@
     (contains? p :farkas) (farkas! path (:farkas p))
     :else (reject! "not a proof step: " (pr-str p))))
 
+(defn- rup!
+  "With every literal of c false, unit propagation over clauses falsifies
+  one of them."
+  [clauses c]
+  (loop [true-lits (set (map pre/negate c))]
+    (let [r (reduce (fn [units cl]
+                      (if (some true-lits cl)
+                        units
+                        (let [open (remove #(contains? true-lits (pre/negate %)) cl)]
+                          (cond (empty? open) (reduced ::conflict)
+                                (empty? (rest open)) (conj units (first open))
+                                :else units))))
+                    #{} clauses)]
+      (cond
+        (= ::conflict r) true
+        ;; a literal and its negation both forced: that is the conflict
+        (some #(or (contains? r (pre/negate %)) (contains? true-lits (pre/negate %))) r) true
+        (empty? (remove true-lits r))
+        (reject! "the lemma " (pr-str c) " does not follow by unit propagation")
+        :else (recur (into true-lits r))))))
+
+(defn- lemma!
+  "Lemma c follows from clauses by its justification j."
+  [clauses c j]
+  (when-not (and (vector? c) (every? literal! c))
+    (reject! "not a clause: " (pr-str c)))
+  (cond
+    (:rup j) (rup! clauses c)
+    (contains? j :farkas)
+    (let [ls (map first (:farkas j))]
+      (when-not (= (set c) (set (map pre/negate ls)))
+        (reject! "a Farkas lemma is not the negations of what it combines: " (pr-str c)))
+      (farkas! (set ls) (:farkas j)))
+    (contains? j :cut)
+    (let [ls (map first (:cut j))
+          m (:lit j)]
+      (when-not (= (set c) (conj (set (map pre/negate ls)) m))
+        (reject! "a cut lemma is not its cut and the negations of what it combines: " (pr-str c)))
+      (when-not (= m (cut (set ls) (:cut j)))
+        (reject! "a cut lemma's literal is not the cut: " (pr-str m))))
+    :else (reject! "a lemma needs a justification: " (pr-str j))))
+
+(defn- lemmas!
+  "Each lemma follows from the clauses before it, and the last is empty."
+  [clauses ls]
+  (when-not (and (sequential? ls) (seq ls) (= [] (first (last ls))))
+    (reject! "a lemma list must end with the empty clause"))
+  (reduce (fn [cls [c j]] (lemma! cls c j) (conj cls c)) clauses ls))
+
 (defn verify
   "True when certificate c proves its claim of formula f under decls;
   otherwise throws, saying which step is wrong."
@@ -107,5 +174,9 @@
                  :unsat f
                  :valid [:not f]
                  (reject! "a certificate claims :unsat or :valid, not " (pr-str (:claim c))))]
-    (check! (:clauses (pre/preprocess target decls)) #{} (:proof c))
+    (let [clauses (:clauses (pre/preprocess target decls))
+          p (:proof c)]
+      (if (and (map? p) (contains? p :lemmas))
+        (lemmas! clauses (:lemmas p))
+        (check! clauses #{} p)))
     true))
