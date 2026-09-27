@@ -53,7 +53,8 @@
             [writ.prove :as prover]
             [clojure.test.check :as tc]
             [clojure.test.check.generators :as gen]
-            [clojure.test.check.properties :as prop]))
+            [clojure.test.check.properties :as prop]
+            [clojure.test.check.rose-tree :as rose]))
 
 (defn- fail! [& msg]
   (throw (ex-info (str "Writ: " (apply str msg)) {:writ/error true})))
@@ -570,6 +571,21 @@
 
 (declare type->gen)
 
+(defn- int-rose
+  "n with the shrinks test.check gives an integer: 0 first, then halfway
+  back to n, and so on, each shrinking again."
+  [n]
+  (rose/make-rose n (map (fn [d] (int-rose (- n d)))
+                         (take-while #(not= 0 %) (iterate #(quot % 2) n)))))
+
+(defn- seed-gen
+  "One of a code's literals.  gen/elements shrinks only to the literals
+  listed before it, so a failing 251 stays near 251; an integer literal
+  here shrinks as any integer does, toward the smallest that still fails."
+  [seeds]
+  (gen/gen-fmap (fn [r] (rose/bind r #(if (integer? %) (int-rose %) (rose/pure %))))
+                (gen/elements seeds)))
+
 (defn- data-gen
   "A data value is a vector headed by its constructor keyword: [:Leaf],
   [:Node l v r].  Recursive fields get half the size, and at size 0 only
@@ -611,13 +627,13 @@
             plain (type->gen t (update tenv ::seeds dissoc t))
             tags (vec (filter keyword? seeds))]
         (gen/frequency
-          (cond-> [[3 plain] [1 (gen/elements seeds)]]
+          (cond-> [[3 plain] [1 (seed-gen seeds)]]
             ;; code that dispatches on a tag, (case (first ret) :reply ...),
             ;; wants tagged vectors: one of its keywords, then a few values
             (and (= 'Any t) (seq tags))
             (conj [2 (gen/fmap (fn [[k xs]] (into [k] xs))
                                (gen/tuple (gen/elements tags)
-                                          (gen/vector (gen/one-of [plain (gen/elements seeds)]) 0 3)))]))))
+                                          (gen/vector (gen/one-of [plain (seed-gen seeds)]) 0 3)))]))))
 
       (symbol? t)
       (case t
