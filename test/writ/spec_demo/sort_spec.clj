@@ -5,20 +5,24 @@
   element. The laws say that and nothing about how it is done, and they
   measure the result with the spec's own vocabulary (`ascending?`,
   `occurrences`), never with the implementation's."
-  (:require [writ.spec :refer [spec ann law graph]]))
+  (:require [writ.spec :refer [spec ann law graph refine]]))
 
 (spec writ.spec-demo.sort)
 
 (ann insert [Nat (List Nat) -> (List Nat)])
 (ann isort  [(List Nat) -> (List Nat)])
 
-(graph sorting
-  {:states {:item Nat, :unsorted (List Nat), :sorted (List Nat)}
-   :edges  {:unsorted {[isort] #{:sorted}}
-            :item     {[insert (List Nat)] #{:sorted}}}})
-
 (defn ascending? [xs]
   (or (empty? xs) (apply <= xs)))
+
+;; a list goes in, a sorted one comes out
+(refine Sorted [xs (List Nat)] (ascending? xs))
+
+(graph sorting
+  {:states {:unsorted (List Nat), :sorted Sorted}
+   :edges  {:unsorted {[isort] #{:sorted}}
+            ;; `_` is where the state goes: (insert x sorted-list)
+            :sorted   {[insert Nat _] #{:sorted}}}})
 
 (defn occurrences [x xs]
   (count (filter #(= x %) xs)))

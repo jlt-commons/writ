@@ -15,9 +15,8 @@
 (ann insert  [Nat Tree -> Tree])
 
 (graph tree
-  {:states {:item Nat, :tree Tree, :listed (List Nat), :size Nat}
-   :edges  {:item {[insert Tree] #{:tree}}
-            :tree {[to-list] #{:listed}, [size] #{:size}}}})
+  {:states {:tree Tree, :listed (List Nat), :size Nat}
+   :edges  {:tree {[insert Nat _] #{:tree}, [to-list] #{:listed}, [size] #{:size}}}})
 
 (defn strictly-ascending? [xs]
   (or (empty? xs) (apply < xs)))

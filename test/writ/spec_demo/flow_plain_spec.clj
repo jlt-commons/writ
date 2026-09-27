@@ -1,22 +1,21 @@
-(ns writ.spec-demo.flow-spec
-  "A graph from a plain type into a refinement: the sorted state says what
-  makes a list sorted, so the edge into it is the sort's law."
-  (:require [writ.spec :refer [spec ann law graph refine]]))
+(ns writ.spec-demo.flow-plain-spec
+  "A graph whose two states are the same plain type: nothing tells a
+  sorted list from an unsorted one."
+  (:require [writ.spec :refer [spec ann law graph]]))
 
 (spec writ.spec-demo.sort)
 
 (ann insert [Nat (List Nat) -> (List Nat)])
 (ann isort  [(List Nat) -> (List Nat)])
 
+(graph sorting
+  {:states {:unsorted (List Nat), :sorted (List Nat)}
+   :edges  {:unsorted {[isort] #{:sorted}}}})
+
 (defn occurrences [x xs] (count (filter #(= x %) xs)))
 (defn ascending? [xs] (or (empty? xs) (apply <= xs)))
 
-(refine Sorted [xs (List Nat)] (ascending? xs))
-
-(graph sorting
-  {:states {:unsorted (List Nat), :sorted Sorted}
-   :edges  {:unsorted {[isort] #{:sorted}}}})
-
+(law sorted (forall [xs (List Nat)] (ascending? (isort xs))))
 (law permutation (forall [x Nat, xs (List Nat)] (= (occurrences x (isort xs)) (occurrences x xs))))
 (law insert-keeps-sorted (forall [x Nat, xs (List Nat)] (=> (ascending? xs) (ascending? (insert x xs)))))
 (law insert-adds (forall [x Nat, xs (List Nat)] (= (occurrences x (insert x xs)) (inc (occurrences x xs)))))

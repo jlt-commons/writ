@@ -9,8 +9,8 @@
 (ann thirds      [Nat -> Nat])
 
 (graph dividing
-  {:states {:n Nat, :part Nat}
-   :edges  {:n {[half] #{:part}, [parity] #{:part}, [half-by-two] #{:part}, [thirds] #{:part}}}})
+  {:states {:n Nat}
+   :edges  {:n {[half] #{:n}, [parity] #{:n}, [half-by-two] #{:n}, [thirds] #{:n}}}})
 
 (law half-halves (forall [n Nat] (= (half n) (quot n 2))))
 (law parity-is-mod-2 (forall [n Nat] (= (parity n) (mod n 2))))

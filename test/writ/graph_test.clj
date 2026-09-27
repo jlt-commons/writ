@@ -48,7 +48,25 @@
     (testing "a law over a refined type"
       (is (= :proved (:status (law-result r 'a-light-counts-up-while-it-shows)))))
     (is (= [{:graph 'signal :status :ok :states 3 :edges 3}] (:graphs r)))
-    (is (str/includes? (:message r) "graph `signal`: 3 edges proved"))))
+    (is (str/includes? (:message r) "graph `signal`: 3 edges proved, each of their 6 steps taken"))))
+
+(deftest every-step-of-the-graph-is-taken
+  (let [r (spec/check 'writ.spec-demo.signal-spec {:seed 42})]
+    (doseq [nm '[signal:green:tick->green signal:green:tick->yellow
+                 signal:yellow:tick->yellow signal:yellow:tick->red
+                 signal:red:tick->red signal:red:tick->green]]
+      (is (= :witnessed (:status (law-result r nm))) (str nm ": " (pr-str (law-result r nm)))))
+    (testing "the witness is the state, and any args, that takes the step"
+      (is (= '{l [:Green 30]} (:witness (law-result r 'signal:green:tick->yellow)))))))
+
+(deftest a-step-the-code-never-takes-fails
+  (let [r (spec/check 'writ.spec-demo.signal-spec {:seed 42 :target 'writ.spec-demo.signal-stuck})]
+    (is (not (:ok r)))
+    (is (= :proved (:status (law-result r 'signal:green:tick))) "the light stays in its states...")
+    (is (= :failed (:status (law-result r 'signal:green:tick->yellow))) "...but never turns yellow")
+    (is (str/includes? (:message r) "law `signal:green:tick->yellow` fails"))
+    (is (str/includes? (:message r)
+                       "the graph says a tick can take green to yellow, but no generated green does"))))
 
 (deftest code-that-leaves-the-graph-fails-its-edge
   (let [r (spec/check 'writ.spec-demo.signal-spec {:seed 42 :target 'writ.spec-demo.signal-skip})
@@ -89,11 +107,19 @@
     (is (str/includes? (:message r) "`writ.spec-demo.no-graph-spec` declares no state graph"))
     (is (str/includes? (:message r) "(graph name {:states {state Type ...} :edges {state {[fn ArgType ...] #{state ...}}}})"))))
 
-(deftest a-graph-over-plain-compound-types-is-data-flow
-  (require 'writ.spec-demo.flow-spec)
+(deftest a-refined-state-makes-its-edge-a-law
   (let [r (spec/check 'writ.spec-demo.flow-spec {:seed 42})]
     (is (:ok r) (:message r))
-    (is (= [{:graph 'sorting :status :ok :states 2 :edges 1}] (:graphs r)))))
+    (is (= [{:graph 'sorting :status :ok :states 2 :edges 1}] (:graphs r)))
+    (is (= :witnessed (:status (law-result r 'sorting:unsorted:isort->sorted))))
+    (is (contains? #{:proved :tested} (:status (law-result r 'sorting:unsorted:isort))))))
+
+(deftest states-of-one-plain-type-cannot-be-told-apart
+  (let [r (spec/check 'writ.spec-demo.flow-plain-spec {:seed 42})]
+    (is (not (:ok r)))
+    (is (str/includes? (:message r)
+                       "graph `sorting`: :unsorted and :sorted are both (List Nat), so nothing tells them apart"))
+    (is (str/includes? (:message r) "make each a refinement that says what sets it apart"))))
 
 (deftest a-graph-step-is-proved-never-to-throw
   (let [r (spec/check 'writ.spec-demo.signal-spec {:seed 42})
@@ -112,3 +138,58 @@
 (deftest a-rare-refinement-is-still-generated
   (let [tenv (spec/type-env 'writ.spec-demo.signal-spec)]
     (is (every? #(= [:Red 30] %) (spec/sample 'Stopped tenv 1000)))))
+
+(deftest an-edge-into-a-plain-state-beside-refined-ones-fails
+  (let [r (spec/check 'writ.spec-demo.signal-mixed-spec {:seed 42})]
+    (is (not (:ok r)))
+    (is (some? (law-result r 'signal:green:tick)) "an edge into refinements only is still a law")
+    (is (str/includes? (:message r)
+                       "graph `signal`: the edge :yellow -[tick]-> lands in :red, a plain (Tuple Keyword Nat)"))
+    (is (str/includes? (:message r) "make :red a refinement"))))
+
+(deftest an-edge-can-take-its-state-at-any-parameter
+  (let [r (spec/check 'writ.spec-demo.sort-spec {:seed 42})]
+    (is (:ok r) (:message r))
+    (testing "`_` marks the state: insert keeps a sorted list sorted"
+      (is (contains? #{:proved :tested} (:status (law-result r 'sorting:sorted:insert)))))))
+
+(deftest a-state-can-be-taken-out-of-a-result
+  (let [r (spec/check 'writ.spec-demo.links-spec {:seed 42})]
+    (is (:ok r) (:message r))
+    (is (= [{:graph 'store :status :ok :states 2 :edges 2}] (:graphs r)))))
+
+(deftest an-edge-marks-its-state-once
+  (is (str/includes? (expansion-error '(writ.spec/graph g {:states {:a Nat} :edges {:a {[f _ _] #{:a}}}}))
+                     "marks the state with `_` more than once"))
+  (is (str/includes? (expansion-error '(writ.spec/graph g {:states {:a Nat} :edges {:a {[first Nat] #{:a}}}}))
+                     "`first` takes the state alone")))
+
+(deftest a-projection-must-fit-its-state
+  (let [r (spec/check 'writ.spec-demo.links-bad-spec {:seed 42})]
+    (is (not (:ok r)))
+    (is (str/includes? (:message r)
+                       "graph `store`: the edge :added -[second]-> :links expects a (Map String String), but `second` of :added gives a String"))))
+
+(deftest a-graph-draws-as-a-state-diagram
+  (let [m (spec/mermaid 'writ.spec-demo.signal-spec {:graph 'signal})]
+    (is (str/starts-with? m "stateDiagram-v2"))
+    (is (str/includes? m "[*] --> green"))
+    (is (str/includes? m "green --> yellow : tick"))
+    (is (str/includes? m "green : green, a Green"))))
+
+(deftest the-plan-reads-from-the-spec-alone
+  (let [p (spec/plan 'writ.spec-demo.pipeline-spec)]
+    (is (str/includes? p "plan: writ.spec-demo.pipeline-spec for writ.spec-demo.pipeline"))
+    (is (str/includes? p "graph `request`"))
+    (is (str/includes? p ":clean     Clean, a String where (= s (cleaned s))"))
+    (is (str/includes? p ":raw -[normalize]-> :clean"))
+    (is (str/includes? p "handle  [String -> (Tuple Keyword String)]"))
+    (is (str/includes? p "laws: handle-answers-with-the-cleaned-input, ok-exactly-when-short"))
+    (is (str/includes? p "flow: s -> normalize -> respond -> result"))
+    (is (str/includes? p "calls exactly: normalize, respond"))))
+
+(deftest the-readmes-sort-spec-is-proved
+  (let [r (spec/check 'writ.spec-demo.readme-sort-spec {:seed 42})]
+    (is (:ok r) (:message r))
+    (is (= :proved (:status (law-result r 'sorting:unsorted:isort))))
+    (is (= :proved (:status (law-result r 'sorting:sorted:insert))))))

@@ -53,6 +53,13 @@
     (sequential? v) (seq-term (map value->term v))
     :else [:lit v]))
 
+(defn sort-printed
+  "xs in the order they print, or (kf x) prints: terms have no order of
+  their own, and this one is the same on every run.  Each is printed once;
+  sort-by with pr-str prints both sides of every comparison."
+  ([xs] (sort-printed identity xs))
+  ([kf xs] (map peek (sort-by first (map (fn [x] [(pr-str (kf x)) x]) xs)))))
+
 (defn var? [t] (symbol? t))
 
 (defn vars

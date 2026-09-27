@@ -52,7 +52,7 @@
                                      [(conj assign (second r)) (conj units [(second r) i]) (conj q (second r))])
                              [assign units q])))
                        [assign units []] is))]
-    (loop [assign assign, units [], queue (if (nil? queue) nil (vec queue)), first-pass (nil? queue)]
+    (loop [assign assign, units [], queue (if (nil? queue) nil (vec queue)), first-pass (if (nil? queue) true false)]
       (let [is (if first-pass
                  (range (count clauses))
                  (distinct (mapcat #(get occ (negate %)) queue)))

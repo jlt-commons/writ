@@ -8,7 +8,7 @@
   the four phases of a game; each edge is proved from the code, so every
   run of `step` stays inside the graph and keeps its rules."
   (:require [pong.core :refer [W H PH LEFT-X RIGHT-X WIN]]
-            [writ.spec :refer [spec data ann refine graph law]]))
+            [writ.spec :refer [spec data ann refine graph flow law]]))
 
 (spec pong.core {:require :proved})
 
@@ -59,6 +59,20 @@
             :paused  {[step Key] #{:paused :playing}}
             :won     {[step Key] #{:won :serving}}}
    :before [[:playing :won]]})
+
+;; a tick of play: the key moves the left paddle, the ball draws the
+;; right one, and the ball moves against both
+(flow play [ball ly ry ls rs key]
+  [key move-paddle advance :result]
+  [ball track advance]
+  [ball advance :result])
+
+;; step hands the game and the key to play, and moves the paddle while
+;; a serve counts down
+(flow step [game key]
+  [game play :result]
+  [key play]
+  [key move-paddle :result])
 
 ;; --- paddles -------------------------------------------------------------------
 
@@ -127,6 +141,15 @@
 ;; --- the game --------------------------------------------------------------------
 
 (law a-game-starts-level (= [0 0] (scores (new-game))))
+
+;; ...and with a serve: counting down, the ball on its way right, the paddles
+;; centred. Without it, a new-game that returned any level game passed, since
+;; the one other law naming it compares step's call of it with itself
+(law a-game-starts-with-a-serve
+  (let [[phase ball ly ry] (new-game)]
+    (and (= :Serving (first phase)) (pos? (second phase))
+         (= ball (serve [:Right]))
+         (= ly (quot (- H PH) 2)) (= ry (quot (- H PH) 2)))))
 
 (defn one-point-at-most? [before after]
   (let [[a b] before [a2 b2] after]

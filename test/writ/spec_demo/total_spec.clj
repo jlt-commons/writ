@@ -8,8 +8,8 @@
 (ann total-by-reduce [(List Nat) -> Nat])
 
 (graph summing
-  {:states {:items (List Nat), :sum Nat, :count Nat}
-   :edges  {:items {[total] #{:sum}, [total-by-reduce] #{:sum}, [size] #{:count}}}})
+  {:states {:items (List Nat), :number Nat}
+   :edges  {:items {[total] #{:number}, [total-by-reduce] #{:number}, [size] #{:number}}}})
 
 (law total-of-two (forall [a Nat, b Nat] (= (+ a b) (total (list a b)))))
 (law total-sums (forall [xs (List Nat)] (= (total xs) (apply + xs))))

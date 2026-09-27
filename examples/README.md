@@ -336,6 +336,19 @@ What writ catches:
   Writ: `println` in `shorten` is effect code (...); writ checks pure data-and-functions code only
   ```
 
+The spec also says how the data moves. `flow` forms state that `handle`
+passes the path to `route` and on to `follow`, and the body to `shorten`,
+and that `shorten` validates the normalized URL, not the raw body. The
+same forms reach into the server, which writ doesn't check: `app` must
+answer each request with `shortener.core/handle`, through
+`shortener.store/transact!`, and build its response from `handle`'s
+reply. The server's source is read for this, never loaded:
+
+```clojure
+(calls shortener.server/app {:through [shortener.core/handle shortener.store/transact!]})
+(flow shortener.server/app [req] [req shortener.core/handle response :result])
+```
+
 `scan` reads the server namespace, which writ can't check, and follows
 the effect up the call graph:
 

@@ -12,7 +12,7 @@
   three live neighbours. `packed` folds a generated world into a 6x6 box,
   and one law, tested on crowded worlds, compares whole generations with
   a model of the rule, so a broken rule is caught with a small world."
-  (:require [writ.spec :refer [spec ann refine graph law]]))
+  (:require [writ.spec :refer [spec ann refine graph flow law]]))
 
 (spec life.core {:require :proved})
 
@@ -27,6 +27,9 @@
   {:states {:cell (Tuple Int Int), :around Neighbourhood, :world (Set (Tuple Int Int))}
    :edges  {:cell  {[neighbours] #{:around}}
             :world {[step] #{:world}}}})
+
+;; a step looks at the live cells and the cells around them
+(flow step [world] [world neighbours :result])
 
 ;; --- the rule, cell by cell ------------------------------------------------------
 
