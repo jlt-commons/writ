@@ -27,6 +27,11 @@
     (testing "vector? is decided for literals, lists and scalars"
       (doseq [l '[payload-of-an-ok-vector a-list-is-not-a-vector anything-else-is-bad]]
         (is (= :proved (:status (law-result r l))) (str l))))
+    (testing "maps, bounded unrolling, pruning and constant kinds"
+      (doseq [l '[a-reason-is-set setting-a-reason-replaces-it map-equality-ignores-order no-reason-is-none
+                  tags-of-a-known-vector no-tags-outside-a-vector a-symbol-is-a-symbol any-keyword-is-a-keyword]]
+        ;; a closed law is evaluated, which is its proof
+        (is (contains? #{:proved :evaluated} (:status (law-result r l))) (str l))))
     (testing "the code's literals seed the generator"
       (is (= :witnessed (:status (law-result r 'some-exit-is-orderly)))))
     (testing "a graph edge passed the spec's fn is proved, and its stale marker reported"

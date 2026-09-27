@@ -615,9 +615,9 @@
             ;; code that dispatches on a tag, (case (first ret) :reply ...),
             ;; wants tagged vectors: one of its keywords, then a few values
             (and (= 'Any t) (seq tags))
-            (conj [1 (gen/fmap (fn [[k xs]] (into [k] xs))
+            (conj [2 (gen/fmap (fn [[k xs]] (into [k] xs))
                                (gen/tuple (gen/elements tags)
-                                          (gen/vector (gen/one-of [plain (gen/elements seeds)]) 0 4)))]))))
+                                          (gen/vector (gen/one-of [plain (gen/elements seeds)]) 0 3)))]))))
 
       (symbol? t)
       (case t
@@ -2519,9 +2519,20 @@
   (if (= false (:prove opts))
     results
     (let [proof-ns (::proof-ns opts)
+          ;; the target's dependencies, which a spec helper or a law may call
+          ;; through the spec's own aliases
+          libs+refers (delay
+                        (let [libs (lib-pairs target)
+                              spec-forms (book/read-forms (source-url spec-ns))
+                              {:keys [aliases]} (ns-names (first (filter #(head? % "ns") spec-forms)))]
+                          [libs spec-forms
+                           (into {} (for [[a lib] aliases
+                                          [n fs] libs :when (= n lib)
+                                          f fs :when (and (seq? f) (contains? '#{defn defn-} (first f)))]
+                                      [(symbol (str a) (str (second f))) (symbol (str lib) (str (second f)))]))]))
           defs (delay (prover/definitions
-                        (cond-> (conj (lib-pairs target)
-                                      [spec-ns (mapv refine->defn (book/read-forms (source-url spec-ns)))])
+                        (cond-> (let [[libs spec-forms spec-refers] @libs+refers]
+                                  (conj libs [spec-ns (mapv refine->defn spec-forms) spec-refers]))
                           ;; a proof namespace's own defns, reading the
                           ;; target's fns it refers by their plain names --
                           ;; the fns of the target checked, when a stand-in
@@ -2560,7 +2571,7 @@
                                                 :lemma (:lemma r)
                                                 :sigs sigs :contracts @contracts
                                                 :defs ds :tenv tenv
-                                                :target target :own own :lemmas lemmas
+                                                :target target :own (merge own (nth @libs+refers 2)) :lemmas lemmas
                                                 :rets (into {} (for [[nm sig] anns]
                                                                  [(symbol (str target) (str nm))
                                                                   (plain (:ret sig))]))}))

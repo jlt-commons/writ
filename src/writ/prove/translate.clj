@@ -18,7 +18,9 @@
      reduce integer? max min abs every? some quot mod rem contains? boolean
      bit-shift-left bit-shift-right set hash-set into mapcat
      sort distinct reverse last butlast take drop str name keyword
-     vector? sequential? map? get nil? some?})
+     vector? sequential? map? get nil? some?
+     keyword? symbol? string? char? boolean?
+     hash-map assoc dissoc merge keys vals})
 
 (def value-fns
   "The clojure.core fns that may be passed as values: the modelled ones,
@@ -33,13 +35,14 @@
 (defn outside-reason [ex] (::outside (ex-data ex)))
 
 (defn- scalar? [x]
-  (or (nil? x) (number? x) (string? x) (keyword? x) (char? x) (boolean? x)))
+  (or (nil? x) (number? x) (string? x) (keyword? x) (char? x) (boolean? x) (symbol? x)))
 
 (defn- plain-data?
-  "A scalar, or a sequential of plain data, or a set of scalars."
+  "A scalar, a sequential or a map of plain data, or a set of scalars."
   [x]
   (or (scalar? x)
       (and (sequential? x) (every? plain-data? x))
+      (and (map? x) (every? plain-data? (keys x)) (every? plain-data? (vals x)))
       (and (set? x) (every? scalar? x))))
 
 (defn- constant
@@ -103,6 +106,10 @@
              :core (into [:call v] args)
              (outside! (str "`" (:name f) "`"))))
     :fn (into [:ap (term-of ctx env f)] args)
+    ;; (:k m) and (:k m default) are lookups
+    :lit (if (and (keyword? (:val f)) (<= 1 (count args) 2))
+           (into [:call 'get (first args) [:lit (:val f)]] (rest args))
+           (outside! "calling a computed value"))
     (outside! "calling a computed value")))
 
 (defn term-of
@@ -114,6 +121,7 @@
                  (and (seq? v) (empty? v)) [:sq t/enil]
                  (sequential? v) (t/value->term v)
                  (and (set? v) (every? scalar? v)) (into [:call 'hash-set] (map t/lit (t/sort-printed v)))
+                 (and (map? v) (plain-data? v)) (t/value->term v)
                  (coll? v) (outside! (str "the literal " (pr-str v)))
                  :else [:lit v]))
     :ref (let [s (:name ast)]
@@ -180,6 +188,8 @@
     ;; prover reads it as any sequence
     :vec (with-meta (t/seq-term (mapv #(term-of ctx env %) (:items ast))) {:vector true})
     :set (into [:call 'hash-set] (map #(term-of ctx env %) (:items ast)))
+    :map (into [:call 'hash-map] (mapcat (fn [k v] [(term-of ctx env k) (term-of ctx env v)])
+                                         (:keys ast) (:vals ast)))
     :case (case-term ctx env ast)
     (outside! (str "`" (name (:op ast)) "`"))))
 
