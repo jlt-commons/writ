@@ -25,7 +25,8 @@
       (is (= :test (:evidence (law-result r 'smallest-first)))))
     (testing "the report counts them"
       ;; seven laws, the graph's two edges and a witness for each step
-      (is (= {:require :tested :proved 10 :tested 1 :laws 11} (:proof r)))
+      (is (= {:require :tested :proved 10 :general 6 :tested 1 :laws 11} (:proof r)))
+      (is (str/includes? (:message r) "(6 for every input, 4 on particular values)"))
       (is (str/includes? (:message r) "10 of 11 laws proved"))
       (is (str/includes? (:message r) "tested, not proved: smallest-first")))))
 
