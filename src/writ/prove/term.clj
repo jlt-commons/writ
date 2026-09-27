@@ -50,6 +50,7 @@
   [v]
   (cond
     (nil? v) tnil
+    (vector? v) (with-meta (seq-term (map value->term v)) {:vector true})
     (sequential? v) (seq-term (map value->term v))
     :else [:lit v]))
 
@@ -97,7 +98,8 @@
     (= :lin (head t)) (let [[_ c pairs] t]
                         [:lin c (mapv (fn [[a k]] [(subst a m) k]) pairs)])
     (contains? #{:call :app} (head t)) (into [(first t) (second t)] (map #(subst % m)) (drop 2 t))
-    :else (into [(first t)] (map #(subst % m)) (rest t))))
+    ;; a vector literal's :vector mark rides along
+    :else (with-meta (into [(first t)] (map #(subst % m)) (rest t)) (meta t))))
 
 (defn subterms [t]
   (tree-seq (fn [x] (and (vector? x) (not (lit? x)) (not (contains? #{:cfn :dfn} (head x)))))

@@ -17,7 +17,8 @@
      filter map not = not= < <= > >= + - * inc dec zero? pos? neg? nth identity apply
      reduce integer? max min abs every? some quot mod rem contains? boolean
      bit-shift-left bit-shift-right set hash-set into mapcat
-     sort distinct reverse last butlast take drop str name keyword})
+     sort distinct reverse last butlast take drop str name keyword
+     vector? sequential? map? get nil? some?})
 
 (def value-fns
   "The clojure.core fns that may be passed as values: the modelled ones,
@@ -175,7 +176,9 @@
                           [:lit false] (reverse (t/sort-printed members))))
                 (invoke-term ctx env f (mapv #(term-of ctx env %) (:args ast)))))
 
-    :vec (t/seq-term (mapv #(term-of ctx env %) (:items ast)))
+    ;; a vector literal says it is a vector, for vector?; the rest of the
+    ;; prover reads it as any sequence
+    :vec (with-meta (t/seq-term (mapv #(term-of ctx env %) (:items ast))) {:vector true})
     :set (into [:call 'hash-set] (map #(term-of ctx env %) (:items ast)))
     :case (case-term ctx env ast)
     (outside! (str "`" (name (:op ast)) "`"))))

@@ -514,14 +514,22 @@
     {:ok true}))
 
 (defn read-forms
-  "Read every top-level form in a source file."
+  "Read every top-level form in a source file.  After its ns form, the rest
+  is read in that namespace, so ::k and ::alias/k resolve as they do when
+  the file is compiled.  A namespace not loaded yet is loaded for that; one
+  that cannot be is read as before, where only plain keywords resolve."
   [path]
   (with-open [r (java.io.PushbackReader. (io/reader path))]
-    (loop [forms []]
-      (let [form (read {:eof ::eof} r)]
+    (loop [forms [], the-ns *ns*]
+      (let [form (binding [*ns* the-ns] (read {:eof ::eof} r))]
         (if (= ::eof form)
           forms
-          (recur (conj forms form)))))))
+          (recur (conj forms form)
+                 (or (when (and (empty? forms) (seq? form) (= 'ns (first form)) (symbol? (second form)))
+                       (or (find-ns (second form))
+                           (try (require (second form)) (find-ns (second form))
+                                (catch Throwable _ nil))))
+                     the-ns)))))))
 
 (defn check-files
   "Read the given source files and check them as one book."
