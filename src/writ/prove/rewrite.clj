@@ -234,9 +234,12 @@
       (division? ctx t)
       (and (contains? #{:app :call} (head t)) (proved-integer? ctx t))))
 
+(declare proved-nat?)
+
 (defn- nat-atom? [ctx a]
   (or (and (symbol? a) (= 'Nat (get-in ctx [:types a])))
-      (and (= :call (head a)) (= 'count (second a)))))
+      (and (= :call (head a)) (= 'count (second a)))
+      (and (= :app (head a)) (proved-nat? ctx a))))
 
 (defn- lin-of
   "{:c const :m {atom coef}} for an integer term, else nil."
@@ -918,6 +921,29 @@
                            (= [:lit true] (ih-rewrite ctx q))
                            (= [:lit true] (lemma-rewrite ctx q))))]
         (some-> memo (swap! assoc t r))
+        r))))
+
+(defn- proved-nat?
+  "Does a proved contract say (<= 0 t)?  A contract's rule is kept as
+  written, (<= 0 (f ?x)) to true, so it is read here, where t is an atom
+  of a linear form, not by rewriting."
+  [ctx t]
+  (let [memo (:int-memo ctx)
+        k [:nat t]
+        hit (some-> memo deref (get k))]
+    (if (some? hit)
+      hit
+      (let [_ (some-> memo (swap! assoc k false))
+            r (boolean
+                (some (fn [{:keys [vars hyp lhs rhs name types]}]
+                        (when (and (nil? hyp) (= [:lit true] rhs) (= :call (head lhs))
+                                   (= '<= (second lhs)) (= [:lit 0] (nth lhs 2 nil)) (= 4 (count lhs)))
+                          (when-let [m (match-term (nth lhs 3) t vars)]
+                            (when (typed? ctx types m)
+                              (swap! (:lemmas-used ctx) conj name)
+                              true))))
+                      (:lemmas ctx)))]
+        (some-> memo (swap! assoc k r))
         r))))
 
 (defn- conjuncts
