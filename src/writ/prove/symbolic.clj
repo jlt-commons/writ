@@ -76,8 +76,17 @@
 (defn- state []
   (atom {:n 0 :defs [] :decls {} :codes {} :memo {} :path [] :throws []}))
 
+(def ^:private max-vars
+  "How many variables one goal's evaluation may make before it gives up:
+  a value of unknown shape taken apart level by level multiplies its
+  alternatives, and the formula it grows would swamp the solver anyway."
+  20000)
+
 (defn- fresh! [st kind]
   (let [n (:n @st)
+        _ (when (>= n max-vars)
+            (throw (ex-info "outside symbolic evaluation: too large a formula"
+                            {::outside "too large a formula" ::spent true})))
         s (symbol (str "%" (name kind) n))]
     (swap! st #(-> % (update :n inc) (assoc-in [:decls s] kind)))
     s))
@@ -262,15 +271,45 @@
   (swap! st update :path conj c)
   (try (f) (finally (swap! st update :path pop))))
 
+(defn- relevant-defs
+  "The definitions and facts formulas fs depend on: those of the variables
+  they mention, and of the variables those definitions mention, and so on
+  (constraint independence, as KLEE splits a query).  The rest constrain
+  only variables fs never reach, so leaving them out cannot turn a
+  satisfiable question unsatisfiable, and a refutation without them
+  refutes with them."
+  [st fs]
+  (let [{:keys [defs def-of]} @st
+        vars-of (fn [f] (filter symbol? (tree-seq coll? seq f)))
+        cone (loop [todo (vec (mapcat vars-of fs)) seen #{}]
+               (if-let [v (peek todo)]
+                 (if (contains? seen v)
+                   (recur (pop todo) seen)
+                   (recur (into (pop todo) (some-> (get def-of v) vars-of)) (conj seen v)))
+                 seen))]
+    (filterv (fn [d] (some cone (vars-of d))) defs)))
+
+(def ^:private max-prune-size
+  "The most definitions and path conditions a branch is pruned under."
+  400)
+
 (defn- unreachable?
   "Is the path the evaluation is on impossible, under what the goal assumes
   -- its hypotheses, its variables' facts and the definitions so far?  Asked
-  of the solver, with a small budget; unknown counts as reachable."
+  of the solver, with a small budget: :unsat, :sat or :unknown."
   [st]
-  (let [{:keys [assumed defs path decls]} @st
-        f (into [:and true] (concat assumed defs path))]
-    (= :unsat (:result (try (solve/check f decls {:budget 2000})
-                            (catch clojure.lang.ExceptionInfo _ nil))))))
+  (let [{:keys [assumed path decls]} @st
+        defs (relevant-defs st (concat assumed path))]
+    ;; a large formula is not asked about: the solver's budget bounds its
+    ;; search, not the work of reading the formula in, and pruning only
+    ;; ever buys completeness
+    (if (<= (+ (count assumed) (count defs) (count path)) max-prune-size)
+      (case (:result (try (solve/check (into [:and true] (concat assumed defs path)) decls {:budget 2000})
+                          (catch clojure.lang.ExceptionInfo _ nil)))
+        :unsat :unsat
+        :sat :sat
+        :unknown)
+      :unknown)))
 
 (defn- pruned
   "(thunk), unless it gives up on a path no model reaches: that branch is
@@ -280,9 +319,16 @@
   [st thunk]
   (try (thunk)
        (catch clojure.lang.ExceptionInfo e
-         (if (and (::outside (ex-data e)) (unreachable? st))
-           :bottom
-           (throw e)))))
+         (let [d (ex-data e)]
+           (cond
+             (or (not (::outside d)) (::spent d) (::reachable d)) (throw e)
+             :else
+             (case (unreachable? st)
+               :unsat :bottom
+               ;; the paths of the pruned calls around this one are shorter,
+               ;; so reachable too: none of them asks again
+               :sat (throw (ex-info (ex-message e) (assoc d ::reachable true) e))
+               (throw e)))))))
 
 (defn- guarded
   "(f x), or :bottom where Clojure would throw, noting that it does."
@@ -645,6 +691,29 @@
     (swap! st update :defs into @facts)
     v))
 
+(defn- opaque-count
+  "The count of opaque v: some count, the same each time, never negative.
+  Its emptiness, and whether its seq is nil, are read off it."
+  [st v]
+  (or (get-in @st [:unknowns ['count v]])
+      (let [c (unknown! st 'count v :int)]
+        (swap! st update :defs conj [:<= 0 c])
+        c)))
+
+(defn- opaque-rest
+  "The rest of opaque v: a seq, never nil and never a vector, one shorter
+  than v unless v is empty.  The same value each time it is asked for."
+  [st v]
+  (or (get-in @st [:unknown-values ['rest v]])
+      (let [r {:opaque (unknown! st 'rest v :int)}
+            n (opaque-count st v)]
+        (swap! st #(-> %
+                       (assoc-in [:unknown-values ['rest v]] r)
+                       (assoc-in [:unknowns ['sequential? r]] true)
+                       (assoc-in [:unknowns ['vector? r]] false)))
+        (swap! st update :defs conj [:= (opaque-count st r) [:ite [:= n 0] 0 [:- n 1]]])
+        r)))
+
 (defn- unknown-value
   "What op returns of an opaque v: some value, the same each time op is
   asked of v (Ackermann again)."
@@ -858,24 +927,38 @@
       ;; of an opaque value -- a map, a longer collection -- the first
       ;; element is some value, its count some count
       first (lift st (fn [x] (if (opaque? x) (unknown-value st 'first x) (or (first (seq-of x)) {:nil true}))) a)
-      second (lift st (fn [x] (if (opaque? x) (unknown-value st 'second x) (or (second (seq-of x)) {:nil true}))) a)
-      rest (lift st (fn [x] (if (opaque? x) (unknown-value st 'rest x) {:vec (vec (rest (seq-of x))) :kind :seq})) a)
-      next (lift st (fn [x] (if (opaque? x) (unknown-value st 'next x)
-                                (let [r (vec (rest (seq-of x)))] (if (seq r) {:vec r :kind :seq} {:nil true})))) a)
-      seq (lift st (fn [x] (if (seq (seq-of x)) {:vec (seq-of x) :kind :seq} {:nil true})) a)
+      ;; second is the first of the rest, next the seq of it, for a value
+      ;; of unknown shape as for any
+      second (lift st (fn [x] (if (opaque? x)
+                                 (core* st 'first [(opaque-rest st x)])
+                                 (or (second (seq-of x)) {:nil true})))
+                   a)
+      rest (lift st (fn [x] (if (opaque? x) (opaque-rest st x) {:vec (vec (rest (seq-of x))) :kind :seq})) a)
+      next (lift st (fn [x] (if (opaque? x)
+                              (core* st 'seq [(opaque-rest st x)])
+                              (let [r (vec (rest (seq-of x)))] (if (seq r) {:vec r :kind :seq} {:nil true}))))
+                 a)
+      ;; of an opaque value, what its count says: nil when it has none, some
+      ;; other truthy value when it has some
+      seq (lift st (fn [x]
+                     (if (opaque? x)
+                       (let [none [:= (opaque-count st x) 0]]
+                         (union-of st [[none {:nil true}]
+                                       [[:not none] {:opaque (unknown! st 'seq x :int)}]]))
+                       (if (seq (seq-of x)) {:vec (seq-of x) :kind :seq} {:nil true})))
+                a)
       empty? (lift st (fn [x]
-                        (if (:set x)
+                        (cond
+                          (:set x)
                           (let [es (or (:elems (:set x)) (give-up! "whether a set of unknown size is empty"))]
                             {:bool [:not (into [:or false] (map first es))]})
-                          {:bool (empty? (seq-of x))}))
+                          (opaque? x) {:bool [:= (opaque-count st x) 0]}
+                          :else {:bool (empty? (seq-of x))}))
                    a)
       count (lift st (fn [x]
                        (cond
                          (:map x) {:int (into [:+ 0] (map (fn [[p _ _]] [:ite p 1 0]) (:map x)))}
-                         (opaque? x)
-                         (let [c (unknown! st 'count x :int)]
-                           (swap! st update :defs conj [:<= 0 c])
-                           {:int c})
+                         (opaque? x) {:int (opaque-count st x)}
                          (:set x)
                          (let [{:keys [elems distinct]} (:set x)]
                            (when-not elems (give-up! "the count of a set of unknown size"))
@@ -924,6 +1007,19 @@
   "How many recursive calls one goal's evaluation may unfold in all."
   400)
 
+(defn- sig
+  "The shape of a value as far as recursion on it can make progress: its
+  alternatives, a vector's length and elements, an integer literal."
+  [v]
+  (cond (= :bottom v) :bottom
+        (:union v) [:union (set (map (comp sig second) (:union v)))]
+        (:vec v) [:vec (mapv sig (:vec v))]
+        (and (contains? v :int) (integer? (:int v))) [:int (:int v)]
+        (:map v) [:map (count (:map v))]
+        :else (shape v)))
+
+(defn- opaque-in? [g] (boolean (some #{:opaque} (tree-seq coll? seq g))))
+
 (defn- app
   "A defn of the target or the spec applied to values: its body, run on
   them.  A recursive definition is unfolded like any other -- bounded
@@ -936,9 +1032,14 @@
     (when (or (nil? d) (:outside d))
       (give-up! (str "the call of `" f "`")))
     (when (:recursive? d)
-      (let [{:keys [depth unfolds] :or {depth 0 unfolds 0}} @st]
+      (let [{:keys [depth unfolds calls] :or {depth 0 unfolds 0}} @st
+            g (mapv sig vs)]
         (when (or (>= depth max-unfold-depth) (>= unfolds max-unfolds))
           (give-up! (str "the recursion of `" f "`, unfolded as far as it may be")))
+        ;; a call on values of unknown shape that has the shape of a call
+        ;; around it walks into more of the same: it never bottoms out
+        (when (and (opaque-in? g) (some #{[f g]} calls))
+          (give-up! (str "the recursion of `" f "` over a value of unknown shape")))
         (swap! st assoc :unfolds (inc unfolds))))
     (swap! st update :used (fnil conj #{}) f)
     (let [k [f vs]
@@ -949,13 +1050,23 @@
                             _ (swap! st assoc :path [] :throws [])
                             ;; restored however the body ends: a give-up in
                             ;; it must not leave the caller's path emptied
-                            _ (when (:recursive? d) (swap! st update :depth (fnil inc 0)))
+                            _ (when (:recursive? d)
+                                (swap! st #(-> % (update :depth (fnil inc 0))
+                                               (update :calls conj [f (mapv sig vs)]))))
                             [r tau] (try
                                       (let [r (ev st (zipmap (:params d) vs) (:body d))]
                                         [r (let [ts (:throws @st)] (if (seq ts) (into [:or false] ts) false))])
+                                      ;; the body ran on a path of its own, so a
+                                      ;; give-up found reachable there may not be
+                                      ;; on the caller's path: the caller asks again
+                                      (catch clojure.lang.ExceptionInfo e
+                                        (throw (if (::reachable (ex-data e))
+                                                 (ex-info (ex-message e) (dissoc (ex-data e) ::reachable) e)
+                                                 e)))
                                       (finally
                                         (swap! st assoc :path path :throws throws)
-                                        (when (:recursive? d) (swap! st update :depth dec))))]
+                                        (when (:recursive? d)
+                                          (swap! st #(-> % (update :depth dec) (update :calls pop))))))]
                         (swap! st assoc-in [:memo k] [r tau])
                         [r tau]))]
       (record-throw! st tau)

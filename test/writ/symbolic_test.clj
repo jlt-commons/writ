@@ -111,3 +111,14 @@
     (doseq [n [-3 0 12]]
       (is (true? (sym/throws-agree? {:types '{n Int} :defs defs :tenv tenv}
                                     [:app 'writ.spec-demo.shapes/bucket 'n] {'n n}))))))
+
+(deftest values-of-any-shape-are-taken-apart
+  (let [t0 (System/currentTimeMillis)
+        r (spec/check 'writ.spec-demo.walk-spec {:seed 3 :cache false})
+        status (into {} (map (juxt :law :status)) (:laws r))]
+    (testing "seq, empty?, first and rest of a value of unknown shape agree"
+      (is (= :proved (get status 'a-pair-binds-its-second)) (:message r))
+      (is (= :proved (get status 'the-first-matching-clause-wins)) (:message r)))
+    (testing "a recursion into a form of any depth gives up, and soon"
+      (is (= :tested (get status 'a-depth-is-never-negative)) (:message r))
+      (is (< (- (System/currentTimeMillis) t0) 120000)))))
