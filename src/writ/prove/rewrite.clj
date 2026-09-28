@@ -39,7 +39,11 @@
     [rest-empty    [:call rest [:sq [:enil]]]           [:sq [:enil]]]
     [rest-cons     [:call rest [:sq [:econs ?h ?E]]]    [:sq ?E]]
     [rest-elems    [:call rest [:sq [:elems ?v]]]       [:call rest ?v]]
-    ;; next is seq of rest; empty? is not seq; second is first of rest
+    ;; every sequential value is a seq term, and nothing else is one
+    [sequential-sq  [:call sequential? [:sq ?E]]        [:lit true]]
+    [sequential-nil [:call sequential? [:nil]]          [:lit false]]
+    [sequential-fn  [:call sequential? [:fn ?p ?b]]     [:lit false]]
+        ;; next is seq of rest; empty? is not seq; second is first of rest
     [next-def      [:call next ?x]                      [:call seq [:call rest ?x]]]
     [empty-def     [:call empty? ?x]                    [:call not [:call seq ?x]]]
     [second-def    [:call second ?x]                    [:call first [:call rest ?x]]]
@@ -127,6 +131,47 @@
     [some-cons     [:call some ?f [:sq [:econs ?h ?E]]]
                    [:if [:ap ?f ?h] [:ap ?f ?h] [:call some ?f [:sq ?E]]]]
     [some-elems    [:call some ?f [:sq [:elems ?v]]]    [:call some ?f ?v]]
+    ;; take and drop count down with pos? and dec, as clojure.core's do,
+    ;; so these hold for any count
+    [take-nil      [:call take ?n [:nil]]               [:sq [:enil]]]
+    [take-empty    [:call take ?n [:sq [:enil]]]        [:sq [:enil]]]
+    [take-cons     [:call take ?n [:sq [:econs ?h ?E]]]
+                   [:if [:call pos? ?n] [:sq [:econs ?h [:elems [:call take [:call dec ?n] [:sq ?E]]]]] [:sq [:enil]]]]
+    [take-elems    [:call take ?n [:sq [:elems ?v]]]    [:call take ?n ?v]]
+    [drop-nil      [:call drop ?n [:nil]]               [:sq [:enil]]]
+    [drop-empty    [:call drop ?n [:sq [:enil]]]        [:sq [:enil]]]
+    [drop-cons     [:call drop ?n [:sq [:econs ?h ?E]]]
+                   [:if [:call pos? ?n] [:call drop [:call dec ?n] [:sq ?E]] [:sq [:econs ?h ?E]]]]
+    [drop-elems    [:call drop ?n [:sq [:elems ?v]]]    [:call drop ?n ?v]]
+    ;; keep is map then filter some?, in one walk
+    [keep-nil      [:call keep ?f [:nil]]               [:sq [:enil]]]
+    [keep-empty    [:call keep ?f [:sq [:enil]]]        [:sq [:enil]]]
+    [keep-cons     [:call keep ?f [:sq [:econs ?h ?E]]]
+                   [:if [:call some? [:ap ?f ?h]]
+                        [:sq [:econs [:ap ?f ?h] [:elems [:call keep ?f [:sq ?E]]]]]
+                        [:call keep ?f [:sq ?E]]]]
+    [keep-elems    [:call keep ?f [:sq [:elems ?v]]]    [:call keep ?f ?v]]
+    ;; mapcat concatenates what f gives each element
+    [mapcat-nil    [:call mapcat ?f [:nil]]             [:sq [:enil]]]
+    [mapcat-empty  [:call mapcat ?f [:sq [:enil]]]      [:sq [:enil]]]
+    [mapcat-cons   [:call mapcat ?f [:sq [:econs ?h ?E]]]
+                   [:sq [:eapp [:elems [:ap ?f ?h]] [:elems [:call mapcat ?f [:sq ?E]]]]]]
+    [mapcat-elems  [:call mapcat ?f [:sq [:elems ?v]]]  [:call mapcat ?f ?v]]
+    ;; reverse puts the head last
+    [reverse-nil   [:call reverse [:nil]]               [:sq [:enil]]]
+    [reverse-empty [:call reverse [:sq [:enil]]]        [:sq [:enil]]]
+    [reverse-cons  [:call reverse [:sq [:econs ?h ?E]]]
+                   [:sq [:eapp [:elems [:call reverse [:sq ?E]]] [:econs ?h [:enil]]]]]
+    [reverse-elems [:call reverse [:sq [:elems ?v]]]    [:call reverse ?v]]
+    ;; vec, mapv and filterv are their seq's elements; remove and not-any?
+    ;; are filter and some, negated
+    [vec-def       [:call vec ?x]                       [:sq [:elems ?x]]]
+    [mapv-def      [:call mapv ?f ?x]                   [:call map ?f ?x]]
+    [filterv-def   [:call filterv ?f ?x]                [:call filter ?f ?x]]
+    [remove-def    [:call remove ?f ?x]                 [:call filter [:fn [%rm] [:call not [:ap ?f %rm]]] ?x]]
+    [not-any-def   [:call not-any? ?f ?x]               [:call not [:call some ?f ?x]]]
+    ;; whether some element passes does not depend on their order
+    [not-some-rev  [:call not [:call some ?f [:call reverse ?x]]] [:call not [:call some ?f ?x]]]
     ;; apply + sums; of nothing it is 0
     [apply-sum-nil     [:call apply [:cfn +] [:nil]]                [:lit 0]]
     [apply-sum-empty   [:call apply [:cfn +] [:sq [:enil]]]         [:lit 0]]
@@ -220,14 +265,49 @@
        (t/int-lit? (nth t 3)) (not (zero? (second (nth t 3))))
        (int-term? ctx (nth t 2))))
 
+(defn- term-type
+  "The type of term t when its form says it: a variable's own, a list of
+  a tail's elements, an element nth takes from a list (nth throws, rather
+  than give anything else), and a part of a Tuple, whose length is fixed.
+  nil otherwise; never from a fn's signature."
+  [ctx t]
+  (let [list-el (fn [ty] (cond (and (seq? ty) (contains? '#{List Vec} (first ty))) (second ty)
+                               (and (map? ty) (:elems ty)) (:elems ty)
+                               :else nil))]
+    (cond
+      (symbol? t) (get-in ctx [:types t])
+      (and (= :sq (head t)) (symbol? (second t))) (some->> (get-in ctx [:types (second t)]) :elems (list 'List))
+      (not= :call (head t)) nil
+      :else
+      (let [[_ f x i] t
+            ty (term-type ctx x)
+            k (case f
+                first (when (= 3 (count t)) 0)
+                second (when (= 3 (count t)) 1)
+                nth (when (and (= 4 (count t)) (t/int-lit? i)) (second i))
+                nil)]
+        (cond
+          (and ty (seq? ty) (= 'Tuple (first ty)) k (< -1 k (dec (count ty)))) (nth ty (inc k))
+          (and (= 'nth f) (= 4 (count t)) (list-el ty)) (list-el ty)
+          :else nil)))))
+
+(defn- tuple-part-type
+  "The type of (first x), (second x) or (nth x k) for a term x of a Tuple
+  type, or nil."
+  [ctx t]
+  (when (and (= :call (head t)) (contains? '#{first second nth} (second t)))
+    (term-type ctx t)))
+
 (defn int-term?
   "Is t known to be an integer?  Literals, linear forms, counts, variables
-  typed Nat or Int, and a term a fact, hypothesis or proved lemma says is
-  an integer?.  Nothing else is trusted: not even a fn's signature."
+  typed Nat or Int, and their parts of a Tuple, and a term a fact,
+  hypothesis or proved lemma says is an integer?.  Nothing else is
+  trusted: not even a fn's signature."
   [ctx t]
   (or (t/int-lit? t)
       (contains? #{:lin} (head t))
       (and (symbol? t) (contains? int-types (get-in ctx [:types t])))
+      (contains? int-types (tuple-part-type ctx t))
       (and (= :call (head t)) (= 'count (second t)))
       (and (= :call (head t)) (= 'apply (second t)) (= [:cfn '+] (nth t 2 nil))
            (int-elems? ctx (nth t 3 nil)))
@@ -238,6 +318,7 @@
 
 (defn- nat-atom? [ctx a]
   (or (and (symbol? a) (= 'Nat (get-in ctx [:types a])))
+      (= 'Nat (tuple-part-type ctx a))
       (and (= :call (head a)) (= 'count (second a)))
       (and (= :app (head a)) (proved-nat? ctx a))))
 
@@ -404,7 +485,19 @@
   "clojure.core fns that always return a seq or vector object, which is
   truthy whatever it holds.  A lazy one is truthy before it is realised,
   so its elements must not be computed to decide it."
-  '#{filter map concat rest cons list vector vec})
+  '#{filter map concat rest cons list vector vec mapcat keep take drop reverse range
+     mapv filterv subvec hash-map hash-set assoc})
+
+(def ^:private number-makers
+  "clojure.core fns that return a number or throw: never nil or false."
+  '#{inc dec + - * count quot rem mod max min abs})
+
+(defn- nil-fact
+  "false when a fact says c is nil: (nil? c), or (some? c) false."
+  [ctx c]
+  (when (or (true? (get (:facts ctx) [:call 'nil? c]))
+            (false? (get (:facts ctx) [:call 'some? c])))
+    false))
 
 (defn truthiness
   "true / false for a term whose truthiness is settled, else nil.  An if
@@ -418,15 +511,25 @@
     (:sq :fn :cfn :dfn) true
     :if (let [a (truthiness ctx (nth c 2)) b (truthiness ctx (nth c 3))]
           (when (and (some? a) (= a b)) a))
-    :call (if (contains? seq-makers (second c))
+    :call (if (or (contains? seq-makers (second c)) (contains? number-makers (second c))
+                  (int-term? ctx c))
             true
-            (let [d (decide ctx c)] (when (some? d) d)))
-    (let [d (decide ctx c)] (when (some? d) d))))
+            (let [d (decide ctx c)] (if (some? d) d (nil-fact ctx c))))
+    ;; a call of a definition that a fact or a law says is an integer
+    :app (if (int-term? ctx c)
+           true
+           (let [d (decide ctx c)] (if (some? d) d (nil-fact ctx c))))
+    (let [d (decide ctx c)] (if (some? d) d (nil-fact ctx c)))))
 
 ;; --- equality ------------------------------------------------------------------
 
 (def ^:private float-free-types
-  '#{Nat Int Bool String Keyword Symbol Char Unit})
+  "The types whose values hold no NaN.  That is all of them: writ's types
+  range over values without NaN, as its generators do (a Double or an Any
+  is never ##NaN), so a law over Any says nothing about a NaN.  A NaN the
+  code computes, (/ 0.0 0.0), is another matter: float-free? keeps to
+  terms that only pick and arrange parts of the law's values."
+  '#{Nat Int Bool String Keyword Symbol Char Unit Any Float Double})
 
 (defn- float-free-type?
   "seen: the data types already being checked; a field of one of them is
@@ -435,8 +538,11 @@
   ([ctx ty seen]
    (cond
      (contains? float-free-types ty) true
+     ;; a type variable ranges over the values of some type
+     (and (symbol? ty) (:tvar (get-in ctx [:tenv ty]))) true
      (contains? seen ty) true
      (and (seq? ty) (contains? '#{List Vec} (first ty))) (float-free-type? ctx (second ty) seen)
+     (and (seq? ty) (contains? '#{Map Set Tuple} (first ty))) (every? #(float-free-type? ctx % seen) (rest ty))
      (and (map? ty) (:elems ty)) (float-free-type? ctx (:elems ty) seen)
      (and (symbol? ty) (get-in ctx [:tenv ty]))
      (every? (fn [[_ c]] (every? #(float-free-type? ctx % (conj seen ty)) (:fields c)))
@@ -450,11 +556,14 @@
   and nothing else: no float in, no float out.  A fn argument only picks
   which parts."
   '#{filter remove concat list vector vec cons rest next seq take drop reverse
-     sort distinct butlast first second last nth})
+     sort distinct butlast first second last nth subvec filterv
+     get keys vals hash-map assoc dissoc merge})
 
 (defn float-free?
-  "Can this term's value hold no float?  Then two syntactically equal
-  terms are =; with a NaN inside, Clojure's = says they are not.  A value
+  "Can this term's value hold no NaN?  Then two syntactically equal terms
+  are =; with a NaN inside, Clojure's = says they are not.  Only the
+  law's values and what is picked from them qualify, and literals other
+  than ##NaN: arithmetic on floats can make a NaN of none.  A value
   built only by picking and arranging parts of float-free values -- a
   filter, a concat, a fold that does no more, a definition that does no
   more -- has none either."
@@ -469,7 +578,7 @@
        (case (head x)
          :nil true
          :bottom true
-         :lit (not (float? (second x)))
+         :lit (not (and (float? (second x)) (Double/isNaN (second x))))
          :sq (ff? (second x))
          :enil true
          :econs (and (ff? (nth x 1)) (ff? (nth x 2)))
@@ -478,8 +587,22 @@
          :if (and (ff? (nth x 2)) (ff? (nth x 3)))
          :call (let [[_ f & args] x]
                  (cond
+                   ;; an index or a count only picks which parts: a NaN one
+                   ;; would throw
+                   (contains? '#{nth get subvec} f) (ff? (first args))
+                   (contains? '#{take drop} f) (ff? (second args))
                    (contains? selecting-fns f)
                    (every? ff? (remove #(contains? #{:fn :cfn :dfn} (head %)) args))
+                   ;; what a fn literal makes of float-free elements
+                   (and (contains? '#{map mapcat keep} f) (= 2 (count args)) (= :fn (head (first args)))
+                        (= 1 (count (second (first args)))))
+                   (let [[[_ ps body] coll] args]
+                     (and (ff? coll) (float-free? ctx body (into env ps) seen)))
+                   (= 'range f) (every? ff? args)
+                   ;; a picking core fn mapped over them
+                   (and (contains? '#{map mapcat keep} f) (= 2 (count args)) (= :cfn (head (first args)))
+                        (contains? selecting-fns (second (first args))))
+                   (ff? (second args))
                    ;; a fold whose step makes its value of the accumulator's
                    ;; and the element's parts
                    (and (= 'reduce f) (= 3 (count args)) (= :fn (head (first args)))
@@ -724,6 +847,10 @@
         not (cond
               (= :le (head a)) [:le (lin->term (lin+ (lin* -1 (lin-of ctx (second a))) {:c -1 :m {}}))]
               :else (let [tr (truthiness ctx a)] (when (some? tr) [:lit (not tr)])))
+        ;; a truthy value is not nil, and a value that is neither nil nor
+        ;; false is truthy
+        some? (when (= 1 n) (if (true? (truthiness ctx a)) [:lit true] (when (= t/tnil a) [:lit false])))
+        nil? (when (= 1 n) (if (true? (truthiness ctx a)) [:lit false] (when (= t/tnil a) [:lit true])))
         list (t/seq-term args)
         vector (t/seq-term args)
         vec (when (= 1 n) [:sq [:elems a]])
@@ -746,8 +873,34 @@
                          :else nil))
         reduce (when (= 3 n) (reduce-rule ctx a b (nth args 2)))
         sort (when (= 1 n) (sort-model ctx a))
-        nth (when (and (<= 2 n 3) (t/int-lit? b))
-              (nth-rule a (second b) (if (= 3 n) (nth args 2) ::none)))
+        nth (cond
+              (and (<= 2 n 3) (t/int-lit? b))
+              (nth-rule a (second b) (if (= 3 n) (nth args 2) ::none))
+              ;; an integer index into a known head: the head at 0, else
+              ;; one less into the tail.  At a negative index nth throws,
+              ;; so the test can be (<= i 0), and the other case says i >= 1
+              (and (<= 2 n 3) (int-term? ctx b) (= :sq (head a)) (= :econs (head (second a))))
+              (let [[_ h e] (second a)]
+                [:if [:call '<= b [:lit 0]] h
+                 (into [:call 'nth [:sq e] [:call 'dec b]] (drop 2 args))])
+              :else nil)
+        ;; (subvec v i j) is j - i elements from i on, on integer indexes;
+        ;; it throws where those would not fit, and a rule holds where its
+        ;; left side returns
+        subvec (when (and (every? #(int-term? ctx %) (rest args)) (<= 2 n 3))
+                 (if (= 2 n)
+                   [:call 'drop b a]
+                   [:call 'take [:call '- (nth args 2) b] [:call 'drop b a]]))
+        ;; (range a b) on integers, one element at a time, once the facts
+        ;; say whether a < b: open, it stays, or it would unfold for ever
+        range (cond
+                (and (= 1 n) (int-term? ctx a)) [:call 'range [:lit 0] a]
+                (and (= 2 n) (int-term? ctx a) (int-term? ctx b))
+                (case (decide ctx (lt ctx a b))
+                  true [:sq [:econs a [:elems [:call 'range [:call 'inc a] b]]]]
+                  false [:sq t/enil]
+                  nil)
+                :else nil)
         nil)))
 
     :ap (let [[_ f & args] x]
@@ -757,10 +910,19 @@
             ;; a core fn value applied is a call of it, and a defn's an app
             (= :cfn (head f)) (into [:call (second f)] args)
             (= :dfn (head f)) (into [:app (second f)] args)
+            ;; a set applied is the member equal to its argument, or nil
+            (and (= :call (head f)) (= 'hash-set (second f)) (= 1 (count args)))
+            (reduce (fn [else e] [:if [:call '= (first args) e] e else]) t/tnil (reverse (drop 2 f)))
             :else nil))
 
     :le (let [d (decide ctx x)] (when (some? d) [:lit d]))
     :ieq (let [d (decide ctx x)] (when (some? d) [:lit d]))
+    ;; the elements of a value that is always a seq, as a seq, are it
+    :sq (let [e (second x)]
+          (when (and (= :elems (head e)) (= :call (head (second e)))
+                     (contains? seq-makers (second (second e)))
+                     (not (contains? '#{hash-map hash-set assoc} (second (second e)))))
+            (second e)))
     nil))
 
 ;; --- normalising ------------------------------------------------------------------
@@ -777,6 +939,7 @@
   ([ctx] (burn! ctx nil))
   ([ctx x]
    (let [left (swap! (:fuel ctx) dec)]
+     (some-> (:burned ctx) (swap! inc))
      (when (and *last-terms* x (< left 60)) (swap! *last-terms* conj x))
      (when (neg? left) (out-of-fuel!)))))
 
@@ -885,6 +1048,24 @@
   [x y]
   (and (not= x y) (some #(= x %) (t/subterms y))))
 
+(def ^:private sublist-fns
+  "clojure.core fns whose value is a seq of some of their list's elements,
+  never nil: (fn ... xs), xs last."
+  '#{drop take rest filter remove reverse filterv vec distinct})
+
+(defn- elem-type
+  "The element type of a list term, when its form says it: a variable of a
+  list type or a tail of one, or a sublist of such a term.  [T non-nil?]."
+  [ctx u]
+  (let [ty (if (symbol? u) (get-in ctx [:types u]))]
+    (cond
+      (and (seq? ty) (contains? '#{List Vec} (first ty))) [(second ty) (= 'Vec (first ty))]
+      (and (= :sq (head u)) (symbol? (second u)) (:elems (get-in ctx [:types (second u)])))
+      [(:elems (get-in ctx [:types (second u)])) true]
+      (and (= :call (head u)) (contains? sublist-fns (second u)) (<= 3 (count u)))
+      (when-let [[el] (elem-type ctx (last u))] [el true])
+      :else nil)))
+
 (defn has-type?
   "Is term u known to be of type ty?  A variable of that type is; an
   integer term is an Int, and a Nat when it is not negative; anything else
@@ -896,6 +1077,10 @@
       (or (= ty (get-in ctx [:types u]))
           (and (= :sq (head u)) (symbol? (second u)) (el ty)
                (= {:elems (el ty)} (get-in ctx [:types (second u)])))
+          ;; a sublist of a list of its elements: never nil, so a Vec too
+          (and (el ty) (= :call (head u))
+               (let [[t non-nil?] (elem-type ctx u)]
+                 (and (= t (el ty)) (or non-nil? (= 'List (first ty))))))
           (case ty
             Int (int-term? ctx u)
             Nat (and (int-term? ctx u)
@@ -968,11 +1153,35 @@
      (and (= :fn (head pat)) (= :fn (head x)) (= (count (second pat)) (count (second x))))
      (match-term (t/subst (nth pat 2) (zipmap (second pat) (second x))) (nth x 2) vs m)
      (and (vector? pat) (vector? x) (= (count pat) (count x)))
-     (reduce (fn [m [p y]] (or (match-term p y vs m) (reduced nil))) m (map vector pat x))
+     (or (reduce (fn [m [p y]] (or (match-term p y vs m) (reduced nil))) m (map vector pat x))
+         ;; = is symmetric, and a literal is put second, so (= ?id (f x))
+         ;; is also (= (f x) 0)
+         (when (and (= :call (head pat)) (= '= (second pat)) (= 4 (count pat))
+                    (= :call (head x)) (= '= (second x)))
+           (some->> m (match-term (nth pat 3) (nth x 2) vs) (match-term (nth pat 2) (nth x 3) vs))))
      (= pat x) m
      :else nil)))
 
 (declare normalize truthiness ih-rewrite lemma-rewrite)
+
+(def ^:dynamic *provisional*
+  "True while a question about a term is being worked out with a
+  provisional answer to it in place, to stop a loop: nothing worked out
+  then is memoised, since it may rest on that answer."
+  false)
+
+(defn- provisionally
+  "(f), with k's answer taken to be false in memo while it runs.  The
+  answer is kept only when no outer question was open, for then it rests
+  on nothing provisional."
+  [memo k f]
+  (let [outer *provisional*
+        _ (some-> memo (swap! assoc k false))
+        r (binding [*provisional* true] (f))]
+    (if outer
+      (some-> memo (swap! dissoc k))
+      (some-> memo (swap! assoc k r)))
+    r))
 
 (defn- proved-integer?
   "Does a fact, an induction hypothesis or a proved lemma say (integer? t)?"
@@ -981,36 +1190,35 @@
         hit (some-> memo deref (get t))]
     (if (some? hit)
       hit
-      (let [q [:call 'integer? t]
-            _ (some-> memo (swap! assoc t false))  ; no circular answer while working it out
-            r (boolean (or (true? (get (:facts ctx) q))
-                           (= [:lit true] (ih-rewrite ctx q))
-                           (= [:lit true] (lemma-rewrite ctx q))))]
-        (some-> memo (swap! assoc t r))
-        r))))
+      (let [q [:call 'integer? t]]
+        (provisionally memo t
+          #(boolean (or (true? (get (:facts ctx) q))
+                        (= [:lit true] (ih-rewrite ctx q))
+                        (= [:lit true] (lemma-rewrite ctx q)))))))))
 
 (defn- proved-nat?
-  "Does a proved contract say (<= 0 t)?  A contract's rule is kept as
-  written, (<= 0 (f ?x)) to true, so it is read here, where t is an atom
-  of a linear form, not by rewriting."
+  "Does a proved contract or law say (<= 0 t), its hypothesis holding
+  here?  A contract's rule is kept as written, (<= 0 (f ?x)) to true, so
+  it is read here, where t is an atom of a linear form, not by
+  rewriting."
   [ctx t]
   (let [memo (:int-memo ctx)
         k [:nat t]
         hit (some-> memo deref (get k))]
     (if (some? hit)
       hit
-      (let [_ (some-> memo (swap! assoc k false))
-            r (boolean
+      (provisionally memo k
+        #(boolean
                 (some (fn [{:keys [vars hyp lhs rhs name types]}]
-                        (when (and (nil? hyp) (= [:lit true] rhs) (= :call (head lhs))
+                        (when (and (= [:lit true] rhs) (= :call (head lhs))
                                    (= '<= (second lhs)) (= [:lit 0] (nth lhs 2 nil)) (= 4 (count lhs)))
                           (when-let [m (match-term (nth lhs 3) t vars)]
-                            (when (typed? ctx types m)
+                            ;; a law's hypothesis must hold here too
+                            (when (and (typed? ctx types m)
+                                       (or (nil? hyp) (true? (truthiness ctx (normalize ctx (t/subst hyp m))))))
                               (swap! (:lemmas-used ctx) conj name)
                               true))))
-                      (:lemmas ctx)))]
-        (some-> memo (swap! assoc k r))
-        r))))
+                      (:lemmas ctx)))))))
 
 (defn- conjuncts
   "The parts of a normalised conjunction: (if a b false) and (if a b a),
@@ -1178,8 +1386,16 @@
                                                      (map (fn [[a k]] (lin* k (lin-of ctx a))) atoms)))
                                   [:lin c (vec atoms)]))
                          :fn (let [[_ ps body] x
-                                   ps* (canonical-params ps body)]
-                               [:fn ps* (normalize ctx (t/subst body (zipmap ps ps*)))])
+                                   ps* (canonical-params ps body)
+                                   ;; a fact that names a parameter is about
+                                   ;; some other value of that name: the body
+                                   ;; must not read it as about its own
+                                   bound (set ps*)
+                                   ctx* (if (some #(some bound (t/vars (key %))) (:facts ctx))
+                                          (assoc ctx :facts (into {} (remove #(some bound (t/vars (key %)))) (:facts ctx))
+                                                 :memo (atom {}) :stuck (atom #{}) :int-memo (atom {}))
+                                          ctx)]
+                               [:fn ps* (normalize ctx* (t/subst body (zipmap ps ps*)))])
                          (into [(head x)] (map #(normalize ctx %)) (rest x)))]
                 (if (= :if (head x))
                   ;; a boolean law's left side is often an if: an induction
@@ -1192,19 +1408,21 @@
                       (if-let [y (step ctx x*)]
                         (if (= y x*) x* (normalize ctx y))
                         x*)))))]
-      (swap! (:memo ctx) assoc x r)
+      (when-not *provisional* (swap! (:memo ctx) assoc x r))
       r)))
 
 (defn context
   "A fresh normalising context.  defs: name -> {:params :body :recursive?};
   types: variable -> type; tenv: data declarations."
-  [{:keys [defs types tenv facts ih fuel lemmas lemmas-used recognizers]}]
+  [{:keys [defs types tenv facts ih fuel lemmas lemmas-used recognizers burned unfolded]}]
   {:defs (or defs {}) :types (or types {}) :tenv (or tenv {})
    :recognizers (or recognizers {})
    :facts (or facts {}) :ih (or ih []) :lemmas (or lemmas [])
    :lemmas-used (or lemmas-used (atom #{}))
-   :memo (atom {}) :stuck (atom #{}) :unfolded (atom #{}) :used-ih (atom 0) :int-memo (atom {})
+   :memo (atom {}) :stuck (atom #{}) :unfolded (or unfolded (atom #{})) :used-ih (atom 0) :int-memo (atom {})
    :held (atom #{})
+   ;; every rewrite of an attempt, across its contexts, for its telemetry
+   :burned burned
    :fuel (atom (or fuel 20000))})
 
 ;; --- checking the rules against the runtime ----------------------------------------

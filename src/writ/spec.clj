@@ -41,6 +41,7 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.set :as set]
+            [clojure.walk :as walk]
             [clojure.string :as str]
             [writ.book :as book]
             [writ.check :as ck]
@@ -124,16 +125,25 @@
     (spec my.sort {:require :proved})  ; every law must be proved
 
   Under {:require :proved} a law that is only tested fails the check,
-  unless the law itself says why it cannot be proved yet."
+  unless the law itself says why it cannot be proved yet.
+
+    (spec my.app {:uses [my.sort-spec]})
+
+  checks my.sort-spec first, and its laws that are proved are lemmas here:
+  a proof may cite them.  Like a proof namespace's lemmas they are not
+  laws of this spec, and judge no stand-in.  One that is only tested is
+  not imported, and the report says so."
   ([target] `(spec ~target {}))
   ([target opts]
    (when-not (simple-sym? target)
      (fail! "`spec` names a namespace symbol, had: `" (pr-str target) "`"))
    (when-not (map? opts)
      (fail! "`spec " target "` takes an options map after the namespace, had: " (pr-str opts)))
-   (when-let [bad (seq (remove #{:require} (keys opts)))]
-     (fail! "`spec " target "` has unknown options: " (pr-str bad) "; it takes :require"))
+   (when-let [bad (seq (remove #{:require :uses} (keys opts)))]
+     (fail! "`spec " target "` has unknown options: " (pr-str bad) "; it takes :require and :uses"))
    (when (contains? opts :require) (check-level! (str "`spec " target "`") (:require opts)))
+   (when (and (contains? opts :uses) (not (and (vector? (:uses opts)) (every? simple-sym? (:uses opts)))))
+     (fail! "`spec " target "` :uses takes a vector of spec namespaces, had: " (pr-str (:uses opts))))
    `(-register! '~(ns-name *ns*) :target '~[target opts])))
 
 (defmacro data
@@ -973,6 +983,85 @@
                      (let [r (apply real args)]
                        (if (some #(= % (nth args i)) vs) r (other r)))))})))))
 
+(def ^:private swaps
+  "What a mutant puts in place of an operator: the mistake a slip of the
+  hand makes."
+  '{< <=, <= <, > >=, >= >, = not=, not= =, inc dec, dec inc, + -, - +, and or, or and,
+    first last, rest butlast, pos? neg?, zero? pos?, empty? seq, max min, min max})
+
+(defn- mutation-sites
+  "The places in form a mutant changes, as [path replacement desc]: an
+  operator swapped, an integer one off, an if's branches swapped.  A
+  quoted form is data, and is left alone."
+  [form]
+  (letfn [(sites [f path parent]
+            (cond
+              (and (seq? f) (= 'quote (first f))) []
+              (seq? f)
+              (let [[h & args] f]
+                (concat
+                  (when-let [r (and (symbol? h) (get swaps (symbol (name h))))]
+                    [[(conj path 0) r (str "uses `" r "` for `" h "` in " (pr-str f))]])
+                  (when (and (contains? '#{if clojure.core/if} h) (= 4 (count f)))
+                    [[path (list h (nth f 1) (nth f 3) (nth f 2)) (str "swaps the branches of " (pr-str f))]])
+                  (mapcat (fn [i x] (sites x (conj path i) f)) (range 1 (count f)) args)))
+              (vector? f) (mapcat (fn [i x] (sites x (conj path i) f)) (range) f)
+              (and (integer? f) (not (boolean? f)))
+              (for [x [(inc f) (dec f)]]
+                [path x (str "has " x " for " f (when parent (str " in " (pr-str parent))))])
+              :else []))]
+    (sites form [] nil)))
+
+(defn- put-at
+  "form with the part at path replaced by x; lists stay lists."
+  [form path x]
+  (if (empty? path)
+    x
+    (let [[i & more] path
+          v (vec form)
+          v (assoc v i (put-at (nth v i) more x))]
+      (if (vector? form) v (with-meta (apply list v) (meta form))))))
+
+(declare static-check defn-parts source-url)
+
+(defn- mutants
+  "Mutants of signed fn nm, as impostors: its source changed at one place,
+  kept only when writ's static check still passes it -- so it is
+  well-typed and terminates -- and when some input tells it from the
+  real fn, which :distinguish holds.  A mutant no input tells apart is the
+  same fn, and never a gap.  At most budget of them."
+  [e target nm sig ctx seed budget]
+  (let [forms (book/read-forms (source-url target))
+        f (first (filter #(and (ck/defn-form? %) (= nm (second %))) forms))
+        {:keys [params body]} (when f (defn-parts f))]
+    (when (and f (vector? params))
+      (let [gens (try (mapv #(type->gen % (:tenv ctx)) (:params sig)) (catch Throwable _ nil))
+            real @(ns-resolve (the-ns target) nm)
+            static-ok? (fn [body*]
+                         (let [f* (apply list (concat (take-while #(not= params %) f) [params] body*))]
+                           (:ok (static-check (assoc e ::forms-override {nm f*})))))
+            run (fn [g args] (try {:ok (apply g args)} (catch Throwable _ ::threw)))
+            differ (fn [g]
+                     (when gens
+                       (first (for [i (range 60)
+                                    :let [args (map-indexed (fn [j gn] (gen/generate gn (mod i 20) (+ seed i (* 31 j)))) gens)]
+                                    :when (not= (run real args) (run g args))]
+                                (zipmap (map-indexed (fn [i _] (nth params i (symbol (str "arg" i)))) (:params sig)) args)))))]
+        (->> (mutation-sites (vec body))
+             (take (* 4 budget))
+             (keep (fn [[path x desc]]
+                     (let [body* (seq (put-at (vec body) path x))]
+                       (when (static-ok? body*)
+                         (let [g (try (binding [*ns* (the-ns target)]
+                                        (eval (list* 'fn nm params body*)))
+                                      (catch Throwable _ nil))
+                               d (when g (differ g))]
+                           (when d
+                             {:desc (str desc ", and it differs from the real fn on " (pr-str d))
+                              :kind :mutant
+                              :make (fn [_] g)}))))))
+             (take budget))))))
+
 (declare leading-foralls holds)
 
 (defn- holds-sampled?
@@ -1005,7 +1094,7 @@
   "Swap each signed public fn for its impostors, one at a time, and run
   every law against each.  Returns, per fn, [{:fn f :laws n :rejected
   [impostor] :survivors [desc]}]: a survivor is a gap in the spec."
-  [ctx target fns anns props trials seed]
+  [ctx target fns anns props trials seed & [extra]]
   (vec (for [nm fns
              :let [v (ns-resolve (the-ns target) nm)
                    real @v
@@ -1021,7 +1110,8 @@
                                  (finally (alter-var-root v (constantly real)))))
                    {survived true rejected false}
                    (group-by (comp boolean survives?)
-                             (impostors nm sig argn (:tenv ctx) seed pins))]]
+                             (concat (impostors nm sig argn (:tenv ctx) seed pins)
+                                     (when extra (extra nm sig))))]]
          {:fn nm
           :laws (count (filter #(some #{qnm} (tree-seq coll? seq %)) props))
           :rejected (mapv #(dissoc % :make) rejected)
@@ -1083,7 +1173,12 @@
   private?}} or {:ok false :error msg}."
   [{:keys [target data anns] :as e}]
   (try
-    (let [forms (book/read-forms (source-url target))
+    (let [forms (cond->> (book/read-forms (source-url target))
+                  ;; a mutant's source in place of the fn's own
+                  (::forms-override e)
+                  (mapv #(if (and (ck/defn-form? %) (contains? (::forms-override e) (second %)))
+                           (get (::forms-override e) (second %))
+                           %)))
           defns (into {} (keep (fn [f] (when (ck/defn-form? f)
                                          (let [p (defn-parts f)]
                                            [(:name p) (or (= "defn-" (name (first f)))
@@ -2258,11 +2353,25 @@
            "\n  (found by the solver, when no test did, and confirmed by running the code)"
            (when seed (str "\n  (replay with {:seed " seed "})"))))))
 
+(defn- format-stuck
+  "Where a failed proof search got stuck, for a report: the goal it could
+  not close, in which induction case, and the facts it had.  A lemma that
+  proves the goal from those facts would close it."
+  [stuck]
+  (let [one (fn [{:keys [case goal facts]}]
+              (str "\n  stuck" (when (seq case) (str " in " (str/join ", within " (reverse case))))
+                   " on\n      " goal
+                   (when (seq facts)
+                     (str "\n    given\n" (str/join "\n" (map #(str "      " %) facts))))))]
+    (str (apply str (map one (take 2 stuck)))
+         (when (seq stuck)
+           "\n  A lemma that proves such a goal from what it is given would close it."))))
+
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
   [{:keys [ok target spec static laws gaps unspecified rejected calls flows machines proof graphs graph-missing
-           lemmas off-graph]
-    ambiguous ::ambiguous}]
+           lemmas off-graph uses]
+    ambiguous ::ambiguous explain ::explain}]
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
        (when (and proof (pos? (:laws proof)))
          (str "\n  " (:proved proof) " of " (:laws proof) " laws proved"
@@ -2272,6 +2381,10 @@
               (when (= :proved (:require proof)) " (the spec requires proof)")
               (when-let [ts (seq (filter #(= :test (:evidence %)) laws))]
                 (str "; tested, not proved: " (str/join ", " (map :law ts))))))
+       (apply str (for [{d :spec n :imported sk :skipped} uses]
+                    (str "\n  uses " d ": " n (if (= 1 n) " proved law" " proved laws") " to cite"
+                         (apply str (for [[l why] sk]
+                                      (str "\n    law `" l "` of " d " is not imported, being unproved: " why))))))
        (apply str (for [{l :lemma p :proof st :status} lemmas :when (= :proved st)]
                     (str "\n  lemma `" l "` proved " p)))
        (apply str (for [{l :law p :proof st :status} laws :when (= :proved st)]
@@ -2281,6 +2394,9 @@
                       (str "\n  law `" l "` is marked {:require :tested}, but it is now proved;"
                            " drop the marker so a regression is caught")
                       (str "\n  law `" l "` is only tested: " b))))
+       (when explain
+         (apply str (for [{l :law st :status stuck :stuck} laws :when (and (= :tested st) (seq stuck))]
+                      (str "\n  law `" l "`'s proof search" (subs (format-stuck stuck) 2)))))
        (when ok
          (apply str (for [{f :fn n :laws imps :rejected} rejected]
                       (str "\n  `" f "`: " n (if (= 1 n) " law, " " laws, ")
@@ -2385,14 +2501,23 @@
                          "\n  the prover: " (or why "no proof found")
                          "\n  A lemma must be proved before a law may cite it: give it a hint,"
                          "\n  or a lemma of its own.")))
-       (apply str (for [{l :law why :unproved st :status need :require} laws :when (= :unproved st)]
+       (apply str (for [{l :law why :unproved st :status need :require stuck :stuck} laws :when (= :unproved st)]
                     (str "\n\nlaw `" l "` is tested, not proved, and the "
                          (if need "law" "spec") " requires proof"
                          "\n  the prover: " (or why "no proof found")
+                         (format-stuck stuck)
                          "\n  Prove it: state it in terms the prover models, or state the lemma"
                          "\n  it needs as a law of its own.  If it cannot be proved yet, say why"
                          "\n  on the law, and every report will show it:"
                          "\n  (law " l " {:require :tested :because \"...\"} ...)")))
+       (apply str (for [{sg :suggestion :as x} (concat lemmas laws) :when sg]
+                    (str "\n\n" (if (:lemma x) (str "lemma `" (:lemma x)) (str "law `" (:law x))) "` "
+                         (cond
+                           (:hint sg) (str "is proved with this hint in the proof namespace:\n  "
+                                           (pr-str (:hint sg)))
+                           (:lemma sg) (str "is proved with this lemma in the proof namespace; it passes"
+                                            " its tests and the prover proves it:\n  " (pr-str (:lemma sg)))
+                           :else (str "has no suggestion: " (:none sg))))))
        (apply str (map #(str "\n\nlaw `" (:law %) "` is vacuous: " (:why %)
                              ". A law must say what the code does.")
                        (filter #(= :vacuous (:status %)) laws)))
@@ -2429,21 +2554,54 @@
   (io/file dir (str spec-ns "--" target ".edn")))
 
 (defn- load-proofs
-  "The proof results cached for a spec and target, when they were found
-  from exactly these sources; {} otherwise.  The sources are kept whole, not hashed, so a
-  cached proof is never taken for a different law or different code."
-  [dir spec-ns sources]
+  "The proof cache for a spec and target, when it was made by this writ:
+  {:laws {key result} :traces {law trace}}, or empty.  A law's key holds
+  everything its proof can rest on -- the law, its hint, the lemmas it may
+  cite, and the definitions it reaches, whole -- so a result is never taken
+  for a different law or different code.  A trace is only a candidate:
+  the checker replays it against the code as it is now."
+  [dir spec-ns version]
   (or (try (let [f (cache-file dir spec-ns)]
              (when (.exists f)
                (let [c (edn/read-string (slurp f))]
-                 (when (= sources (:sources c)) (:proofs c)))))
+                 (when (= version (:version c)) (select-keys c [:laws :traces])))))
            (catch Throwable _ nil))
-      {}))
+      {:laws {} :traces {}}))
 
-(defn- save-proofs! [dir spec-ns sources proofs]
+(defn- save-proofs! [dir spec-ns version cache]
   (try (.mkdirs (io/file dir))
-       (spit (cache-file dir spec-ns) (pr-str {:sources sources :proofs proofs}))
+       (spit (cache-file dir spec-ns) (pr-str (assoc cache :version version)))
        (catch Throwable _ nil)))
+
+(defn- canonical-names
+  "t with the names translation makes up -- loop definitions and their
+  locals, numbered as they were made -- renumbered in the order they
+  appear in t, so editing an earlier fn does not change a later one's."
+  [t]
+  (let [made? #(and (symbol? %) (re-find #"(%|\$loop)\d+$" (name %)))
+        order (distinct (filter made? (tree-seq coll? seq t)))
+        ren (zipmap order (map-indexed (fn [i s] (symbol (str "n%" i))) order))]
+    (walk/postwalk #(if (made? %) (get ren % %) %) t)))
+
+(defn- reach
+  "The definitions law prop reaches, each once, in the order a walk from
+  the prop meets them, and the plain data of the names it refers to: all
+  its proof can read of the code."
+  [ds prop]
+  (let [syms (filter symbol? (tree-seq coll? seq prop))
+        calls (fn [d] (keep #(when (and (vector? %) (contains? #{:app :dfn} (first %))) (second %))
+                            (tree-seq coll? seq (:body d))))]
+    (loop [todo (vec (filter #(contains? ds %) syms)), seen #{}, out []]
+      (if-let [f (first todo)]
+        (if (contains? seen f)
+          (recur (subvec todo 1) seen out)
+          (recur (into (subvec todo 1) (calls (get ds f))) (conj seen f) (conj out [f (get ds f)])))
+        [(canonical-names out)
+         (vec (for [x (distinct syms)
+                    :when (and (namespace x) (not (contains? ds x)))
+                    :let [v (try (resolve x) (catch Throwable _ nil))]
+                    :when (and (var? v) (bound? v) (not (fn? @v)))]
+                [x @v]))]))))
 
 (defn- cached-contracts
   "The contracts proved for target, from the cache when they were proved
@@ -2549,6 +2707,89 @@
               (recur (concat (rest todo) deps) (conj seen n) (conj out [n forms ref-map]))))))
       out)))
 
+(defn- hint-candidates
+  "Hints to try on a law over variables vs, cheapest first: induction on
+  each, then with one or all of the others free in the hypothesis, each
+  strategy on its own, and more fuel.  A hint's :use is kept."
+  [vs hint]
+  (let [keep-use #(merge (select-keys hint [:use]) %)]
+    (distinct
+      (map keep-use
+           (concat (for [v vs] {:induct v})
+                   (for [v vs, w vs :when (not= v w)] {:induct v :vary [w]})
+                   (for [v vs :when (< 2 (count vs))] {:induct v :vary (vec (remove #{v} vs))})
+                   [{:strategy :symbolic} {:strategy :induction} {:strategy :rewriting}]
+                   [{:fuel 80000}])))))
+
+(defn- suggest-proof
+  "For a law that is tested and not proved, a hint that proves it, or a
+  lemma: {:hint (hint ...)} or {:lemma (lemma ...)}, or {:none why}.  A
+  lemma comes from the goals the search got stuck on; it is offered only
+  once it has passed its tests, been proved itself, and proved the law.
+  Nothing is added to the spec: the proof namespace stays the record."
+  [r lemmas attempt** ctx rets hint {:keys [budget] :or {budget 40}}]
+  (let [vs (mapv first (first (leading-foralls (:prop r))))
+        tries (atom 0)
+        spent? #(>= @tries budget)
+        prove #(do (swap! tries inc) (attempt** %1 %2 nil %3))
+        by-hint (first (for [h (hint-candidates vs hint)
+                             :while (not (spent?))
+                             :when (:proved (prove r lemmas h))]
+                         h))]
+    (if by-hint
+      {:hint (list 'hint (:law r) by-hint)}
+      (let [raw (:stuck-raw (attempt** r lemmas nil))
+            cands (take 8 (prover/lemma-candidates raw rets))
+            named (symbol (str (:law r) "-needs"))
+            found (first
+                    (for [{:keys [bindings hyps goal]} cands
+                          :while (not (spent?))
+                          :let [form (list 'forall (vec (mapcat identity bindings))
+                                           (if (seq hyps) (list '=> (if (next hyps) (cons 'and hyps) (first hyps)) goal) goal))
+                                prop (desugar form)
+                                t (test-law ctx {:name named :prop prop} {:trials 100 :seed 1 :max-size 30})]
+                          :when (contains? #{:tested :evaluated} (:status t))
+                          :when (:proved (prove {:prop prop :lemma true :law named} lemmas nil))
+                          :when (:proved (prove r (conj lemmas {:name named :prop prop}) nil))]
+                      form))]
+        (if found
+          {:lemma (list 'lemma named found)}
+          {:none (if (spent?) (str "none found within " budget " attempts") "none found")})))))
+
+(def ^:private ^:dynamic *using*
+  "The specs being checked for a spec that uses them, to refuse a cycle."
+  #{})
+
+(declare check)
+
+(defn- imports-of
+  "What spec-ns imports from the specs its :uses names: {:lemmas [{:name
+  :prop}] :tenv :report [{:spec :imported :skipped}]}.  Each is checked
+  (from its cache when that holds); a law of one that is proved is a
+  lemma here, erased and qualified as it was there, and one only tested
+  is not."
+  [spec-ns e opts]
+  (let [deps (:uses e)]
+    (when (some #(contains? (conj *using* spec-ns) %) deps)
+      (fail! "`" spec-ns "` uses " (pr-str (vec (filter #(contains? (conj *using* spec-ns) %) deps)))
+             ", which uses it back: specs may not use each other in a cycle"))
+    (reduce (fn [acc dep]
+              (let [r (binding [*using* (conj *using* spec-ns)]
+                        (check dep (-> (select-keys opts [:cache :cache-dir :seed :fuel])
+                                       (assoc :adequacy false))))
+                    proved (::proved-props r)
+                    de (get @registry dep)
+                    ;; a law that holds but is closed, or only witnessed, has
+                    ;; nothing to instantiate: only an unproved forall is missed
+                    skipped (vec (for [l (:laws r) :when (contains? #{:tested :unproved :failed} (:status l))]
+                                   [(:law l) (or (:unproved l) (name (:status l)))]))]
+                (-> acc
+                    (update :lemmas into proved)
+                    (update :tenv merge (type-env-of de dep))
+                    (update :report conj {:spec dep :imported (count proved) :skipped skipped}))))
+            {:lemmas [] :tenv {} :report []}
+            deps)))
+
 (defn- prove-laws
   "Try to prove each law that ran.  A tested law the prover proves becomes
   :proved; a law it cannot prove keeps :tested with the reason.  A law
@@ -2590,29 +2831,31 @@
                              (cached-contracts cache-dir target
                                                [@writ-version (book/read-forms (source-url target)) sigs tenv]
                                                #(prover/prove-contracts {:defs ds :tenv tenv :sigs sigs}))))
-          ;; a proof found before, from the same law, lemmas, code, spec,
-          ;; proof namespace and writ, is the same proof
-          sources (delay (pr-str [@writ-version
-                                  (map second (lib-pairs target))
-                                  (book/read-forms (source-url spec-ns))
-                                  (some-> (::proof-ns opts) source-url book/read-forms)]))
-          cached (atom (if cache-dir (load-proofs cache-dir [spec-ns target] @sources) {}))
+          ;; a proof found before, from the same law, lemmas and the code it
+          ;; reaches, by the same writ, is the same proof
+          cached (atom (if cache-dir (load-proofs cache-dir [spec-ns target] @writ-version) {:laws {} :traces {}}))
           fresh (atom false)]
       ;; a law proved here is a lemma for any law proved after it; one that
       ;; is only tested, or that a test refutes, never is.  Passes repeat
       ;; while they prove something new, so a law may cite one that comes
       ;; later in the spec, and no proof can lean on itself: each cites
       ;; only laws whose proofs were finished before it began
-      (let [attempt** (fn [r lemmas]
-                      (try (let [[ds own] @defs]
+      (let [attempt** (fn [r lemmas replay & [hint]]
+                      (try (let [[ds own] @defs
+                                 hint (or hint (get (::hints opts) (:law r)))]
                              (prover/prove-law {:prop (erase-law (:prop r) refs spec-ns)
-                                                :hint (get (::hints opts) (:law r))
-                                                :fuel (or (:fuel (get (::hints opts) (:law r))) (:fuel opts))
+                                                :replay replay
+                                                :prover (:prover opts)
+                                                :hint hint
+                                                :fuel (or (:fuel hint) (:fuel opts))
                                                 :total (:total r)
                                                 :lemma (:lemma r)
                                                 :sigs sigs :contracts @contracts
                                                 :defs ds :tenv tenv
-                                                :target target :own (merge own (nth @libs+refers 2)) :lemmas lemmas
+                                                :target target :own (merge own (nth @libs+refers 2))
+                                                ;; a lemma's types erased as the law's are, so a
+                                                ;; refinement in both is the same base type
+                                                :lemmas (mapv #(update % :prop erase-law refs spec-ns) lemmas)
                                                 :rets (into {} (for [[nm sig] anns]
                                                                  [(symbol (str target) (str nm))
                                                                   (plain (:ret sig))]))}))
@@ -2622,23 +2865,28 @@
             ;; symbolically, which a recursive fn defeats; its landing is
             ;; then proved by any strategy, and the report says the rest
             ;; was tested
-            attempt* (fn [r lemmas]
-                       (let [pr (attempt** r lemmas)]
+            attempt* (fn [r lemmas replay]
+                       (let [pr (attempt** r lemmas replay)]
                          (if (or (:proved pr) (not (:total r)))
                            pr
-                           (let [pr2 (attempt** (dissoc r :total) lemmas)]
+                           (let [pr2 (attempt** (dissoc r :total) lemmas replay)]
                              (if (:proved pr2)
                                (update pr2 :summary str
                                        ", and it threw on no test (that it never throws is not proved)")
                                pr)))))
             attempt (fn [r lemmas]
-                      (let [k (pr-str [(:prop r) (get (::hints opts) (:law r)) (:total r) lemmas (:fuel opts)])]
-                        (or (when-let [pr (get @cached k)] (assoc pr :cached true))
+                      (let [law-id (pr-str [(:prop r) (get (::hints opts) (:law r)) (:total r)])
+                            k (pr-str [(:prop r) (get (::hints opts) (:law r)) (:total r) lemmas (:fuel opts) (:prover opts)
+                                       (reach (first @defs) (:prop r)) tenv sigs @contracts])]
+                        (or (when-let [pr (get-in @cached [:laws k])] (assoc pr :cached true))
                             ;; a search that failed is kept too: it can only
                             ;; say "not proved", and a counterexample in it is
-                            ;; run on the code again before it is believed
-                            (let [pr (attempt* r lemmas)]
-                              (swap! cached assoc k (select-keys pr [:proved :summary :lemmas :reason :counterexample]))
+                            ;; run on the code again before it is believed.
+                            ;; The law's last proof is replayed first
+                            (let [pr (attempt* r lemmas (get-in @cached [:traces law-id]))]
+                              (swap! cached assoc-in [:laws k]
+                                     (select-keys pr [:proved :summary :lemmas :reason :counterexample :stuck]))
+                              (when (:trace pr) (swap! cached assoc-in [:traces law-id] (:trace pr)))
                               (reset! fresh true)
                               pr))))
             open? (fn [r] (and (:prop r) (contains? #{:tested :failed} (:status r))
@@ -2662,9 +2910,11 @@
                                                      ", and it threw on no test (that it never throws is not proved)"))})]
                            (cond
                              (and (:proved pr) (= :tested (:status r)))
-                             [(conj out (cond-> (-> r (dissoc :unproved)
+                             [(conj out (cond-> (-> r (dissoc :unproved :stuck)
+                                                    (cond-> (and (:explain opts) (:attempts pr)) (assoc :attempts (:attempts pr)))
                                                     (assoc :status :proved :proof (:summary pr)))
                                           (:cached pr) (assoc :cached true)
+                                          (:replayed pr) (assoc :replayed true)
                                           (seq (:lemmas pr)) (assoc :lemmas (:lemmas pr))))
                               (conj lemmas {:name (:law r) :prop (:prop r)})]
 
@@ -2676,6 +2926,8 @@
 
                              (= :tested (:status r))
                              [(conj out (cond-> (assoc r :unproved (:reason pr))
+                                          (seq (:stuck pr)) (assoc :stuck (:stuck pr))
+                                          (and (:explain opts) (:attempts pr)) (assoc :attempts (:attempts pr))
                                           ;; outside the model: no lemma changes that
                                           (str/starts-with? (str (:reason pr)) "outside")
                                           (assoc :unproved-final true)))
@@ -2683,11 +2935,24 @@
                              :else [(conj out (assoc r :unproved-final true)) lemmas]))))
                      [[] lemmas]
                      rs))]
-        (loop [[rs lemmas] (pass [results []])]
+        ;; the proved laws of the specs this one uses come first
+        (loop [[rs lemmas] (pass [results (vec (::imports opts))])]
           (let [[rs2 lemmas2] (pass [rs lemmas])]
             (if (= (count lemmas2) (count lemmas))
-              (do (when (and cache-dir @fresh) (save-proofs! cache-dir [spec-ns target] @sources @cached))
-                  (mapv #(dissoc % :unproved-final) rs2))
+              (do (when (and cache-dir @fresh) (save-proofs! cache-dir [spec-ns target] @writ-version @cached))
+                  (let [rs2 (mapv #(dissoc % :unproved-final) rs2)]
+                    (if (:suggest opts)
+                      (mapv #(if (and (= :tested (:status %)) (:unproved %)
+                                      (not (str/starts-with? (str (:unproved %)) "outside")))
+                               (let [sg (suggest-proof % lemmas2 attempt** ctx
+                                                       (into {} (for [[nm sig] anns]
+                                                                  [(symbol (str target) (str nm)) (plain (:ret sig))]))
+                                                       (get (::hints opts) (:law %))
+                                                       (if (map? (:suggest opts)) (:suggest opts) {}))]
+                                 (cond-> % sg (assoc :suggestion sg)))
+                               %)
+                            rs2)
+                      rs2)))
               (recur [rs2 lemmas2]))))))))
 
 (def ^:private evidence-of
@@ -2745,9 +3010,14 @@
   failure.  opts: :target, :trials (test.check runs per law, default 100),
   :seed (default random; each law's report carries the one it used) and
   :max-size (the largest generated size, default 50), :adequacy (false
-  skips the gap check), :prove (false skips the prover), :fuel (the
+  skips the gap check; :mutants adds mutants of each fn's source to its
+  stand-ins), :prove (false skips the prover), :fuel (the
   rewrites the prover may make on one attempt, default 20000) and :require
-  (:proved or :tested, in place of the spec's own)."
+  (:proved or :tested, in place of the spec's own), :prover (knobs of
+  the prover over writ.prove/default-config, for a bench to try) and
+  :explain (true
+  gives each law the prover tried its :attempts, and the report the
+  goals a tested law's proof got stuck on)."
   ([spec-ns] (check spec-ns {}))
   ([spec-ns opts]
    (let [{:keys [trials seed max-size] :or {trials 100 max-size 50}} opts
@@ -2822,8 +3092,10 @@
              level (or (:require opts) (:require e) :tested)
              _ (check-level! "`check`" level)
              results (mapv #(cond-> % (contains? lemma-names (:law %)) (assoc :lemma true)) results)
-             results (-> (prove-laws results (assoc opts ::hints (:hints proof-e) ::proof-ns (:ns proof-e))
-                                     target spec-ns data-tenv anns refs ctx)
+             imports (imports-of spec-ns e opts)
+             results (-> (prove-laws results (assoc opts ::hints (:hints proof-e) ::proof-ns (:ns proof-e)
+                                                   ::imports (:lemmas imports))
+                                     target spec-ns (merge (:tenv imports) data-tenv) anns refs ctx)
                          (require-evidence
                            ;; a lemma is there to be cited, so it must be proved
                            (mapv #(if (:lemma %) (assoc-in % [:opts :require] :proved) %) laws)
@@ -2848,12 +3120,20 @@
                                              (for [m (:machines e)]
                                                (qualify (machine-prop m e) #{} publics interns
                                                         target spec-ns)))
-                                trials (or seed 42))
+                                trials (or seed 42)
+                                ;; mutants of the fn's source, on request: they cost
+                                ;; a static check each
+                                (when (= :mutants (:adequacy opts))
+                                  (fn [nm sig] (mutants e target nm sig ctx (or seed 42) 12))))
                       [])
              gaps (vec (for [{f :fn s :survivors} per-fn :when (seq s)]
                          {:fn f :survivors s}))
              lemma-results (mapv #(-> % (dissoc :prop :lemma) (set/rename-keys {:law :lemma}))
                                  (filter :lemma results))
+             proved-props (vec (for [r results
+                                     :when (and (:prop r) (= :proved (:status r)) (not (:lemma r)))]
+                                 {:name (symbol (str spec-ns) (str (:law r)))
+                                  :prop (erase-law (:prop r) refs spec-ns)}))
              ;; whether each law is about every input, read before :prop goes
              results (mapv #(cond-> (dissoc % :prop) (head? (:prop %) "forall") (assoc ::general true))
                            (remove :lemma results))
@@ -2882,6 +3162,9 @@
                                  (:graphs e))
              graphless (and (empty? (:graphs e)) (empty? (:machines e)))
              r (assoc base :laws results :gaps gaps :calls call-results :flows flow-results
+                           :uses (:report imports)
+                           ;; the proved laws, erased and qualified, for a spec that uses this one
+                           ::proved-props proved-props
                            :lemmas lemma-results
                            :graph-missing graphless
                            :graphs (mapv #(dissoc % ::unproved ::obligations ::steps) graph-results)
@@ -2899,7 +3182,8 @@
                                     (every? #(= :ok (:status %)) graph-results)
                                     (not graphless)))]
          (assoc r :message (format-report (assoc r :machines machine-results
-                                                   :graphs graph-results))))))))
+                                                   :graphs graph-results
+                                                   ::explain (:explain opts)))))))))
 
 (defn check!
   "`check`, throwing with the report's message when anything fails."

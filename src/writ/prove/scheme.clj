@@ -239,10 +239,12 @@
                         :else [nil nil])]
     (when c
       (first (for [[x k] pairs
-                   :when (and (symbol? x) (contains? #{1 -1} k))
-                   :let [others (remove #(= x (first %)) pairs)
-                         ;; x*k + c + others = 0  =>  x = -(c + others)/k
-                         m {:c (- (* k c)) :m (into {} (map (fn [[a j]] [a (- (* k j))])) others)}]]
+                   :let [others (remove #(= x (first %)) pairs)]
+                   ;; x must not occur in the rest, or putting it in solves nothing
+                   :when (and (symbol? x) (contains? #{1 -1} k)
+                              (not-any? #(contains? (t/vars (first %)) x) others))
+                   ;; x*k + c + others = 0  =>  x = -(c + others)/k
+                   :let [m {:c (- (* k c)) :m (into {} (map (fn [[a j]] [a (- (* k j))])) others)}]]
                [x (rw/lin->term m)])))))
 
 (defn assume-hyp
@@ -312,8 +314,10 @@
                            value? #(or (t/lit? %) (= t/tnil %) (and (vector? %) (empty? (t/vars %))
                                                                     (not-any? (fn [y] (contains? #{:app :call :ap} (head y)))
                                                                               (t/subterms %))))]
-                       ;; (= :Miss (f x)) rewrites (f x) to :Miss, not the other way
-                       (if (and (value? a) (not (value? b)))
+                       ;; (= :Miss (f x)) rewrites (f x) to :Miss, not the other
+                       ;; way, and (= id (f x)) rewrites (f x) to id: a bare
+                       ;; variable on the left would match every term
+                       (if (and (or (value? a) (symbol? a)) (not (value? b)) (not (symbol? b)))
                          {:hyp hi :lhs b :rhs a}
                          {:hyp hi :lhs a :rhs b}))
                      {:hyp hi :lhs (n gi) :rhs [:lit true]})
@@ -396,7 +400,11 @@
         [ctx vacuous] (reduce (fn [[c vac] {:keys [hyp lhs rhs vars]}]
                                 (if (and (not vac) (= [:lit true] rhs) (empty? vars)
                                          (or (nil? hyp) (true? (rw/truthiness c (rw/normalize c hyp)))))
-                                  (assume-hyp c lhs)
+                                  ;; read again under the facts so far: a hypothesis
+                                  ;; that x is an integer lets (<= 0 x) be arithmetic
+                                  ;; -- but not by the hypotheses, which would read it
+                                  ;; as true
+                                  (assume-hyp c (rw/normalize (assoc c :ih [] :memo (atom {})) lhs))
                                   [c vac]))
                               [ctx vacuous] (if vacuous [] (:ih ctx)))
         ctx (assoc ctx :memo (atom {}) :stuck (atom #{}) :int-memo (atom {}))]

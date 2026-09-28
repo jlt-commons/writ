@@ -235,8 +235,19 @@ the spec does not pin down `classify-read`: every law still holds when it return
 ```
 
 The stand-ins are a fixed family, so a spec that rejects them all can still
-be too weak. Passing this check is necessary for a good spec, not
-sufficient.
+be too weak. `{:adequacy :mutants}` adds mutants of each fn's own source:
+the fn with one operator swapped (`<` for `<=`, `inc` for `dec`, ...), an
+integer one off, or an if's branches swapped. A mutant must pass writ's
+static check, so it is well-typed and terminates, and it counts only when
+some input tells it apart from the real fn; one that no input tells apart
+is the same fn, and never a gap. For `sign`, whose laws say what it does
+at positive and negative `n` but not at 0:
+
+```
+the spec does not pin down `sign`: every law still holds when it has 1 for 0 in (cond (pos? n) 1 (neg? n) -1 :else 0), and it differs from the real fn on {n 0}
+```
+
+Passing this check is necessary for a good spec, not sufficient.
 
 ## Writing a spec
 
@@ -683,7 +694,16 @@ It works in three stages, and each runs only if the one before passed.
 
    A tested law has been tested, not proved; the status keeps the two
    apart. A tested law the prover could not prove carries `:unproved`
-   with the reason. Each law's `:evidence` is `:proof` (proved,
+   with the reason, and `:stuck`: the goals the search could not close,
+   deepest in the attempt that got furthest first, each with the
+   induction case it was in and the facts it had. The report shows them
+   under a law that needs proof; a lemma that proves such a goal from
+   those facts closes it. With `{:explain true}`, each law the prover
+   tried also carries `:attempts`, one entry a strategy in the order they
+   ran, `{:name [:induct xs] :outcome :failed :fuel 3951 :ms 591}`, the
+   outcome `:proved`, `:failed`, `:fuel` (it ran out) or `:rejected` (the
+   checker refused its proof), and the report shows the stuck goals of
+   laws that are only tested too. Each law's `:evidence` is `:proof` (proved,
    evaluated or witnessed) or `:test`, and `:proof` in the report counts
    them. When the spec requires proof, a law that is only tested gets
    `:status :unproved` and fails; see [Requiring proof](#requiring-proof). While laws run, the target's signed fns are instrumented, so a
@@ -722,15 +742,36 @@ needs, in place of the spec's own. `:proof` names the proof namespace
 (`false` for none), and `:fuel` gives the prover more rewrites per
 attempt.
 
-Proofs are cached in `.writ-cache/`, one file per spec. A cached proof is
-used only when the law, its hint and lemmas, and the source of the code,
-the spec, the proof namespace and writ itself are all exactly as they
-were when it was found and checked, so a check that changes nothing
-proves nothing again. The contracts proved for the code are cached
+Proofs are cached in `.writ-cache/`, one file per spec. Each law's result
+is kept under a key of everything its proof can rest on: the law, its
+hint, the lemmas it may cite, the definitions it reaches (the fns it calls
+and the fns they call, not the rest of the code), the plain data it names,
+the signatures and data types, and writ itself. So a check that changes
+nothing proves nothing again, and editing one fn keeps the results of the
+laws that never reach it. The proof of each law is kept too: when a law's
+key has changed, its last proof is replayed through the checker against
+the code as it is now, and only if the checker rejects it does the search
+run. A replayed proof is marked `:replayed`. Since the checker is what a
+proof rests on, a stale or wrong proof in the cache can't make a law
+proved. The contracts proved for the code are cached
 apart, in one file per implementation, keyed on the code, its signatures
 and data and writ, so editing a law or the proof namespace keeps them.
 `:cache false` turns it off; `:cache-dir` puts it
 elsewhere. Add `.writ-cache/` to `.gitignore`.
+
+A spec can build on another's proved laws:
+
+```clojure
+(spec my.app {:uses [my.sort-spec]})
+```
+
+checks `my.sort-spec` first (from its cache, when that holds), and each of
+its laws that is proved is a lemma here, which a proof may cite by its
+full name, `my.sort-spec/sorted`. Like a proof namespace's lemmas, they
+are not laws of this spec, count toward nothing and judge no stand-in, so
+a strong dependency can't make a weak spec look strong. A law of the used
+spec that is only tested is not imported, and the report says so. Specs
+may not use each other in a cycle.
 
 ### Requiring proof
 
@@ -821,6 +862,20 @@ only lemmas and laws a proof may cite, `:strategy` one of `:symbolic`,
 `:induction` or `:rewriting`, and `:fuel` the rewrites one attempt may
 make. A proof a hint leads to is checked like any other.
 
+`{:suggest true}` (or `{:suggest {:budget 40}}`, the attempts it may
+spend on a law) asks the check to find what would prove each law that
+stays tested, and print it as a form for the proof namespace; nothing is
+added for you:
+
+- first a hint: induction on each variable, with the others free in the
+  hypothesis, each strategy alone, and more fuel, cheapest first;
+- then a lemma, made from the goals the search got stuck on: the goal,
+  under the facts that share its variables, with a call the goal and a
+  fact both make (the one the induction hypothesis is about) taken as a
+  variable. A candidate is offered only once it has passed its tests,
+  been proved, and proved the law. Without `insert-keeps-sorted`, the sort
+  spec's `sorted` gets that lemma back.
+
 `writ.spec-demo.tree-proof` in the tests proves the tree's
 `holds-a-sorted-set` this way: a `bst?` invariant, lemmas that `insert`
 keeps it and that listing the tree after an insert is inserting into the
@@ -908,13 +963,24 @@ Clojure makes:
 - `nil` and `()` are different values, and `seq` is the bridge between
   them. `rest` is never nil, and `next` can be.
 - Lists, vectors, cons cells and lazy seqs are one kind of value. The ops
-  that tell them apart (`conj`, `peek`, `vector?`, ...) are outside the
-  model, so a law that needs them stays tested.
+  that tell them apart (`peek`, `vector?`, ...) are outside the model, so
+  a law that needs them stays tested. `conj` and `into` onto a value the
+  code makes a vector (`vec`, `mapv`, `subvec`, a vector literal, and
+  `conj` or `into` onto one) add at its end; onto anything else, `conj`
+  is outside the model.
+- `take`, `drop`, `keep`, `mapcat`, `reverse`, `remove`, `not-any?` and
+  `sequential?` are modelled on a list of any length, `subvec` on integer
+  indexes, `nth` at an integer index, and `(range a b)` an element at a
+  time once the facts decide `a < b`. A `for` with `:when` and `:let` is
+  the `map`, `filter` and `mapcat` it means.
 - A lazy seq is truthy before it is realised, so deciding one never runs
   its elements.
-- `=` is Clojure's: sequentials compare element by element, `1` never
-  equals `1.0`, and a term equals itself only when no float can be inside,
-  because `NaN` is not `=` to itself.
+- `=` is Clojure's: sequentials compare element by element, and `1`
+  never equals `1.0`. writ's types range over values without `NaN`, as
+  its generators do, so a law over `Any` or `Double` says nothing about
+  `##NaN` (which is not `=` to itself). A term equals itself when it only
+  picks and arranges parts of such values; one that computes a float may
+  be a `NaN` of none, and equals itself only when that is ruled out.
 - Integers are exact (jolt promotes on overflow). `+` is associative and
   commutative only on integers. Floats get no algebra. A term counts as
   an integer only when its form or a proved fact says so, never because a
@@ -1211,6 +1277,25 @@ rest of writ has no dependencies.
 jolt -M:test                   # or ./bin/test
 cd examples && jolt -M:test    # the example programs and their specs
 ```
+
+`jolt -M:bench DIR-or-spec-ns ...` (`./bin/bench` for the demo specs,
+`examples/bin/bench` for the examples) benchmarks the prover:
+`writ.bench/run` checks each spec with the proof cache off and makes a row
+per law the prover tried, with the strategy that proved it, the rewrites
+and the time; the table ends with how many laws were proved and which
+strategies won. `--save FILE` keeps the rows, and `--baseline FILE` lists
+the laws a change gained, lost, sped up or slowed down against them. It
+never writes the proof cache.
+
+The prover's knobs are one map, `writ.prove/default-config` (the fuel, how
+deep case splits go, the strategy order, ...), which check's `:prover`
+option overrides. `--tune '[{:depth 6} {:fuel 10000}]' DIR --held-out
+DIR2` runs each config on a tuning corpus and a held-out one and reports,
+against the default, the laws it gained and lost and its rewrites and
+time; a config is a candidate for the default only when it loses no law
+on either and costs no more. `cd examples && jolt -M:bench --tune ...
+../test/writ/spec_demo --held-out test/fetch ...` tunes on the demo specs
+and checks on the examples.
 
 `test/writ/spec_demo/` holds the worked example: an insertion sort and a
 binary search tree, each with a spec, one correct implementation and

@@ -610,3 +610,13 @@
     (is (false? (ev [] '(vector? (quote (a b))) {})))
     (is (= {:k [1]} (ev [] '(quote {:k [1]}) {})))
     (is (list? (:k (ev [] '(quote {:k (1)}) {}))))))
+
+(deftest a-mutant-of-the-code-shows-a-gap-no-stand-in-does
+  (testing "the usual stand-ins all fail sign's laws, which say nothing of 0"
+    (is (:ok (spec/check 'writ.spec-demo.sign-weak-spec {:seed 42 :cache false}))))
+  (testing "with mutants, one wrong at 0 passes them, and the input that tells it apart is shown"
+    (let [r (spec/check 'writ.spec-demo.sign-weak-spec {:seed 42 :cache false :adequacy :mutants})]
+      (is (not (:ok r)))
+      (is (some #(str/includes? % "differs from the real fn on {n 0}") (:survivors (first (:gaps r)))))))
+  (testing "a mutant no input tells apart is the same fn, and a spec that pins sign has no gap"
+    (is (:ok (spec/check 'writ.spec-demo.sign-spec {:seed 42 :cache false :adequacy :mutants})))))

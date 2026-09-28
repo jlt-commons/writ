@@ -50,7 +50,7 @@
                   (reject! "the solver's certificate does not prove " (pr-str (t/show n)))))
       :throws (when-not (or @vacuous (and (= [:bottom] @n) (not (:total opts))))
                 (reject! "the goal does not throw: " (pr-str (t/show @n))))
-      :rewriting (when-not (or @vacuous (sc/truthy? @n))
+      :rewriting (when-not (or @vacuous (sc/truthy? @n) (true? (rw/truthiness (first @cc) @n)))
                    (reject! "the goal does not rewrite to true: " (pr-str (t/show @n))))
       :split (let [c (:on p)]
                (if-let [[x v] (and (= :ieq (head c)) (sc/solve-eq (second c)))]
@@ -163,10 +163,14 @@
 
 (defn check-proof
   "Replay trace, a proof of goal g in opts (types, defs, tenv, and the
-  lemma rules the proof may cite).  {:ok true} or {:ok false :reason}."
+  lemma rules the proof may cite).  {:ok true :unfolded :lemmas-used}, the
+  definitions the replay unfolded and the lemmas it cited, or {:ok false
+  :reason}."
   [opts g trace]
   (try
-    (let [opts (-> opts (assoc :unfolded (atom #{}) :lemmas-used (atom #{})) (dissoc :ih-free))]
+    (let [unfolded (atom #{})
+          used (atom #{})
+          opts (-> opts (assoc :unfolded unfolded :lemmas-used used) (dissoc :ih-free))]
       (case (:by trace)
         :cases (check-all opts g (:proofs trace))
         :induction (check-induction opts g trace)
@@ -185,7 +189,7 @@
                   :induction (check-induction opts* g inner)
                   (reject! "cannot replay " (pr-str (:by inner)))))
         (reject! "cannot replay " (pr-str (:by trace))))
-      {:ok true})
+      {:ok true :unfolded @unfolded :lemmas-used @used})
     (catch clojure.lang.ExceptionInfo e
       (cond
         (::rejected (ex-data e)) {:ok false :reason (ex-message e)}

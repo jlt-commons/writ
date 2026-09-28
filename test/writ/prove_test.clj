@@ -43,9 +43,11 @@
     (is (= [:lit true] (norm [:call '= (t/value->term [1 2]) (t/value->term '(1 2))]))))
   (testing "an integer never equals a float"
     (is (= [:lit false] (norm [:call '= [:lit 1] [:lit 1.0]]))))
-  (testing "a term is = to itself only when no float can be inside"
+  (testing "a term is = to itself unless a NaN can be inside: a law's values hold none, a computed float may"
     (is (= [:lit true] (norm {:types {'xs '(List Nat)}} [:call '= 'xs 'xs])))
-    (is (= [:call '= 'xs 'xs] (norm {:types {'xs '(List Double)}} [:call '= 'xs 'xs])))))
+    (is (= [:lit true] (norm {:types {'xs '(List Double)}} [:call '= 'xs 'xs])))
+    (let [half [:call 'map [:fn '[y] [:call '* 'y [:lit 0.5]]] 'xs]]
+      (is (= '= (second (norm {:types {'xs '(List Double)}} [:call '= half half])))))))
 
 (deftest integers-are-exact-and-floats-get-no-algebra
   (let [ctx {:types {'a 'Nat 'b 'Nat}}]
@@ -332,7 +334,7 @@
   (let [{:keys [law opts goal]} (law-input 'writ.spec-demo.sort-spec 'insert-keeps-sorted)
         r (prover/prove-law law)]
     (is (:proved r))
-    (is (= {:ok true} (writ.prove.check/check-proof opts goal (:trace r))))
+    (is (:ok (writ.prove.check/check-proof opts goal (:trace r))))
     (testing "a proof with a case left out is rejected"
       (let [bad (update-in (:trace r) [:cases] pop)]
         (is (re-find #"the cases of `xs` are" (:reason (writ.prove.check/check-proof opts goal bad))))))
@@ -351,7 +353,7 @@
       (let [{:keys [law opts goal]} (law-input sp nm)
             r (prover/prove-law law)]
         (is (:proved r) (str nm))
-        (is (= {:ok true} (writ.prove.check/check-proof opts goal (:trace r))) (str nm))))))
+        (is (:ok (writ.prove.check/check-proof opts goal (:trace r))) (str nm))))))
 
 ;; --- a hypothesis that varies ----------------------------------------------------------
 
@@ -372,7 +374,7 @@
     (testing "without its recognizers the checker can't show acc's instance is a list"
       (is (not (:ok (writ.prove.check/check-proof (dissoc opts :recognizers) goal (:trace r))))))
     (is (= '{acc (List Nat)} (:vary (:trace r))))
-    (is (= {:ok true} (writ.prove.check/check-proof opts goal (:trace r))))
+    (is (:ok (writ.prove.check/check-proof opts goal (:trace r))))
     (testing "the fold is not proved with the accumulator held fixed"
       (is (not (:proved (prover/prove-law (assoc-in law [:hint :vary] nil))))))
     (testing "the checker rebuilds the hypothesis the trace names, and no other"
@@ -485,7 +487,9 @@
   (let [ctx {:types '{xs (List Nat) ys (List Double)}}
         pick (fn [v] [:call 'filter [:fn '[y] [:call 'odd? 'y]] v])]
     (is (= [:lit true] (norm ctx [:call '= (pick 'xs) (pick 'xs)])))
-    (is (= '= (second (norm ctx [:call '= (pick 'ys) (pick 'ys)]))) "a NaN may be inside")
+    (is (= [:lit true] (norm ctx [:call '= (pick 'ys) (pick 'ys)])) "a law's Doubles hold no NaN")
+    (let [sq [:call 'map [:fn '[y] [:call '* 'y 'y]] 'ys]]
+      (is (= '= (second (norm ctx [:call '= sq sq]))) "a product of them may be one"))
     (testing "and a fold that only arranges them"
       (let [fold [:call 'reduce [:fn '[s x] [:call 'cons 'x 's]] [:sq [:enil]] 'xs]]
         (is (= [:lit true] (norm ctx [:call '= fold fold])))))
@@ -627,3 +631,32 @@
     (is (re-find #"mentions `i`" (str (:reason (writ.prove.check/check-proof opts g trace)))))
     (is (re-find #"not an integer"
                  (str (:reason (writ.prove.check/check-proof opts g (assoc trace :climb 'k))))))))
+
+;; --- seqs of any length ---------------------------------------------------
+
+(defn- lowered [locals form]
+  (writ.prove.translate/lower-term (writ.prove.translate/context {}) locals form))
+
+(deftest a-for-is-the-map-and-filter-it-means
+  (let [ctx {:types '{xs (List Int)}}]
+    (is (= (norm ctx (lowered '[xs] '(map (fn [x] (inc x)) (filter (fn [x] (pos? x)) xs))))
+           (norm ctx (lowered '[xs] '(for [x xs :when (pos? x)] (inc x))))))))
+
+(deftest conj-onto-a-vector-adds-at-the-end
+  (let [ctx {:types '{xs (List Int)}}]
+    (is (= [:lit true] (norm ctx (lowered '[xs] '(= (conj (vec xs) 1) (concat xs [1]))))))
+    (is (thrown? clojure.lang.ExceptionInfo (lowered '[xs] '(conj xs 1)))
+        "onto a value not known to be a vector, conj is outside the model")))
+
+(deftest a-seq-is-sequential
+  (is (= [:lit true] (norm [:call 'sequential? [:sq [:econs [:lit 1] t/enil]]])))
+  (is (= [:lit false] (norm [:call 'sequential? t/tnil]))))
+
+(deftest a-fact-about-a-name-is-not-about-a-parameter-of-that-name
+  ;; a fact that happens to name a fn literal's canonical parameter says
+  ;; nothing about the values the fn is called with
+  (let [p (symbol "%1_0")
+        ctx (rw/assume (rw/context {:types '{cs (List Any)}}) [:call '= [:call 'first p] [:lit 99]] true)
+        n (rw/normalize ctx [:call 'some [:fn [p] [:call '= [:call 'first p] [:lit 99]]] 'cs])]
+    (is (not= [:lit true] n))
+    (is (not (some #{[:fn [p] [:lit true]]} (t/subterms n))))))

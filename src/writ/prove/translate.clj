@@ -20,12 +20,24 @@
      sort distinct reverse last butlast take drop str name keyword
      vector? sequential? map? get nil? some?
      keyword? symbol? string? char? boolean?
-     hash-map assoc dissoc merge keys vals})
+     hash-map assoc dissoc merge keys vals
+     subvec mapv filterv keep remove not-any? range conj})
+
+(def ^:private vector-fns
+  "The clojure.core fns whose value is always a vector."
+  '#{vec mapv filterv subvec vector})
+
+(defn- vector-term?
+  "Is term t, as translated, a vector: a vector literal, a call of a fn
+  that makes one, conj or into onto one, or an if of two?"
+  [t]
+  (boolean (or (:vector (meta t))
+               (and (= :if (t/head t)) (vector-term? (nth t 2)) (vector-term? (nth t 3))))))
 
 (def value-fns
   "The clojure.core fns that may be passed as values: the modelled ones,
   and pure predicates the prover keeps opaque."
-  (into core-fns '#{odd? even? nil? some? true? false?}))
+  (-> core-fns (disj 'conj) (into '#{odd? even? nil? some? true? false?})))
 
 (defn outside!
   "Signal a form the prover does not model."
@@ -103,7 +115,18 @@
            (case k
              :local (into [:ap v] args)
              :own (into [:app v] args)
-             :core (into [:call v] args)
+             :core (let [a (first args)]
+                     (cond
+                       (contains? vector-fns v) (with-meta (into [:call v] args) {:vector true})
+                       ;; conj and into add at the end of a vector: to the
+                       ;; model, its elements then theirs
+                       (and (= 'conj v) (seq (rest args)) (vector-term? a))
+                       (with-meta [:sq (reduce (fn [e x] [:eapp e [:econs x t/enil]]) [:elems a] (rest args))]
+                         {:vector true})
+                       (= 'conj v) (outside! "conj onto a value not known to be a vector")
+                       (and (= 'into v) (= 2 (count args)) (vector-term? a))
+                       (with-meta [:sq [:eapp [:elems a] [:elems (second args)]]] {:vector true})
+                       :else (into [:call v] args)))
              (outside! (str "`" (:name f) "`"))))
     :fn (into [:ap (term-of ctx env f)] args)
     ;; (:k m) and (:k m default) are lookups

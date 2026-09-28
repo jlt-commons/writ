@@ -4,4 +4,7 @@
 
  :aliases
  {:test {:extra-paths ["test"]
-         :main-opts   ["-m" "writ.test-runner"]}}}
+         :main-opts   ["-m" "writ.test-runner"]}
+  ;; jolt -M:bench test/writ/spec_demo: the prover over the demo specs
+  :bench {:extra-paths ["test"]
+          :main-opts   ["-m" "writ.bench"]}}}
