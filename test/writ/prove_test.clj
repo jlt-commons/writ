@@ -589,3 +589,41 @@
         trace {:by :symbolic :proofs [shared shared {:by :solver} {:by :list-cases :on 'xs}]}]
     (is (= "by symbolic evaluation, splitting on (<= 0 x), with the solver, with cases on xs"
            (prover/summary trace)))))
+
+;; --- loops whose index climbs to a bound -----------------------------------
+
+(defn- index-defs []
+  (first (prover/definitions [['writ.spec-demo.index
+                               (writ.book/read-forms (clojure.java.io/resource "writ/spec_demo/index.clj"))]])))
+
+(deftest a-loop-takes-only-the-locals-it-reads
+  ;; scan's loop never reads start, so a call of it does not name start:
+  ;; the hypothesis at start + 1 then matches the loop's own next step
+  (let [defs (index-defs)
+        body (:body (get defs 'writ.spec-demo.index/scan))]
+    (is (= 4 (count (:params (get defs (second body))))))
+    (is (not (contains? (set (drop 3 body)) 'start)))))
+
+(deftest a-recursion-on-integer-guards-unfolds-one-level-at-a-time
+  (let [ctx (rw/context {:defs (index-defs) :fuel 300 :types '{xs (Vec Any) k Any i Nat}})
+        n (rw/normalize ctx '[:app writ.spec-demo.index/tally xs k i])]
+    (is (= 2 (count (filter #(= [:app 'writ.spec-demo.index/tally 'xs 'k [:lin 1 [['i 1]]]] %)
+                            (t/subterms n)))))))
+
+(deftest loops-climbing-to-a-bound-are-proved-by-induction-on-what-is-left
+  (let [t0 (System/currentTimeMillis)
+        r (spec/check 'writ.spec-demo.index-spec {:seed 3 :cache false})]
+    (is (:ok r) (:message r))
+    (doseq [l (:laws r) :when (not= 'a-tally-counts-from-its-index (:law l))]
+      (is (= :proved (:status l)) (str (:law l) " " (:unproved l)))
+      (is (re-find #"induction on \S+ up to \(count xs\)" (str (:proof l))) (str (:law l))))
+    (is (< (- (System/currentTimeMillis) t0) 60000))))
+
+(deftest the-checker-rejects-a-bound-that-climbs-with-the-index
+  (let [opts {:defs (index-defs) :tenv {} :types '{xs (Vec Any) k Any i Nat}}
+        g {:hyps [] :goals '[[:call integer? [:app writ.spec-demo.index/tally xs k i]]]}
+        trace {:by :induction :on 'i :ty 'Nat :climb '[:lin 1 [[i 1]]]
+               :cases [{:case "" :proof [{:by :rewriting}]} {:case "" :proof [{:by :rewriting}]}]}]
+    (is (re-find #"mentions `i`" (str (:reason (writ.prove.check/check-proof opts g trace)))))
+    (is (re-find #"not an integer"
+                 (str (:reason (writ.prove.check/check-proof opts g (assoc trace :climb 'k))))))))

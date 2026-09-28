@@ -112,6 +112,21 @@
            (outside! "calling a computed value"))
     (outside! "calling a computed value")))
 
+(defn- self-calls-without
+  "t with each call of loop q, which takes n bindings then m closed-over
+  locals, passing only the locals at the indexes in kept."
+  [q n m kept t]
+  (let [f #(self-calls-without q n m kept %)]
+    (cond
+      (not (vector? t)) t
+      (contains? #{:lit :nil :enil :bottom :cfn :dfn} (t/head t)) t
+      (= :lin (t/head t)) [:lin (second t) (mapv (fn [[a k]] [(f a) k]) (nth t 2))]
+      (and (= :app (t/head t)) (= q (second t)) (= (+ 2 n m) (count t)))
+      (into [:app q] (concat (map f (take n (drop 2 t)))
+                             (keep-indexed #(when (kept %1) (f %2)) (drop (+ 2 n) t))))
+      (contains? #{:call :app} (t/head t)) (into [(first t) (second t)] (map f) (drop 2 t))
+      :else (with-meta (into [(first t)] (map f) (rest t)) (meta t)))))
+
 (defn term-of
   "The term for a lowered AST node.  env maps local names to terms."
   [ctx env ast]
@@ -166,9 +181,16 @@
                 fps (mapv (fn [_] (fresh ctx "c")) frees)
                 body (term-of (assoc ctx :recur-target [q fps])
                               (merge env (zipmap frees fps) (zipmap names ps))
-                              (:body ast))]
-            (swap! (:extra ctx) assoc q {:params (into ps fps) :body body :recursive? true})
-            (into [:app q] (concat inits (map #(get env %) frees))))
+                              (:body ast))
+                ;; the loop takes only the locals its body reads: one it
+                ;; merely passes on to its own recur is left out, so a call
+                ;; of the loop names only what its result depends on
+                used (t/vars (self-calls-without q (count names) (count fps) #{} body))
+                kept (set (keep-indexed (fn [j fp] (when (contains? used fp) j)) fps))
+                body (self-calls-without q (count names) (count fps) kept body)]
+            (swap! (:extra ctx) assoc q {:params (into ps (keep-indexed #(when (kept %1) %2) fps))
+                                         :body body :recursive? true})
+            (into [:app q] (concat inits (keep-indexed #(when (kept %1) (get env %2)) frees))))
     :recur (if-let [[q fr] (:recur-target ctx)]
              (into [:app q] (concat (map #(term-of ctx env %) (:args ast)) fr))
              (outside! "recur outside a loop"))

@@ -6,12 +6,14 @@
   in writ.prove.scheme and the rewriter, and confirms the step is one the
   logic allows:
 
-  * rewriting closes a goal only when it normalises to a truthy value
+  * rewriting closes a goal only when it normalises to a truthy value, or
+    to a throw, when the law is not one that says nothing throws
   * a split on a condition proves both outcomes, and substitutes only an
     equation it solves for itself
   * cases on a list of elements prove both shapes
   * an induction's cases are exactly its type's cases, each proved with
-    the hypotheses at that case's smaller values and no others
+    the hypotheses at that case's smaller values and no others; an
+    integer climbing to a bound has two, below it and not
   * a generalisation uses an equality hypothesis the case really has, and
     the call it replaces really occurs
   * an accumulator's lemmas are proved before anything cites them, and a
@@ -46,6 +48,8 @@
       :solver (let [[ctx _ n] (sc/case-context opts g hyps)]
                 (when-not (or @vacuous (smt/verify ctx n (:certificate p)))
                   (reject! "the solver's certificate does not prove " (pr-str (t/show n)))))
+      :throws (when-not (or @vacuous (and (= [:bottom] @n) (not (:total opts))))
+                (reject! "the goal does not throw: " (pr-str (t/show @n))))
       :rewriting (when-not (or @vacuous (sc/truthy? @n))
                    (reject! "the goal does not rewrite to true: " (pr-str (t/show @n))))
       :split (let [c (:on p)]
@@ -107,11 +111,22 @@
       (reject! "an induction case cannot be proved " (pr-str (:by p))))))
 
 (defn- check-induction
-  "Replay an induction on v: its cases must be the type's cases.  A
+  "Replay an induction on v: its cases must be the type's cases, or for
+  an integer climbing to a bound, the climbing cases -- the bound an
+  integer, and not v's own.  A
   variable that varies in the hypothesis must be one of the goal's, at its
   own type."
-  [opts g {:keys [on ty cases vary]}]
-  (let [cs (or (sc/cases on ty (:tenv opts)) (reject! "`" on "` is not of an inductive type"))
+  [opts g {:keys [on ty cases vary climb] :as p}]
+  (let [cs (if (contains? p :climb)
+             (let [ctx (rw/context opts)]
+               (when-not (contains? '#{Nat Int} (sc/plain (get-in opts [:types on])))
+                 (reject! "`" on "` climbs but is not an integer"))
+               (when (contains? (t/vars climb) on)
+                 (reject! "the bound " (pr-str (t/show climb)) " mentions `" on "`"))
+               (when-not (sc/int-bound? ctx climb)
+                 (reject! "the bound " (pr-str (t/show climb)) " is not an integer"))
+               (sc/climbing-cases on climb))
+             (or (sc/cases on ty (:tenv opts)) (reject! "`" on "` is not of an inductive type")))
         declared (get-in opts [:types on])
         _ (doseq [[x xty] vary]
             (when (or (= x on) (not= xty (get-in opts [:types x])))

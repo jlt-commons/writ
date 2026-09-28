@@ -81,6 +81,26 @@
 
       :else nil)))
 
+(defn int-bound?
+  "Is e an integer term an induction can climb to: an integer in every
+  part, so e - v is an integer that falls by one at each step."
+  [ctx e]
+  (if (= :lin (head e))
+    (every? #(rw/int-term? ctx (first %)) (nth e 2))
+    (rw/int-term? ctx e)))
+
+(defn climbing-cases
+  "The cases of an induction on integer variable v climbing to bound e,
+  the scheme of a loop whose index counts up to a limit: v at or past e,
+  with no hypothesis, and v below e, with the law at v + 1.  The measure
+  is e - v: the second case holds only while it is positive, and it falls
+  by one at each step, so every v is reached from a first case in finitely
+  many.  e must not mention v, and must be an integer."
+  [v e]
+  (let [shown (pr-str (t/show e))]
+    [{:desc (str shown " <= " v) :value v :hyp [:call '<= e v] :types {} :smaller []}
+     {:desc (str v " < " shown) :value v :hyp [:call '< v e] :types {} :smaller [[:call 'inc v]]}]))
+
 ;; --- recognizers ------------------------------------------------------------------
 ;; A law proved for every value of a type holds at a term only if the term
 ;; is of that type.  The prover's logic is untyped, like ACL2's: a type is
@@ -237,6 +257,15 @@
     (and (= :if (head h)) (or (falsy? (nth h 3)) (= (nth h 1) (nth h 3))))
     (let [[c1 v1] (assume-hyp ctx (nth h 1))]
       (if v1 [c1 true] (assume-hyp c1 (rw/normalize c1 (nth h 2)))))
+    ;; a hypothesis that holds did not throw, so it took the branch that
+    ;; does not: (if c a (throw)) holds when c and a do
+    (and (= :if (head h)) (= [:bottom] (nth h 3)))
+    (let [[c1 v1] (assume-hyp ctx (nth h 1))]
+      (if v1 [c1 true] (assume-hyp c1 (rw/normalize c1 (nth h 2)))))
+    (and (= :if (head h)) (= [:bottom] (nth h 2)))
+    (let [c1 (rw/assume ctx (nth h 1) false)]
+      (assume-hyp c1 (rw/normalize c1 (nth h 3))))
+    (= [:bottom] h) [ctx true]
     (and (= :if (head h)) (falsy? (nth h 2)))
     (let [c1 (rw/assume ctx (nth h 1) false)]
       (assume-hyp c1 (rw/normalize c1 (nth h 3))))
@@ -266,7 +295,7 @@
         pvars (set (vals ren))
         nctx (rw/context (-> opts (dissoc :ih)
                              (update :types merge (into {} (map (fn [[x ty]] [(ren x) ty])) free))))
-        n #(rw/normalize nctx %)
+        n #(rw/normalize (rw/hold-calls! nctx %) %)
         type-hyps (for [[x ty] free
                         :when (contains? '#{Nat Int} ty)]
                     (cond-> [:call 'integer? (ren x)]
@@ -279,7 +308,14 @@
                :let [gi (t/subst (t/subst g ren) {v s})
                      hi (some-> hyp (t/subst {v s}))]]
            (cond-> (if (and (= :call (head gi)) (= '= (second gi)) (= 4 (count gi)))
-                     {:hyp hi :lhs (n (nth gi 2)) :rhs (n (nth gi 3))}
+                     (let [a (n (nth gi 2)) b (n (nth gi 3))
+                           value? #(or (t/lit? %) (= t/tnil %) (and (vector? %) (empty? (t/vars %))
+                                                                    (not-any? (fn [y] (contains? #{:app :call :ap} (head y)))
+                                                                              (t/subterms %))))]
+                       ;; (= :Miss (f x)) rewrites (f x) to :Miss, not the other way
+                       (if (and (value? a) (not (value? b)))
+                         {:hyp hi :lhs b :rhs a}
+                         {:hyp hi :lhs a :rhs b}))
                      {:hyp hi :lhs (n gi) :rhs [:lit true]})
              (seq pvars) (assoc :vars pvars
                                 :types (into {} (map (fn [[x ty]] [(ren x) (plain ty)])) free)))))))
@@ -344,7 +380,7 @@
         ;; whose first case a split ruled out) is read again under all of
         ;; them
         [ctx vacuous] (if vacuous [ctx vacuous] (take-all ctx hyps))
-        ctx (assoc ctx :ih (mapv (fn [i] (update i :lhs #(rw/normalize ctx %))) (:ih opts)))
+        ctx (assoc ctx :ih (mapv (fn [i] (update i :lhs #(rw/normalize (rw/hold-calls! ctx %) %))) (:ih opts)))
         ;; an unconditional hypothesis that is a linear comparison is a
         ;; fact too: the arithmetic reads facts, and a rewrite of the
         ;; comparison itself never meets 0 <= h + (f t) with 0 <= (f t)
@@ -354,6 +390,15 @@
                         (rw/assume c lhs true)
                         c))
                     ctx (:ih ctx))
+        ;; a boolean hypothesis whose own hypothesis holds here is a fact,
+        ;; each of its parts: (<= (inc i) x) then gives (<= i x), where a
+        ;; rewrite would need the goal's term to be the hypothesis's
+        [ctx vacuous] (reduce (fn [[c vac] {:keys [hyp lhs rhs vars]}]
+                                (if (and (not vac) (= [:lit true] rhs) (empty? vars)
+                                         (or (nil? hyp) (true? (rw/truthiness c (rw/normalize c hyp)))))
+                                  (assume-hyp c lhs)
+                                  [c vac]))
+                              [ctx vacuous] (if vacuous [] (:ih ctx)))
         ctx (assoc ctx :memo (atom {}) :stuck (atom #{}) :int-memo (atom {}))]
     [ctx vacuous (when-not vacuous (rw/normalize ctx g))]))
 
@@ -378,11 +423,12 @@
 
 (defn induction-case
   "[opts gi] for case c of induction on v: its variables typed, the law at
-  the case's smaller values as hypotheses, and the goals at the case."
+  the case's smaller values as hypotheses, the case's own condition
+  (a climbing case's) as one more, and the goals at the case."
   [opts g v c]
   (let [opts* (-> opts (update :types merge (:types c)) (assoc :ih []))
         opts* (assoc opts* :ih (useful-ih (ih-for opts* g v (:smaller c))))]
-    [opts* {:hyps (instance (:hyps g) v (:value c))
+    [opts* {:hyps (cond-> (instance (:hyps g) v (:value c)) (:hyp c) (conj (:hyp c)))
             :goals (instance (:goals g) v (:value c))}]))
 
 (defn- eq-goal? [g] (and (= :call (head g)) (= '= (second g)) (= 4 (count g))))

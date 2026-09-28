@@ -368,6 +368,28 @@
             (true? (decide-le ctx (lin->term (lin+ (lin* -1 lf) {:c -1 :m {}}))))) false
         :else nil))))
 
+(defn- int-at-most?
+  "Is integer a known to be at most integer b?"
+  [ctx a b]
+  (let [la (lin-of ctx a) lb (lin-of ctx b)]
+    (and la lb (true? (decide-le ctx (lin->term (lin+ lb (lin* -1 la))))))))
+
+(defn- bounded-by-fact
+  "true when a fact bounds the comparison c, (< a x) or (<= a x) where x
+  is not known to be an integer, from the same side: a <= a' and a fact
+  a' <= x gives a <= x.  So it holds whatever number x is.  A strict c
+  needs a strict fact: a double can round a < a' to equal."
+  [ctx c]
+  (when (and (= :call (head c)) (contains? '#{< <=} (second c)) (= 4 (count c)))
+    (let [[_ op a x] c]
+      (some (fn [[f v]]
+              (when (and (true? v) (= :call (head f)) (contains? '#{< <=} (second f)) (= 4 (count f))
+                         (or (= op '<=) (= (second f) '<)))
+                (let [[_ _ a' x'] f]
+                  (or (and (= x x') (not= a a') (int-at-most? ctx a a'))
+                      (and (= a a') (not= x x') (int-at-most? ctx x' x))))))
+            (:facts ctx)))))
+
 (defn decide
   "The truth of condition c under ctx, or nil when it is open."
   [ctx c]
@@ -375,6 +397,7 @@
     (= :le (head c)) (let [f (get (:facts ctx) c)] (if (some? f) f (decide-le ctx (second c))))
     (= :ieq (head c)) (decide-ieq ctx (second c))
     (contains? (:facts ctx) c) (get (:facts ctx) c)
+    (bounded-by-fact ctx c) true
     :else nil))
 
 (def ^:private seq-makers
@@ -770,6 +793,20 @@
 
 (declare assume truthiness)
 
+(defn- shape-test?
+  "Does condition c read the shape of a variable's value -- (seq xs),
+  (first (rest t)), (nth v 0) -- which a case split or an induction
+  could reveal?  An element at an index that is not a literal,
+  (= k (nth xs i)), is no shape: no split on xs decides it."
+  [c]
+  (some (fn [x]
+          (and (= :call (head x)) (some? (nth x 2 nil)) (seq (t/vars (nth x 2)))
+               (or (contains? '#{seq first rest next empty? count second last
+                                 sequential? vector? map? nil? some?}
+                              (second x))
+                   (and (= 'nth (second x)) (t/int-lit? (nth x 3 nil))))))
+        (t/subterms c)))
+
 (defn- settled?
   "Should a recursive definition, its arguments substituted in, be
   unfolded?  Its guards -- the tests of its if-tree, from the top -- are
@@ -780,7 +817,8 @@
   or a split reveals that shape.  Once a guard has been decided, an open
   test of what a definition's call returns -- (and (bst? l) ...) after
   the tag is known -- is not a shape: the call stays folded until its
-  own guards settle.  Only the guards are normalised, never the
+  own guards settle, and nor is a test no split could decide, such as
+  an element at an index.  Only the guards are normalised, never the
   branches, so a recursive call inside a branch is not unfolded here."
   ([ctx body] (settled? ctx body false))
   ([ctx body decided?]
@@ -794,23 +832,51 @@
          (settled? ctx [:if (nth c 2) (nth body 3) (nth body 2)] decided?)
          (splittable? c) (and (settled? (assume ctx c true) (nth body 2) decided?)
                               (settled? (assume ctx c false) (nth body 3) decided?))
-         (and decided? (some #(= :app (head %)) (t/subterms c)))
+         (and decided? (or (some #(= :app (head %)) (t/subterms c)) (not (shape-test? c))))
          (and (settled? ctx (nth body 2) true) (settled? ctx (nth body 3) true))
          :else false))
      true)))
 
-(defn- unfold [ctx x]
+(defn- unfold
+  "The body of definition call x, when it should be unfolded.  A recursive
+  definition whose first guard is open is unfolded one level: each call
+  of itself in the body is held, and a held call is unfolded only once
+  the facts decide its own first guard -- or (f (inc i)) would unfold
+  into (f (+ i 2)) and on until the fuel ran out.  A split on a guard
+  decides it, and the next level opens then."
+  [ctx x]
   (let [[_ f & args] x
         d (get-in ctx [:defs f])]
     (when (and d (= (count (:params d)) (count args))
                (not (contains? @(:stuck ctx) x)))
-      (burn! ctx)
-      (let [body (t/subst (:body d) (zipmap (:params d) args))]
-        (if-not (:recursive? d)
-          (do (swap! (:unfolded ctx) conj f) body)
-          (if (settled? ctx body)
+      (let [body (t/subst (:body d) (zipmap (:params d) args))
+            open? (delay (and (= :if (head body))
+                              (nil? (truthiness ctx (normalize ctx (nth body 1))))))]
+        (when-not (and (:recursive? d) (contains? @(:held ctx) x) @open?)
+          (burn! ctx)
+          (if-not (:recursive? d)
             (do (swap! (:unfolded ctx) conj f) body)
-            (do (swap! (:stuck ctx) conj x) nil)))))))
+            (if (settled? ctx body)
+              (do (swap! (:unfolded ctx) conj f)
+                  (when @open?
+                    (swap! (:held ctx) into
+                           (for [y (t/subterms body)
+                                 :when (and (= :app (head y)) (= f (second y)))]
+                             (into [:app f] (map #(normalize ctx %)) (drop 2 y)))))
+                  body)
+              (do (swap! (:stuck ctx) conj x) nil))))))))
+
+(defn hold-calls!
+  "Hold, in ctx, each call of a recursive definition in t: normalised, it
+  stays folded until the facts decide its first guard.  An induction
+  hypothesis about (f (inc i)) rewrites only a goal where that call is
+  folded, as it is under an unfolding of (f i)."
+  [ctx t]
+  (swap! (:held ctx) into
+         (for [y (t/subterms t)
+               :when (and (= :app (head y)) (:recursive? (get-in ctx [:defs (second y)])))]
+           (into [:app (second y)] (map #(normalize ctx %)) (drop 2 y))))
+  ctx)
 
 (declare match-term)
 
@@ -1027,8 +1093,18 @@
               with (fn [v] (into [:call (second x)] (assoc args i v)))]
           [:if c (with a) (with b)])))))
 
+(defn- strict
+  "[:bottom] for a call, or a fn value applied, with an argument that
+  throws: Clojure evaluates every argument before the call.  Not for a
+  seq's elements, which a lazy seq may never compute."
+  [x]
+  (when (and (contains? #{:call :app :ap :le :ieq} (head x))
+             (some #(= [:bottom] %) (if (= :ap (head x)) (rest x) (drop (if (contains? #{:le :ieq} (head x)) 1 2) x))))
+    [:bottom]))
+
 (defn- step [ctx x]
-  (or (ih-rewrite ctx x)
+  (or (strict x)
+      (ih-rewrite ctx x)
       (lemma-rewrite ctx x)
       (lift-if x)
       (when (and (contains? (:facts ctx) x) (not (contains? #{:le :ieq} (head x)))
@@ -1083,6 +1159,7 @@
                          :if (let [c (normalize ctx (nth x 1))
                                    tr (truthiness ctx c)]
                                (cond
+                                 (= [:bottom] c) c
                                  (true? tr) (normalize ctx (nth x 2))
                                  (false? tr) (normalize ctx (nth x 3))
                                  (and (= :call (head c)) (= 'not (second c)))
@@ -1127,6 +1204,7 @@
    :facts (or facts {}) :ih (or ih []) :lemmas (or lemmas [])
    :lemmas-used (or lemmas-used (atom #{}))
    :memo (atom {}) :stuck (atom #{}) :unfolded (atom #{}) :used-ih (atom 0) :int-memo (atom {})
+   :held (atom #{})
    :fuel (atom (or fuel 20000))})
 
 ;; --- checking the rules against the runtime ----------------------------------------
