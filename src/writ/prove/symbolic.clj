@@ -409,6 +409,27 @@
          :distinct distinct
          :elem (second (first elems))}})
 
+(defn- ordered
+  "A seq of guarded elements es, in order: each element there when its
+  guard holds.  It compares with a seq as a seq does."
+  [st es]
+  (assoc-in (finite-set st es false) [:set :ordered] true))
+
+(defn- guarded-elems
+  "The guarded elements of a seq whose order is known, or nil."
+  [v]
+  (cond (:vec v) (mapv (fn [x] [true x]) (:vec v))
+        (and (:set v) (:ordered (:set v))) (:elems (:set v))
+        :else nil))
+
+(defn- one-if [c] (if (true? c) 1 (if (false? c) 0 [:ite c 1 0])))
+
+(defn- ranks
+  "Each element's place among the kept ones: how many kept elements come
+  before it."
+  [es]
+  (mapv (fn [i] (into [:+ 0] (map (comp one-if first) (take i es)))) (range (count es))))
+
 (declare map-equal)
 
 (defn- equal
@@ -422,6 +443,22 @@
       (or (and (:map a) (contains? b :opaque)) (and (:map b) (contains? a :opaque)))
       (give-up! "comparing a map with a value of type Any")
       (or (:map a) (:map b)) false
+      ;; a filtered seq and a seq, or two filtered seqs: equal when as many
+      ;; are kept and the kept ones agree place by place
+      (and (or (:ordered (:set a)) (:ordered (:set b))) (guarded-elems a) (guarded-elems b))
+      (let [as (guarded-elems a) bs (guarded-elems b)
+            ra (ranks as) rb (ranks bs)
+            n (fn [es] (into [:+ 0] (map (comp one-if first) es)))]
+        (reduce conj-f [:= (n as) (n bs)]
+                (for [i (range (count as)) j (range (count bs))]
+                  [:or [:not (conj-f (conj-f (first (nth as i)) (first (nth bs j))) [:= (nth ra i) (nth rb j)])]
+                   (let [x (second (nth as i)) y (second (nth bs j))]
+                     (if (= x y) true (truth (lift2 st (fn [p q] {:bool (equal st p q)}) x y))))])))
+      ;; a seq whose order the model does not know, such as a map's vals,
+      ;; against a seq: outside
+      (or (and (:set a) (not (:distinct (:set a))) (:vec b))
+          (and (:set b) (not (:distinct (:set b))) (:vec a)))
+      (give-up! "comparing a seq of unknown order with a seq")
       ;; an opaque value is none of int, constant, bool or nil, but it may
       ;; be a collection, so only against those is it known to differ
       (and (not= sa sb) (or (= :opaque sa) (= :opaque sb))
@@ -532,6 +569,16 @@
                       [[:= tag 7] {:opaque (fresh! st :int)}]]))
       (and (seq? ty) (= 'Tuple (first ty)))
       {:vec (mapv #(var-value st facts % tenv v) (rest ty))}
+      ;; a vector of unknown length: opaque, but known to be a vector, so
+      ;; (vector? v) is true of it and a law that only passes it along is
+      ;; decided without its elements; reading them gives up, as for Any
+      (and (seq? ty) (= 'Vec (first ty)))
+      (let [x {:opaque (fresh! st :int)}]
+        (swap! st #(-> %
+                       (assoc-in [:unknowns ['vector? x]] true)
+                       (assoc-in [:unknowns ['sequential? x]] true)
+                       (assoc-in [:unknowns ['map? x]] false)))
+        x)
       (and (seq? ty) (= 'Set (first ty)))
       (let [tmpl (var-value st (atom []) (second ty) tenv v)
             n (count (or (flat tmpl) (give-up! (str "a set of " (pr-str (second ty))))))
@@ -560,18 +607,30 @@
                        ctors)))
       :else (give-up! (str "a variable `" v "` of type " (pr-str ty))))))
 
+
 (defn- elems
-  "The values of an element list, or give up when its length is unknown."
+  "The seq value of an element list: {:vec values}, a seq of guarded
+  elements when a part is a filtered seq, or alternatives of such; give
+  up when a part's length or order is unknown."
   [st env e]
-  (case (head e)
-    :enil []
-    :econs (into [(ev st env (nth e 1))] (elems st env (nth e 2)))
-    :eapp (into (elems st env (nth e 1)) (elems st env (nth e 2)))
-    :elems (let [v (ev st env (second e))]
-             (cond (:vec v) (:vec v)
-                   (:nil v) []
-                   :else (give-up! "the elements of a value of unknown length")))
-    (give-up! "an element list of unknown length")))
+  (let [join (fn [x y]
+               (lift2 st (fn [x y]
+                           (cond (and (:vec x) (:vec y)) {:vec (into (:vec x) (:vec y))}
+                                 (and (guarded-elems x) (guarded-elems y))
+                                 (ordered st (concat (guarded-elems x) (guarded-elems y)))
+                                 :else (give-up! "the elements of a value of unknown length")))
+                      x y))]
+    (case (head e)
+      :enil {:vec []}
+      :econs (join {:vec [(ev st env (nth e 1))]} (elems st env (nth e 2)))
+      :eapp (join (elems st env (nth e 1)) (elems st env (nth e 2)))
+      :elems (lift st (fn [v]
+                        (cond (:vec v) {:vec (:vec v)}
+                              (:nil v) {:vec []}
+                              (guarded-elems v) v
+                              :else (give-up! "the elements of a value of unknown length")))
+                   (ev st env (second e)))
+      (give-up! "an element list of unknown length"))))
 
 (defn- seq-of
   "The elements of a seqable value, as a vector of values; nil has none,
@@ -656,10 +715,12 @@
   uninterpreted fn's are (Ackermann)."
   [st op v kind]
   (let [k [op v]]
-    (or (get-in @st [:unknowns k])
-        (let [x (fresh! st kind)]
-          (swap! st assoc-in [:unknowns k] x)
-          x))))
+    ;; an answer already given may be false, so look it up by presence
+    (if (contains? (:unknowns @st) k)
+      (get-in @st [:unknowns k])
+      (let [x (fresh! st kind)]
+        (swap! st assoc-in [:unknowns k] x)
+        x))))
 
 (defn- kind-is?
   "The formula for 'v is a vector'.  Where that is not known -- a sequence
@@ -725,6 +786,13 @@
 
 (def ^:private pure-fns
   '#{sort distinct reverse sort-by str name keyword subs frequencies last butlast take drop count})
+
+(defn- nil-formula
+  "The formula for 'v is nil'."
+  [v]
+  (cond (= :bottom v) false
+        (:union v) (into [:or false] (for [[g x] (:union v)] (conj-f g (boolean (:nil x)))))
+        :else (boolean (:nil v))))
 
 (defn- core
   "A clojure.core fn applied to values."
@@ -828,14 +896,27 @@
                         (let [keep? (fn [e] (truth (apply-fn st a [e])))
                               sx (cond (:set xs) (:set xs)
                                        ;; a seq of known length, filtered: which
-                                       ;; elements stay depends on the tests
-                                       (:vec xs) (:set (finite-set st (map (fn [e] [true e]) (:vec xs)) false))
+                                       ;; elements stay depends on the tests,
+                                       ;; and they stay in order
+                                       (:vec xs) (:set (ordered st (map (fn [e] [true e]) (:vec xs))))
                                        :else (seq-of xs))]
                           {:set {:mem (fn [e] [:and ((:mem sx) e) (keep? e)])
                                  :elems (when (:elems sx) (vec (for [[g v] (:elems sx)] [(conj-f g (keep? v)) v])))
                                  :distinct (:distinct sx)
+                                 :ordered (:ordered sx)
                                  :elem (:elem sx)}}))
                 b)
+      ;; keep over a seq of known length: f's values, each there when it is
+      ;; not nil
+      keep (lift st (fn [xs]
+                      (cond
+                        (:nil xs) {:vec [] :kind :seq}
+                        (guarded-elems xs)
+                        (ordered st (for [[g e] (guarded-elems xs)
+                                          :let [v (apply-fn st a [e])]]
+                                      [(conj-f g [:not (nil-formula v)]) v]))
+                        :else (give-up! "keep over a collection of unknown size or order")))
+                 b)
       (map mapcat) (lift st (fn [xs]
                               (cond
                                 (:vec xs) (if (= 'map f)
@@ -895,15 +976,48 @@
                             (and (:vec xs) (<= (count (:vec xs)) 1)) (assoc xs :kind :seq)
                             :else (give-up! "distinct of more than one symbolic element")))
                      a)
+      ;; sort-by integer keys, of a sequence of known length or the guarded
+      ;; elements a filter kept: stable, so an element goes to its rank --
+      ;; how many kept elements have a smaller key, or the same key and come
+      ;; before it -- and place i holds the element whose rank is i
+      sort-by (lift st (fn [xs]
+                         (let [es (cond (:nil xs) []
+                                        (guarded-elems xs) (vec (guarded-elems xs))
+                                        :else (give-up! "sort-by of a collection of unknown size or order"))
+                               ks (mapv (fn [[_ e]]
+                                          (let [k (apply-fn st a [e])]
+                                            (when (:union k) (give-up! "sort-by on a key of more than one kind"))
+                                            (int-of k)))
+                                        es)
+                               n (count es)
+                               rank (fn [j]
+                                      (define! st :int
+                                        (into [:+ 0]
+                                              (for [k (range n) :when (not= k j)]
+                                                (one-if (conj-f (first (nth es k))
+                                                                (let [kk (nth ks k) kj (nth ks j)]
+                                                                  (if (< k j) [:<= kk kj] [:< kk kj]))))))))
+                               ranks (mapv rank (range n))
+                               kept (define! st :int (into [:+ 0] (map (comp one-if first) es)))
+                               place (fn [i]
+                                       (reduce (fn [acc j]
+                                                 (merge-values st (define! st :bool (conj-f (first (nth es j)) [:= (nth ranks j) i]))
+                                                               (second (nth es j)) acc))
+                                               (second (peek es)) (range (dec n) -1 -1)))]
+                           (cond
+                             (zero? n) {:vec [] :kind :seq}
+                             (every? (comp true? first) es) {:vec (mapv place (range n)) :kind :seq}
+                             :else (ordered st (map (fn [i] [(define! st :bool [:< i kept]) (place i)]) (range n))))))
+                    b)
       ;; some over a seq of known length: the first element's value that is
       ;; truthy, an if for each, nil when none is
       some (lift st (fn [xs]
                       (cond
                         (:nil xs) {:nil true}
-                        (:vec xs) (reduce (fn [acc e]
-                                            (let [v (apply-fn st a [e])]
-                                              (merge-values st (truth v) v acc)))
-                                          {:nil true} (reverse (:vec xs)))
+                        (guarded-elems xs) (reduce (fn [acc [g e]]
+                                                     (let [v (apply-fn st a [e])]
+                                                       (merge-values st (conj-f g (truth v)) v acc)))
+                                                   {:nil true} (reverse (guarded-elems xs)))
                         :else (give-up! "some over a collection of unknown size")))
                  b)
       every? (lift st (fn [xs]
@@ -921,7 +1035,18 @@
                                 (:vec xs) (reduce (fn [acc x] (apply-fn st a [acc x])) b (:vec xs))
                                 :else (give-up! "reduce over a collection of unknown order")))
                      c)
-               (give-up! "reduce with no initial value"))
+               ;; with no initial value: the first element starts it, and
+               ;; over a single element f is not called; over none, (f)
+               (lift st (fn [xs]
+                          (cond (:nil xs) (give-up! "reduce with no initial value over nothing")
+                                (and (:vec xs) (seq (:vec xs)))
+                                (reduce (fn [acc x] (apply-fn st a [acc x])) (first (:vec xs)) (rest (:vec xs)))
+                                :else (give-up! "reduce with no initial value over a collection of unknown order")))
+                     b))
+      ;; the vector forms, as the seq forms: vector? of them is not decided
+      mapv (core* st 'map args)
+      filterv (core* st 'filter args)
+      not-any? {:bool [:not (truth (core* st 'some args))]}
       get (if (<= 2 n 3)
             (lift2 st (fn [x i]
                         (cond
@@ -1158,7 +1283,7 @@
                     :let [r (apply-fn st fv [v])]
                     [h w] (if (= 'map kind) [[true r]] (or (:elems (:set r)) (map (fn [e] [true e]) (seq-of r))))]
                 [(conj-f g h) w])]
-      (finite-set st out false))
+      (cond-> (finite-set st out false) (:ordered sx) (assoc-in [:set :ordered] true)))
     (let [e (fresh-like st (or (:elem sx) (give-up! "the image of a set of no known elements")))
           es (set (flat e))
           ndefs (count (:defs @st))
@@ -1194,7 +1319,8 @@
     (case (head x)
       :nil {:nil true}
       :lit (lit-value st (second x))
-      :sq (cond-> {:vec (elems st env (second x))} (:vector (meta x)) (assoc :kind :vector))
+      :sq (lift st (fn [v] (if (:vec v) (cond-> {:vec (:vec v)} (:vector (meta x)) (assoc :kind :vector)) v))
+                (elems st env (second x)))
       :if (let [c (truth (ev st env (nth x 1)))
                 c (if (or (boolean? c) (symbol? c)) c (define! st :bool c))]
             (cond

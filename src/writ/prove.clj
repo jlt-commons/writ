@@ -890,8 +890,10 @@
   "Translate the defns of the target and the spec: [defs own].  pairs is
   [[ns-sym forms] ...] or [[ns-sym forms refers] ...]; each ns reads its
   own plain names first, then the plain names in refers, name ->
-  qualified name."
-  [pairs]
+  qualified name.  sigs, {qualified-name {:params :ret}}, tell the
+  translation which parameters are vectors."
+  ([pairs] (definitions pairs {}))
+  ([pairs sigs]
   (let [qualified (into {} (for [[k v] (tr/own-names (map #(take 2 %) pairs)) :when (namespace k)] [k v]))
         defs (into {}
                    (for [[ns-sym forms refers] pairs]
@@ -899,5 +901,5 @@
                                       (into {} (for [[k v] (tr/own-names [[ns-sym forms]])
                                                      :when (nil? (namespace k))]
                                                  [k v])))]
-                       (tr/defs-of (tr/context own) ns-sym forms))))]
-    [defs qualified]))
+                       (tr/defs-of (assoc (tr/context own) :sigs sigs) ns-sym forms))))]
+    [defs qualified])))

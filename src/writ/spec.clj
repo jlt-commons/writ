@@ -282,7 +282,7 @@
          (-register! '~(ns-name *ns*) :refine '~{:name nm :var v :base base :pred pred
                                                  :pred-name pred-name}))))
 
-(def ^:private graph-keys #{:states :edges :start :never :before :final :tested})
+(def ^:private graph-keys #{:states :edges :start :never :before :final :tested :witnesses})
 
 (def ^:private projections
   "clojure.core fns an edge may use to take a state out of a tuple state:
@@ -313,7 +313,13 @@
 
   :tested {state \"why\"} lets the edges out of state off proof, as a law's
   {:require :tested :because \"why\"} does: their obligations are tested,
-  and every report shows the reason."
+  and every report shows the reason.
+
+  :witnesses {[from to] [value arg ...]} gives the step from state from to
+  state to an example: a value of from and the edge fn's other arguments
+  that land in to.  The check tries it before any generated one, for a
+  step no generated value takes -- one whose arguments must agree with
+  each other, as a reply must carry the alias its request made."
   [nm m]
   (let [where (str "`graph " nm "`")]
     (when-not (simple-sym? nm)
@@ -325,6 +331,14 @@
     (let [states (set (keys (:states m)))
           known! (fn [what s] (when-not (contains? states s)
                                 (fail! where ": " what " names " (pr-str s) ", which is not a state")))]
+      (when-let [w (:witnesses m)]
+        (when-not (map? w)
+          (fail! where ": :witnesses is {[from to] [value arg ...]}, had " (pr-str w)))
+        (doseq [[k v] w]
+          (when-not (and (vector? k) (= 2 (count k)) (vector? v))
+            (fail! where ": a witness is [from to] [value arg ...], had " (pr-str k) " " (pr-str v)))
+          (known! ":witnesses" (first k))
+          (known! ":witnesses" (second k))))
       (when-let [t (:tested m)]
         (when-not (map? t)
           (fail! where ": :tested is {state \"why it cannot be proved yet\"}, had " (pr-str t)))
@@ -872,7 +886,7 @@
 (def ^:private witness-trials 1000)
 
 (defn- test-law
-  [ctx {:keys [name prop]} {:keys [trials seed max-size]}]
+  [ctx {:keys [name prop witness]} {:keys [trials seed max-size]}]
   (let [[bs body] (leading-foralls prop)
         qc (fn [p] (tc/quick-check trials p :seed seed :max-size max-size))]
     (cond
@@ -889,6 +903,15 @@
       ;; stops at the first, so a rare one -- a pong game a point from won,
       ;; with the ball past the paddle -- is looked for harder than a law
       ;; is tested: at least witness-trials values
+      ;; an existential with a witness the spec gives: that one, first
+      (and (empty? bs) (head? body "exists") witness
+           (let [[ebs inner] (leading-exists body)
+                 xs (mapv first ebs)]
+             (and (= (count xs) (count witness))
+                  (= :pass (:result (holds (assoc ctx :vars xs) inner (zipmap xs witness)))))))
+      (let [[ebs] (leading-exists body)]
+        {:law name :status :witnessed :witness (zipmap (map first ebs) witness)})
+
       (and (empty? bs) (head? body "exists"))
       (let [[ebs inner] (leading-exists body)
             xs (mapv first ebs)
@@ -1339,8 +1362,11 @@
                                (contains? refers s) (get refers s))
     (l/host-member? s) nil
     :else (let [q (symbol (namespace s))
-                lib (get aliases q q)]
-            (cond (contains? own (symbol (name s))) (when (= lib (:self aliases)) (symbol (name s)))
+                lib (get aliases q q)
+                nm (symbol (name s))]
+            ;; the namespace decides: other/f is other's f even when this
+            ;; namespace has an f of its own
+            (cond (and (= lib (:self aliases)) (contains? own nm)) nm
                   (= 'clojure.core lib) nil
                   :else (symbol (name lib) (name s))))))
 
@@ -1838,11 +1864,13 @@
                          (get-in m [:tested from])
                          (assoc :opts {:require :tested :because (get-in m [:tested from])}))
                        (for [t tos]
-                         {:name (symbol (str gname ":" (name from) ":" f "->" (name t)))
-                          :prop (list 'exists binders (lands [t]))
-                          :explain (str "the graph says a " f " can take " (name from) " to "
-                                        (name t) ", but no generated " (name from) " does")
-                          :step-of gname}))]
+                         (cond-> {:name (symbol (str gname ":" (name from) ":" f "->" (name t)))
+                                  :prop (list 'exists binders (lands [t]))
+                                  :explain (str "the graph says a " f " can take " (name from) " to "
+                                                (name t) ", but no generated " (name from) " does")
+                                  :step-of gname}
+                           (get-in m [:witnesses [from t]])
+                           (assoc :witness (get-in m [:witnesses [from t]])))))]
          law)))
 
 (defn- fits?
@@ -2848,6 +2876,9 @@
                                           [n fs] libs :when (= n lib)
                                           f fs :when (and (seq? f) (contains? '#{defn defn-} (first f)))]
                                       [(symbol (str a) (str (second f))) (symbol (str lib) (str (second f)))]))]))
+          anns (into {} (map (fn [[k sig]] [k (erase sig refs)])) anns)
+          sigs (into {} (for [[nm sig] anns]
+                          [(symbol (str target) (str nm)) {:params (mapv plain (:params sig)) :ret (plain (:ret sig))}]))
           defs (delay (prover/definitions
                         (cond-> (let [[libs spec-forms spec-refers] @libs+refers]
                                   (conj libs [spec-ns (mapv refine->defn spec-forms) spec-refers]))
@@ -2859,10 +2890,8 @@
                                           (into {} (for [[k v] (ns-refers (the-ns proof-ns))
                                                          :when (contains? #{target (:target (get @registry spec-ns))}
                                                                           (ns-name (:ns (meta v))))]
-                                                     [k (symbol (name target) (name k))]))]))))
-          anns (into {} (map (fn [[k sig]] [k (erase sig refs)])) anns)
-          sigs (into {} (for [[nm sig] anns]
-                          [(symbol (str target) (str nm)) {:params (mapv plain (:params sig)) :ret (plain (:ret sig))}]))
+                                                     [k (symbol (name target) (name k))]))]))
+                        sigs))
           ;; what each signed fn returns, proved from its code once: the
           ;; laws' lemmas are instantiated only at terms of their types
           cache-dir (when-not (= false (:cache opts)) (or (:cache-dir opts) ".writ-cache"))
@@ -3094,7 +3123,7 @@
              ;; caller's own instrument stays in place
              wrapped (wrap! e)
              results (try
-                       (vec (for [{:keys [name prop explain graph total lemma step-of]} laws
+                       (vec (for [{:keys [name prop explain graph total lemma step-of witness]} laws
                                   :let [p (desugar prop)]]
                               (try
                                 (lw/check-prop-shape! p)
@@ -3113,7 +3142,7 @@
                                                "implementation, so any code satisfies it")}
 
                                     :else
-                                    (cond-> (assoc (test-law ctx {:name name :prop qp}
+                                    (cond-> (assoc (test-law ctx {:name name :prop qp :witness witness}
                                                              {:trials trials :seed seed :max-size max-size})
                                                    :prop qp)
                                       explain (assoc :explain explain)
