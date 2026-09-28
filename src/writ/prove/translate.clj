@@ -17,7 +17,7 @@
      filter map not = not= < <= > >= + - * inc dec zero? pos? neg? nth identity apply
      reduce integer? max min abs every? some quot mod rem contains? boolean
      bit-shift-left bit-shift-right set hash-set into mapcat
-     sort distinct reverse last butlast take drop str name keyword
+     sort sort-by distinct reverse last butlast take drop str name keyword
      vector? sequential? map? get nil? some?
      keyword? symbol? string? char? boolean?
      hash-map assoc dissoc merge keys vals
@@ -241,10 +241,20 @@
     (outside! (str "`" (name (:op ast)) "`"))))
 
 (defn lower-term
-  "The term for a Clojure form, with `locals` bound to themselves."
+  "The term for a Clojure form, with `locals` bound to themselves; those in
+  (:vector-locals ctx) are known to be vectors."
   [ctx locals form]
   (binding [l/*locals* (into (set locals) (keys (:own ctx)))]
-    (term-of ctx (zipmap locals locals) (l/lower form))))
+    (term-of ctx (into {} (map (fn [x] [x (if (contains? (:vector-locals ctx) x) (with-meta x {:vector true}) x)]))
+                       locals)
+             (l/lower form))))
+
+(defn- vector-params
+  "The parameters of fn q its signature says are vectors."
+  [ctx q params]
+  (let [tys (get-in ctx [:sigs q :params])]
+    (set (keep (fn [[p ty]] (when (and (seq? ty) (= 'Vec (first ty))) p))
+               (map vector params tys)))))
 
 (defn- defn-parts [f]
   (let [[_ nm & tail] f
@@ -267,7 +277,9 @@
           [q (try
                (when-not (and (vector? params) (every? symbol? params) (not (some #{'&} params)))
                  (outside! (str "the parameters of `" name "`")))
-               (let [b (lower-term (assoc ctx :current q :recur-target [q []] :ns ns-sym) params
+               (let [b (lower-term (assoc ctx :current q :recur-target [q []] :ns ns-sym
+                                          :vector-locals (vector-params ctx q params))
+                                   params
                                   (if (= 1 (count body)) (first body) (cons 'do body)))]
                  {:params params :body b
                   :recursive? (boolean (some #(and (= :app (t/head %)) (= q (second %)))

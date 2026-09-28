@@ -471,6 +471,20 @@
       (is (= '#{shout classify} (get g 'loud-classify)))
       (is (= #{} (get g 'log!))))))
 
+(deftest a-qualified-name-is-its-namespaces-even-when-this-one-has-it-too
+  (let [g (spec/call-graph 'writ.spec-demo.same-name)]
+    (is (= '#{writ.spec-demo.pipeline/handle} (get g 'handle)))
+    (is (= '#{writ.spec-demo.pipeline/respond handle} (get g 'respond-twice)))))
+
+(deftest a-graph-may-give-a-step-its-witness
+  (testing "a step whose arguments must agree is not found by generating them apart"
+    (let [r (spec/check 'writ.spec-demo.tagged-without-spec {:seed 42 :prove false :adequacy false})]
+      (is (not (:ok r)))
+      (is (str/includes? (:message r) "no generated msg does"))))
+  (testing "and is taken by the witness the graph gives"
+    (let [r (spec/check 'writ.spec-demo.tagged-with-spec {:seed 42 :prove false :adequacy false})]
+      (is (:ok r) (:message r)))))
+
 (deftest mermaid-draws-the-call-graph
   (let [m (spec/mermaid 'writ.spec-demo.pipeline)]
     (is (str/starts-with? m "flowchart LR"))

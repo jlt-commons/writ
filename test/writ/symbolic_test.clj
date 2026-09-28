@@ -129,3 +129,44 @@
         pos [:fn '[x] [:if [:call 'pos? 'x] 'x [:nil]]]]
     (is (sym/prove opts [] [:call '= [:call 'some pos xs] [:if [:call 'pos? 'a] 'a [:if [:call 'pos? 'b] 'b [:nil]]]]))
     (is (sym/prove opts [] [:call 'nil? [:call 'some pos [:sq [:enil]]]]))))
+
+(deftest a-vector-of-unknown-length-is-a-vector
+  (let [opts {:types '{as (Vec Int) k Keyword} :defs {} :tenv {}}
+        proves? (fn [t] (try (boolean (sym/prove opts [] t)) (catch Throwable _ false)))]
+    (is (proves? [:call 'vector? 'as]))
+    (is (proves? [:call 'sequential? 'as]))
+    (is (proves? [:call 'not [:call 'map? 'as]]))
+    (is (proves? [:call 'not [:call 'nil? 'as]]))
+    (is (proves? [:call '= [:call 'nth [:sq [:econs 'k [:econs 'as [:enil]]]] [:lit 1]] 'as]))
+    (testing "what it holds stays unknown"
+      (is (not (proves? [:call 'empty? 'as])))
+      (is (not (proves? [:call 'not [:call 'empty? 'as]])))
+      (is (not (proves? [:call '= 'as [:sq [:enil]]]))))))
+
+(deftest the-rest-of-a-value-of-unknown-shape-is-never-a-vector
+  (let [opts {:types '{x Any} :defs {} :tenv {}}]
+    (is (sym/prove opts [] [:call 'not [:call 'vector? [:call 'rest 'x]]]))))
+
+(deftest a-filtered-seq-compares-as-a-seq
+  (let [opts {:types '{a Int b Int} :defs {} :tenv {}}
+        le5 [:fn '[x] [:call '<= 'x [:lit 5]]]
+        one [:sq [:econs 'a [:enil]]]
+        none [:sq [:enil]]
+        proves? (fn [hyps g] (boolean (try (sym/prove opts hyps g) (catch Throwable _ false))))]
+    (is (proves? [] [:call '= [:call 'filter le5 one] [:if [:call '<= 'a [:lit 5]] one none]]))
+    (testing "and nothing false about it is proved"
+      (is (not (proves? [[:call '<= 'a [:lit 5]]] [:call 'not [:call '= [:call 'filter le5 one] one]])))
+      (is (not (proves? [[:call '> 'a [:lit 5]]] [:call 'not [:call '= [:call 'filter le5 one] none]]))))))
+
+(deftest sort-by-is-a-stable-sort-on-integer-keys
+  (let [opts {:types '{a Int b Int} :defs {} :tenv {}}
+        id [:fn '[x] 'x]
+        zero [:fn '[x] [:lit 0]]
+        ab [:sq [:econs 'a [:econs 'b [:enil]]]]
+        ba [:sq [:econs 'b [:econs 'a [:enil]]]]
+        le5 [:fn '[x] [:call '<= 'x [:lit 5]]]]
+    (is (sym/prove opts [] [:call '= [:call 'sort-by id ab] [:if [:call '<= 'a 'b] ab ba]]))
+    (is (sym/prove opts [] [:call '= [:call 'sort-by zero ab] ab]) "equal keys keep their order")
+    (is (sym/prove opts [] [:call '= [:call 'count [:call 'sort-by id [:call 'filter le5 ab]]]
+                            [:call 'count [:call 'filter le5 ab]]]))
+    (is (not (try (sym/prove opts [] [:call '= [:call 'sort-by id ab] ab]) (catch Throwable _ false))))))

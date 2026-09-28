@@ -531,6 +531,19 @@ state with something else leads back round: `{:result {[first]
   law `signal:green:tick->yellow` fails
     the graph says a tick can take green to yellow, but no generated green does
   ```
+  Some steps no generated value takes, because their arguments must
+  agree with each other: a reply answers a request only when it carries
+  the alias the request made, and two values generated apart never share
+  one. `:witnesses {[from to] [value arg ...]}` gives such a step an
+  example, a value of `from` and the edge fn's other arguments, which
+  the check tries before generating any:
+
+  ```clojure
+  (graph response
+    {:states    {:msg Any, :answered Answered, :unanswered Unanswered}
+     :edges     {:msg {[answer _ ReqId] #{:answered :unanswered}}}
+     :witnesses {[:msg :answered] [[:a 1] [:Req :a :m :srv]]}})
+  ```
 - **The graph's own rules.** `:start` names a state, or `[state value]`
   with a value in it; every state must be reachable from it; `:final`
   states must be reachable from every state; `:never [a b]` says no path
