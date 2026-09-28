@@ -18,6 +18,9 @@
                             :deps/root "lib"}}}
   :test      {:extra-paths ["test"]
               :main-opts   ["-m" "examples-runner"]}
+  ;; ./bin/bench, or jolt -M:bench DIR ...: the prover over the example specs
+  :bench     {:extra-paths ["test" "../test"]
+              :main-opts   ["-m" "writ.bench"]}
   :pong      {:main-opts ["-m" "pong.main"]}
   :life      {:main-opts ["-m" "life.main"]}
   :screens   {:main-opts ["-m" "screens.main"]}

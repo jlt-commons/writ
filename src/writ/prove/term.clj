@@ -169,6 +169,11 @@
         side (fn [xs] (cond (empty? xs) 0 (= 1 (count xs)) (first xs) :else (apply list '+ xs)))]
     [(side pos) (side neg)]))
 
+(def ^:dynamic *full-names*
+  "When true, show names the target's and the spec's fns in full, so the
+  form can be evaluated where they are not referred."
+  false)
+
 (defn show
   "A term as the Clojure form it stands for, for reports."
   [t]
@@ -190,10 +195,10 @@
                   (empty? xs) tail*
                   :else (list 'concat (apply list 'list xs) tail*)))
       :call (apply list (second t) (map show (drop 2 t)))
-      :app (apply list (symbol (name (second t))) (map show (drop 2 t)))
+      :app (apply list (if *full-names* (second t) (symbol (name (second t)))) (map show (drop 2 t)))
       :fn (list 'fn (nth t 1) (show (nth t 2)))
       :cfn (second t)
-      :dfn (symbol (name (second t)))
+      :dfn (if *full-names* (second t) (symbol (name (second t))))
       :ap (apply list (show (second t)) (map show (drop 2 t)))
       :if (list 'if (show (nth t 1)) (show (nth t 2)) (show (nth t 3)))
       :lin (let [[p n] (show-lin (second t) (nth t 2))]

@@ -1,0 +1,6 @@
+#!/bin/sh
+# Benchmark the prover over the example specs; extra arguments go first to
+# writ.bench, for example --baseline FILE or --save FILE.
+set -e
+cd "$(dirname "$0")/.."
+exec jolt -M:bench "$@" test/fetch test/life test/pong test/screens test/shortener

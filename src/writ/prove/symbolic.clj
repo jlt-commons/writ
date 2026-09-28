@@ -1357,7 +1357,10 @@
 (defn verify
   "Does certificate c prove goal g under hyps?"
   [opts hyps g c]
-  (if-let [{:keys [formula decls]} (formula opts hyps g)]
-    (try (solve/verify formula decls c)
-         (catch clojure.lang.ExceptionInfo _ false))
+  (if-let [{:keys [formula decls used]} (formula opts hyps g)]
+    (let [ok (try (solve/verify formula decls c)
+                  (catch clojure.lang.ExceptionInfo _ false))]
+      ;; what a replay unfolds is what the proof reads of the code
+      (when (and ok (:unfolded opts)) (swap! (:unfolded opts) into used))
+      ok)
     false))

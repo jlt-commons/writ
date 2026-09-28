@@ -358,6 +358,30 @@
      ;; a false or nil default is still a default
      :default (when default? (lower default))}))
 
+(defn- for-seq
+  "(for [x xs ...] body) as the seq fns it means: a binding is a mapcat
+  over its coll, or a map when it is the last and has only :when after
+  it, which is a filter; :when is an if and :let a let.  nil for a
+  modifier it does not read (:while), so for is macroexpanded as usual."
+  [bindings body]
+  (let [[b coll & more] bindings
+        [mods rest-bs] (split-with (fn [[k]] (keyword? k)) (partition 2 more))
+        mods (vec mods)
+        rest-bs (apply concat rest-bs)
+        g (gensym "for_")
+        bind (fn [inner] (if (symbol? b) (list 'fn [b] inner) (list 'fn [g] (list 'let [b g] inner))))]
+    (when-not (some (fn [[k]] (not (contains? #{:when :let} k))) mods)
+      (if (and (empty? rest-bs) (every? (fn [[k]] (= :when k)) mods))
+        (let [xs (if (seq mods)
+                   (list 'clojure.core/filter (bind (cons 'and (map second mods))) coll)
+                   coll)]
+          (list 'clojure.core/map (bind body) xs))
+        (when-let [inner (if (seq rest-bs) (for-seq rest-bs body) (list 'clojure.core/list body))]
+          (list 'clojure.core/mapcat
+                (bind (reduce (fn [e [k v]] (if (= :when k) (list 'if v e ()) (list 'let v e)))
+                              inner (reverse mods)))
+                coll))))))
+
 (defn lower [form]
   (cond
     (symbol? form) {:op :ref :name form}
@@ -392,6 +416,11 @@
         (do clojure.core/do)         (lower-do (rest form))
         (recur clojure.core/recur)   {:op :recur :args (mapv lower (rest form))}
         (case clojure.core/case)     (lower-case form)
+        (for clojure.core/for)       (let [[_ bs body] form]
+                                       (if-let [f (and (vector? bs) (even? (count bs)) (= 3 (count form))
+                                                       (for-seq bs body))]
+                                         (lower f)
+                                         (lower (macroexpand-1 form))))
         (unquote clojure.core/unquote)
         (throw (ex-info "Writ: Unsupported special form: unquote"
                         {:writ/error true}))
