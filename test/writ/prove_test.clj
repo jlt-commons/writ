@@ -691,3 +691,26 @@
   (is (= [:lit false] (norm [:call '= [:lit ##NaN] [:lit ##NaN]])))
   (is (= [:lit true] (norm {:types '{n Int}} [:call 'number? 'n])))
   (is (= [:lit false] (norm [:call 'number? [:sq [:econs [:lit 1] t/enil]]]))))
+
+(deftest a-fn-value-is-a-fn-and-data-is-not
+  (is (= [:lit true] (norm [:call 'fn? [:cfn 'inc]])))
+  (is (= [:lit true] (norm [:call 'fn? [:fn '[x] 'x]])))
+  (is (= [:lit false] (norm [:call 'fn? [:lit :k]])))
+  (is (= [:lit false] (norm [:call 'fn? [:sq t/enil]])))
+  (is (= [:lit false] (norm [:call 'fn? [:call 'hash-map [:lit :a] [:lit 1]]]))))
+
+(deftest equality-is-one-term-whichever-way-round
+  (is (= (norm {:types '{m Int n Int}} [:call '= 'm 'n])
+         (norm {:types '{m Int n Int}} [:call '= 'n 'm])))
+  (is (= (norm {:types '{m Keyword n Keyword}} [:call 'not [:call '= 'm 'n]])
+         (norm {:types '{m Keyword n Keyword}} [:call 'not [:call '= 'n 'm]]))))
+
+(deftest keep-of-a-when-is-a-map-over-a-filter
+  (let [p [:call 'pos? 'x]
+        v [:call 'vector 'x]]
+    (is (= (norm {:types '{xs (Vec Int)}} [:call 'map [:fn '[x] v] [:call 'filter [:fn '[x] p] 'xs]])
+           (norm {:types '{xs (Vec Int)}} [:call 'keep [:fn '[x] [:if p v t/tnil]] 'xs])))
+    (is (= (norm {:types '{xs (Vec Int)}} [:call 'map [:fn '[x] v] [:call 'filter [:fn '[x] [:call 'not p]] 'xs]])
+           (norm {:types '{xs (Vec Int)}} [:call 'keep [:fn '[x] [:if p t/tnil v]] 'xs])))
+    (testing "a kept value that may be nil is left alone"
+      (is (= 'keep (second (norm {:types '{xs (Vec Int)}} [:call 'keep [:fn '[x] [:if p [:call 'get 'm 'x] t/tnil]] 'xs])))))))
