@@ -39,7 +39,6 @@ writ runs on [jolt](https://github.com/jolt-lang/jolt).
 src/my/sort.clj           the implementation: plain Clojure, no writ
 test/my/sort_spec.clj     the contract: spec, graph, refine, ann, law
 test/my/sort_proof.clj    optional: lemmas and hints that help the prover
-test/my/sort_test.clj     runs the check
 ```
 
 1. Declare the state graph. Every spec has one: the problem's states, as
@@ -57,7 +56,8 @@ test/my/sort_test.clj     runs the check
 6. Run the check. If it fails, the report says what to fix. If a law holds
    but is not proved, help the prover with a lemma or a hint in the proof
    namespace; don't weaken the law.
-7. Keep the check in the test suite, so it gates every change.
+7. Keep the spec in the test suite, so it gates every change. A spec
+   namespace is a clojure.test namespace: the test runner checks it.
 
 writ is a test dependency. The spec and the check live on the test
 classpath, so production code never loads writ.
@@ -132,15 +132,25 @@ The spec:
                    (= (occurrences x (insert x xs)) (inc (occurrences x xs)))))
 ```
 
-The check:
+The check runs with the rest of the tests. `(spec my.sort)` also defines
+`writ-check`, a clojure.test test in the spec namespace that runs
+`(spec/check 'my.sort-spec)` and fails with the report's message, so
+`(clojure.test/run-tests 'my.sort-spec)`, or any runner that loads the
+namespace, checks the spec. A runner that finds test namespaces by name
+has to be told about the `-spec` ones: with Cognitect's test-runner that
+is `-r ".*-(test|spec)$"`, with Kaocha `:ns-patterns ["-test$" "-spec$"]`.
+
+`{:test {:seed 42 :trials 200}}` passes options to that check, and
+`{:test false}` leaves the test out, for a spec that is meant to fail or
+one a test checks by hand:
 
 ```clojure
 (ns my.sort-test
   (:require [clojure.test :refer [deftest is]]
             [writ.spec :as spec]))
 
-(deftest sort-meets-its-spec
-  (let [r (spec/check 'my.sort-spec)]
+(deftest sort-meets-its-spec-as-tested
+  (let [r (spec/check 'my.sort-spec {:require :tested})]
     (is (:ok r) (:message r))))
 ```
 

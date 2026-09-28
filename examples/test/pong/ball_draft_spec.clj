@@ -7,7 +7,8 @@
   (:require [pong.core :refer [W H PH LEFT-X]]
             [writ.spec :refer [spec ann graph law]]))
 
-(spec pong.core)
+;; it is meant to fail, so a test runner does not check it
+(spec pong.core {:test false})
 
 (ann advance [(Tuple Int Int Int Int) Int Int -> (Tuple Int Int Int Int)])
 

@@ -6,7 +6,8 @@
   table itself."
   (:require [writ.spec :refer [spec data ann machine]]))
 
-(spec screens.core)
+;; it is meant to fail, so a test runner does not check it
+(spec screens.core {:test false})
 
 (data Screen Logo Title Options Gameplay Paused Ending)
 (data Event Timeout Confirm Configure Back Pause Finish Quit)

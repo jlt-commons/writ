@@ -415,7 +415,11 @@ value anywhere else is rejected.
 (spec/instrument 'my.sort-spec)                   ; runtime arg/return checks
 ```
 
-In a test: `(let [r (spec/check 'my.sort-spec)] (is (:ok r) (:message r)))`.
+`(spec my.sort)` defines `writ-check`, a clojure.test test that runs the
+check, so the test runner checks the spec namespace with no wrapper
+(a runner that picks namespaces by name must match `-spec` too).
+`{:test {:seed 42}}` passes check options; `{:test false}` drops it.
+By hand: `(let [r (spec/check 'my.sort-spec)] (is (:ok r) (:message r)))`.
 Other options are `:trials`, the test.check runs per law (default 100),
 `:max-size`, the largest generated size (default 50), and
 `:adequacy false`, which skips the gap check while a spec is being drafted.

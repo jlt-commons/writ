@@ -43,6 +43,7 @@
             [clojure.set :as set]
             [clojure.walk :as walk]
             [clojure.string :as str]
+            [clojure.test]
             [writ.book :as book]
             [writ.check :as ck]
             [writ.data :as dt]
@@ -133,19 +134,32 @@
   checks my.sort-spec first, and its laws that are proved are lemmas here:
   a proof may cite them.  Like a proof namespace's lemmas they are not
   laws of this spec, and judge no stand-in.  One that is only tested is
-  not imported, and the report says so."
+  not imported, and the report says so.
+
+  It also defines `writ-check`, a clojure.test test in the spec namespace
+  that runs `check` on it, so a test runner that loads the spec checks it.
+  {:test {:seed 42 :trials 200}} passes options to that check, and
+  {:test false} leaves the test out."
   ([target] `(spec ~target {}))
   ([target opts]
    (when-not (simple-sym? target)
      (fail! "`spec` names a namespace symbol, had: `" (pr-str target) "`"))
    (when-not (map? opts)
      (fail! "`spec " target "` takes an options map after the namespace, had: " (pr-str opts)))
-   (when-let [bad (seq (remove #{:require :uses} (keys opts)))]
-     (fail! "`spec " target "` has unknown options: " (pr-str bad) "; it takes :require and :uses"))
+   (when-let [bad (seq (remove #{:require :uses :test} (keys opts)))]
+     (fail! "`spec " target "` has unknown options: " (pr-str bad) "; it takes :require, :uses and :test"))
    (when (contains? opts :require) (check-level! (str "`spec " target "`") (:require opts)))
    (when (and (contains? opts :uses) (not (and (vector? (:uses opts)) (every? simple-sym? (:uses opts)))))
      (fail! "`spec " target "` :uses takes a vector of spec namespaces, had: " (pr-str (:uses opts))))
-   `(-register! '~(ns-name *ns*) :target '~[target opts])))
+   (let [t (get opts :test true)
+         spec-ns (ns-name *ns*)]
+     (when-not (or (boolean? t) (map? t))
+       (fail! "`spec " target "` :test takes true, false or a map of `check` options, had: " (pr-str t)))
+     `(do (-register! '~spec-ns :target '~[target (dissoc opts :test)])
+          ~(when t
+             `(clojure.test/deftest ~'writ-check
+                (let [r# (check '~spec-ns ~(if (map? t) t {}))]
+                  (clojure.test/is (:ok r#) (:message r#)))))))))
 
 (defmacro data
   "Declare a datatype the target's values use, as writ.defn/data."
