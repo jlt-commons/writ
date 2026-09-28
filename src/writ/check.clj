@@ -446,25 +446,41 @@
   (when (and o (not (:rebuilt? o)))
     (if (empty? (:path o)) (:col o) [(:col o) (:path o)])))
 
+(declare test-facts*)
+
+(defn- bound-refs
+  "The names an integer bound is made of, or nil when e is not one: a name
+  known to hold a Nat or a count, or (count x) of a name.  A counter that
+  climbs to it stops once the names hold still."
+  [e info]
+  (cond
+    (ref? e) (let [n (:name e)
+                   init (get (:binds info) n)]
+               (when (or (contains? (:nat info) n)
+                         (and init (= 'count (core-head init info))))
+                 #{n}))
+    (and (= 'count (core-head e info)) (= 1 (count (:args e))) (ref? (first (:args e))))
+    #{(:name (first (:args e)))}
+    :else nil))
+
+(defn- below-facts
+  "#{[:below c refs]} when x is column c itself and y an integer bound made
+  of refs: x < y or x <= y, so c climbing by one runs out."
+  [x y info stop]
+  (let [o (origin x info stop)
+        refs (bound-refs y info)]
+    (if (and o refs (numeric-only? o) (zero? (:net o 0)) (not (:strict? o)) (empty? (:path o)))
+      #{[:below (:col o) refs]}
+      #{})))
+
 (defn- test-facts
   "[then else]: the facts a branch test proves about columns, as sets of
   [:pos c k] / [:nonzero c k] (c minus k is positive / nonzero),
-  [:nonempty place], [:nonnil place] and [:eq c v]."
+  [:nonempty place], [:nonnil place], [:eq c v] and [:below c refs] (c is
+  below an integer bound made of the names refs)."
   [test info stop]
-  (let [col (fn [e] (place-of (origin e info stop)))
-        num (fn [e] (let [o (origin e info stop)]
-                      (when (and o (numeric-only? o)) [(:col o) (:net o 0)])))
-        num-fact (fn [f e] (if-let [[c k] (num e)] #{[f c k]} #{}))
-        one (fn [f c] (if c #{[f c]} #{}))
-        ;; e >= m: each depth below m is positive
-        at-least (fn [e m] (if-let [[c k] (num e)]
-                             (into #{} (for [j (range m)] [:pos c (+ k j)]))
-                             #{}))
-        ka (let [v (lit-val (first (:args test)))] (when (int? v) v))
-        kb (let [v (lit-val (second (:args test)))] (when (int? v) v))
-        h (core-head test info)
+  (let [h (core-head test info)
         [a b] (:args test)
-        none [#{} #{}]
         ;; `and` and `or` expand to (let [g x] (if g more g)) and
         ;; (let [g x] (if g g more))
         [g x body] (when (and (= :let (:op test)) (= 1 (count (:bindings test))))
@@ -481,7 +497,32 @@
             [_ e2] (test-facts (:else body) info stop)]
         [#{} (into e1 e2)])
 
-      :else
+      (and (contains? '#{< <= > >=} h) (= 2 (count (:args test))))
+      (let [[t e] (test-facts* test info stop)
+            up (fn [x y] (below-facts x y info stop))]
+        (if (contains? '#{< <=} h)
+          [(into t (up a b)) (into e (up b a))]
+          [(into t (up b a)) (into e (up a b))]))
+
+      :else (test-facts* test info stop))))
+
+(defn- test-facts*
+  "test-facts for a test that is not an and, an or or a comparison's bound."
+  [test info stop]
+  (let [col (fn [e] (place-of (origin e info stop)))
+        num (fn [e] (let [o (origin e info stop)]
+                      (when (and o (numeric-only? o)) [(:col o) (:net o 0)])))
+        num-fact (fn [f e] (if-let [[c k] (num e)] #{[f c k]} #{}))
+        one (fn [f c] (if c #{[f c]} #{}))
+        ;; e >= m: each depth below m is positive
+        at-least (fn [e m] (if-let [[c k] (num e)]
+                             (into #{} (for [j (range m)] [:pos c (+ k j)]))
+                             #{}))
+        ka (let [v (lit-val (first (:args test)))] (when (int? v) v))
+        kb (let [v (lit-val (second (:args test)))] (when (int? v) v))
+        h (core-head test info)
+        [a b] (:args test)
+        none [#{} #{}]]
     (case h
       zero? [#{} (num-fact :nonzero a)]
       pos? [(num-fact :pos a) #{}]
@@ -524,7 +565,7 @@
       ;; any other test: a truthy value is non-nil
       (if (or (ref? test) (origin test info stop))
         [(one :nonnil (col test)) #{}]
-        none)))))
+        none))))
 
 (defn- case-clause-facts
   "Facts a `case` clause proves: when its test constants are all non-nil,
@@ -604,8 +645,22 @@
         stop (set names)
         os (mapv #(origin % info stop) args)
         own? (fn [i] (let [o (nth os i)] (and o (= (:col o) (nth names i nil)))))
+        unchanged? (fn [n] (let [j (.indexOf ^java.util.List names n)]
+                             (or (neg? j)
+                                 (let [o (nth os j nil)]
+                                   (and o (= n (:col o)) (not (:strict? o)) (zero? (:net o 0))
+                                        (empty? (:path o)))))))
+        ;; (inc c) under c < bound, the bound's names held still: bound
+        ;; minus c shrinks, and c, a Nat, is an integer, so it runs out
+        climbs? (fn [i]
+                  (let [c (nth names i nil)
+                        [step x] (shrink-step (nth args i) info)]
+                    (and c (= :inc step) (ref? x) (= c (:name x)) (contains? (:nat info) c)
+                         (some (fn [[k fc refs]] (and (= :below k) (= c fc) (every? unchanged? refs)))
+                               facts))))
         smaller (fn [i] (or (literal-smaller? (nth args i) (nth names i nil) facts)
-                            (and (own? i) (:strict? (nth os i)))))
+                            (and (own? i) (:strict? (nth os i)))
+                            (climbs? i)))
         idx (first (filter smaller (range (count args))))]
     (when (nil? idx)
       (fail! what " does not descend: no argument is a "
@@ -616,7 +671,7 @@
         (fail! what " does not descend: argument " (inc i)
                " before the shrinking one must be passed unchanged; put `"
                (display (nth names idx)) "` first in the " where)))
-    (when-not (literal-smaller? (nth args idx) (nth names idx) facts)
+    (when-not (or (literal-smaller? (nth args idx) (nth names idx) facts) (climbs? idx))
       (let [c (nth names idx)]
         (doseq [need (sort-by pr-str (:needs (nth os idx)))]
           (when-not (proven? need c facts info)
