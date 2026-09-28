@@ -837,11 +837,20 @@ as a hypothesis:
 - a list is nil, empty, or a head and a tail
 - a `Nat` is 0 or p + 1
 - a datatype has one case per constructor
+- an integer `i` that a loop counts up to a bound `e`, such as
+  `(count xs)`, is at or past `e`, or below it with the law at `i + 1`.
+  That is induction on what is left, `e - i`, and it is tried first when
+  a recursion of the code climbs on a law's integer. A scan that resumes
+  from `start` is proved this way.
 
 Within a case, the prover:
 
 - splits an open integer comparison into its two outcomes, and
-  substitutes an equality that holds
+  substitutes an equality that holds, or that two facts pin down
+- splits the test an induction hypothesis still needs, so the hypothesis
+  can be used, and takes a boolean hypothesis that applies as facts
+- closes a branch whose terms throw, since a law is about the inputs on
+  which its terms return (not for a law that says nothing throws)
 - splits an unknown tail into empty, and a head and a tail. That is how
   `insert-keeps-sorted` sees the second element.
 - decides integer conditions from all the facts at once (Fourier-Motzkin

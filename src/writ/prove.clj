@@ -6,7 +6,9 @@
   The search tries, in order: the law as it stands; then structural
   induction on each quantified variable of an inductive type -- a list is
   nil, empty or a head and a tail, a Nat is 0 or p + 1, a datatype one case
-  per constructor -- with the law at every smaller value as a hypothesis.
+  per constructor, an integer a loop counts up to a bound is at or past
+  it, or below it with the law at one more -- with the law at every
+  smaller value as a hypothesis.
   Inside each case an open integer comparison is split into its two
   outcomes; an equality that holds is substituted away.
 
@@ -39,17 +41,50 @@
 ;; for nothing.
 
 (defn- split-candidate
-  "An open integer comparison to split on: in the goal, or in a fact that
-  is still an if, such as a disjunction taken as a hypothesis."
+  "An integer equation the facts pin down, to put in; else an open
+  integer comparison to split on: in the goal, in a fact that is still
+  an if, such as a disjunction taken as a hypothesis, or in what an
+  induction hypothesis assumes; failing that, the test of an if with a
+  branch that throws, or of one nested in another's test."
   ([n] (split-candidate n nil))
   ([n ctx]
-   (first (filter #(contains? #{:le :ieq} (head %))
-                  (concat (rw/open-conditions n)
-                          (for [[f v] (t/sort-printed key (:facts ctx))
-                                :when (and (true? v) (= :if (head f)))
-                                c (rw/open-conditions f)
-                                :when (not (contains? (:facts ctx) c))]
-                            c))))))
+   (or ;; two facts 0 <= d and 0 <= -d pin d to 0: an equation to put in
+       (when ctx
+         (let [les (t/sort-printed (for [[f v] (:facts ctx) :when (and (true? v) (= :le (head f)))] (second f)))]
+           (first (for [[i a] (map-indexed vector les)
+                        b (drop (inc i) les)
+                        :when (= [:lit 0] (rw/normalize ctx [:lin 0 [[a 1] [b 1]]]))
+                        :let [c [:ieq a]]
+                        :when (and (not (contains? (:facts ctx) c)) (solve-eq a))]
+                    c))))
+       (first (filter #(contains? #{:le :ieq} (head %))
+                      (concat (rw/open-conditions n)
+                              (for [[f v] (t/sort-printed key (:facts ctx))
+                                    :when (and (true? v) (= :if (head f)))
+                                    c (rw/open-conditions f)
+                                    :when (not (contains? (:facts ctx) c))]
+                                c)
+                              ;; what an induction hypothesis still needs:
+                              ;; deciding it lets the hypothesis rewrite
+                              (for [{:keys [hyp]} (:ih ctx)
+                                    :when hyp
+                                    :let [h (rw/normalize ctx hyp)]
+                                    c (cons h (rw/open-conditions h))]
+                                c))))
+       ;; the test of an if one of whose branches throws: the other
+       ;; branch is all there is to prove
+       (first (for [x (t/subterms n)
+                    :when (and (= :if (head x)) (or (= [:bottom] (nth x 2)) (= [:bottom] (nth x 3))))]
+                (nth x 1)))
+       ;; the test of an if that is itself an if's test, such as the
+       ;; first case of an `or` over a step of a loop: the rewriter
+       ;; reads only the outer test, so the two outcomes of the inner one
+       ;; are what separates the cases
+       (first (for [x (t/subterms n)
+                    :when (and (= :if (head x)) (= :if (head (nth x 1))))
+                    :let [c (nth (nth x 1) 1)]
+                    :when (not= :if (head c))]
+                c)))))
 
 (def ^:private enum-limit
   "The most values a bounded integer is split into, one case each."
@@ -154,6 +189,9 @@
     (cond
       vacuous {:by :hypothesis-false}
       (truthy? n) {:by :rewriting}
+      ;; the law's terms throw here, and a law is about the inputs on
+      ;; which they return -- unless it says they never throw
+      (and (= [:bottom] n) (not (:total opts))) {:by :throws}
       (zero? depth) (solved)
       :else
       (if-let [v (data-var opts n ctx)]
@@ -250,18 +288,57 @@
                  :when (and ty (not= x v))]
              [x ty])))
 
+(defn- induct
+  "Prove g by induction on v with cases cs, each proved outright or by
+  generalising; the trace, or nil."
+  [opts g v ty cs]
+  (let [free (varying opts v)
+        opts (cond-> opts (seq free) (assoc :ih-free free))
+        steps (for [c cs]
+                (let [[opts* gi] (sc/induction-case opts g v c)]
+                  [c (or (prove-all opts* gi)
+                         (by-generalizing (dissoc opts* :ih-free) gi (keys (:types c))))]))]
+    (when (every? (comp some? second) steps)
+      (cond-> {:by :induction :on v :ty (plain ty)
+               :cases (mapv (fn [[c p]] {:case (:desc c) :proof p}) steps)}
+        (seq free) (assoc :vary free)))))
+
 (defn- by-induction [opts g v ty]
   (when-let [cs (cases v ty (:tenv opts))]
-    (let [free (varying opts v)
-          opts (cond-> opts (seq free) (assoc :ih-free free))
-          steps (for [c cs]
-                  (let [[opts* gi] (sc/induction-case opts g v c)]
-                    [c (or (prove-all opts* gi)
-                           (by-generalizing (dissoc opts* :ih-free) gi (keys (:types c))))]))]
-      (when (every? (comp some? second) steps)
-        (cond-> {:by :induction :on v :ty (plain ty)
-                 :cases (mapv (fn [[c p]] {:case (:desc c) :proof p}) steps)}
-          (seq free) (assoc :vary free))))))
+    (induct opts g v ty cs)))
+
+(defn- by-climbing
+  "Prove g by induction on integer v climbing to bound e: the law where v
+  is at or past e, and where it is below, from the law at v + 1."
+  [opts g v ty e]
+  (some-> (induct opts g v ty (sc/climbing-cases v e)) (assoc :climb e)))
+
+(defn- climbing-bounds
+  "The bounds integer variable v climbs to in terms: each e of a
+  comparison v < e (or v <= e - 1) in them, or in the guards of a
+  recursive definition they call, with its arguments put in -- a loop
+  whose index counts up to e; with loops-only, only the guards.  e never
+  mentions v, and is an integer."
+  [opts terms v & {:keys [loops-only]}]
+  (let [ctx (rw/context opts)
+        guards (fn [x]
+                 (let [d (get-in opts [:defs (second x)])]
+                   (when (and (:recursive? d) (= (count (:params d)) (count (drop 2 x))))
+                     (rw/open-conditions (t/subst (:body d) (zipmap (:params d) (drop 2 x)))))))
+        conds (distinct (concat (when-not loops-only (mapcat rw/open-conditions terms))
+                                (mapcat guards (filter #(= :app (head %)) (distinct (mapcat t/subterms terms))))))]
+    (distinct
+      (for [c conds
+            :let [c (rw/normalize ctx c)
+                  c (if (and (= :call (head c)) (= 'not (second c))) (nth c 2) c)]
+            d (when (= :le (head c)) [(second c)])
+            :let [[k0 pairs] (if (= :lin (head d)) [(second d) (nth d 2)] [0 [[d 1]]])
+                  m (into {} pairs)]
+            ;; 0 <= r - v says v <= r, so v < r + 1
+            :when (= -1 (get m v))
+            :let [e (rw/normalize ctx (rw/lin->term {:c (inc k0) :m (dissoc m v)}))]
+            :when (and (not (contains? (t/vars e) v)) (sc/int-bound? ctx e))]
+        e))))
 
 (defn- fuelled
   "f's result, or nil when it runs out of fuel."
@@ -358,8 +435,9 @@
         ons (fn [by] (distinct (keep #(when (= by (:by %)) (:on %)) steps)))
         by? (fn [by] (some #(= by (:by %)) steps))
         on (first (ons :induction))
+        climb (some #(when (and (= :induction (:by %)) (contains? % :climb)) (:climb %)) steps)
         cs (map (comp pr-str t/show) (ons :split))]
-    (str (cond on (str "by induction on " on)
+    (str (cond on (str "by induction on " on (when climb (str " up to " (pr-str (t/show climb)))))
                (by? :symbolic) "by symbolic evaluation"
                :else "by rewriting")
          (when (seq cs) (str ", splitting on " (str/join " and " cs)))
@@ -485,7 +563,23 @@
           bs-order (if-let [v (:induct hint)]
                      (concat (filter #(= v (first %)) bs) (remove #(= v (first %)) bs))
                      bs)
-          induction (for [[v ty] bs-order] #(by-induction opts g v ty))
+          terms (delay (or (fuelled #(let [ctx (rw/context opts)]
+                                       (mapv (fn [x] (rw/normalize ctx x)) (concat (:hyps g) (:goals g)))))
+                           []))
+          ;; an integer that a loop counts up to a bound, by induction on
+          ;; the distance left
+          climbing (for [[v ty] bs-order
+                         :when (contains? '#{Nat Int} ty)
+                         e (or (fuelled #(climbing-bounds opts @terms v)) [])]
+                     #(by-climbing opts g v ty e))
+          ;; a loop of the code that climbs on a law's integer names the
+          ;; induction its recursion follows: that one goes first, before
+          ;; rewriting unrolls the loop a split at a time
+          loop-climbs? (some (fn [[v ty]] (and (contains? '#{Nat Int} ty)
+                                                (seq (fuelled #(climbing-bounds opts @terms v :loops-only true)))))
+                             bs)
+          structural (for [[v ty] bs-order] #(by-induction opts g v ty))
+          induction (concat climbing structural)
           tries (cond
                   ;; that nothing throws is known only from running the code
                   ;; symbolically, where every throw is noted
@@ -494,6 +588,7 @@
                   (= :rewriting (:strategy hint)) rewriting
                   (= :induction (:strategy hint)) induction
                   (:induct hint) (concat induction symbolic rewriting)
+                  loop-climbs? (concat climbing [(first symbolic)] rewriting [(second symbolic)] structural)
                   :else (concat [(first symbolic)] rewriting [(second symbolic)] induction))
           [trace used] (or (first (filter first (map attempt tries))) [nil #{}])
           ;; a fold into an accumulator: prove it adds, then try again with that
@@ -584,9 +679,19 @@
                   (let [opts {:defs defs :tenv tenv :types types :recognizers recs
                               :unfolded (atom #{}) :lemmas-used (atom #{}) :fuel (or fuel 20000)
                               :lemmas rules :rets {}}
-                        trace (fuelled
-                                #(or (some->> (prove-all opts g) (hash-map :by :cases :proofs))
-                                     (first (keep (fn [p] (by-induction opts g p (types p))) ps))))]
+                        ;; a bound the code climbs to goes first: rewriting
+                        ;; would unroll the loop a split at a time, the goal
+                        ;; doubling at each test it cannot decide.  Each
+                        ;; attempt on its own fuel, so one that runs out
+                        ;; leaves the next its turn
+                        trace (or (first (for [p ps
+                                               :when (contains? '#{Nat Int} (plain (types p)))
+                                               e (or (fuelled #(climbing-bounds opts (:goals g) p)) [])
+                                               :let [r (fuelled #(by-climbing opts g p (types p) e))]
+                                               :when r]
+                                           r))
+                                  (fuelled #(some->> (prove-all opts g) (hash-map :by :cases :proofs)))
+                                  (first (keep (fn [p] (fuelled #(by-induction opts g p (types p)))) ps)))]
                     (when (and trace (:ok (check/check-proof (dissoc opts :lemmas-used :unfolded) g trace)))
                       trace)))
         ;; the fns each fn's code calls, itself and transitively
