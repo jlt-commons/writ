@@ -163,3 +163,31 @@
     (is (re-find #"does not descend"
                  (check-err '(defn f {:writ/descend true} [^:many ^Nat a ^:many ^Bool b]
                                (if (or (pos? a) b) (f (dec a) b) b)))))))
+
+(deftest a-counter-climbing-to-a-bound-descends
+  (testing "(inc i) under (< i n), n fixed and an integer: n - i shrinks"
+    (is (ck/check-defn
+          '(defn find-at {:writ/descend true} [^:many ^{:writ/type (Vec Nat)} xs ^:many ^Nat start]
+             (let [n (count xs)]
+               (loop [^:many i start]
+                 (if (< i n)
+                   (if (zero? (nth xs i)) i (recur (inc i)))
+                   nil))))))
+    (is (ck/check-defn
+          '(defn up {:writ/descend true} [^:many ^Nat i ^:many ^Nat n]
+             (if (>= i n) i (up (inc i) n)))))
+    (is (ck/check-defn
+          '(defn up-count {:writ/descend true} [^:many ^{:writ/type (Vec Nat)} xs ^:many ^Nat i]
+             (if (< i (count xs)) (up-count xs (+ i 1)) i)))))
+  (testing "a bound that moves with the counter does not"
+    (is (re-find #"does not descend"
+                 (check-err '(defn chase {:writ/descend true} [^:many ^Nat i ^:many ^Nat n]
+                               (if (< i n) (chase (inc i) (inc n)) i))))))
+  (testing "a bound that is not an integer does not: it may be ##Inf"
+    (is (re-find #"does not descend"
+                 (check-err '(defn to-x {:writ/descend true} [^:many ^Nat i ^:many x]
+                               (if (< i x) (to-x (inc i) x) i))))))
+  (testing "a counter that is not an integer does not"
+    (is (re-find #"does not descend"
+                 (check-err '(defn from-x {:writ/descend true} [^:many i ^:many ^Nat n]
+                               (if (< i n) (from-x (inc i) n) i)))))))
