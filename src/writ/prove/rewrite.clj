@@ -669,6 +669,11 @@
       (and (= :lit hb) (exact-scalar? (second b)))
       (when-let [v (known-literal ctx a)]
         [:lit (= v (second b))])
+      ;; = is symmetric: of two other terms, the one that prints first goes
+      ;; first, so (= m n) and (= n m) are one term, and a fact of one
+      ;; decides the other
+      (and (not= :lit ha) (not= :lit hb) (pos? (compare (pr-str a) (pr-str b))))
+      [:call '= b a]
       :else nil)))
 
 ;; --- computed rules --------------------------------------------------------------
@@ -875,6 +880,25 @@
                    (= :call (head (nth a 3))) (= 'reverse (second (nth a 3))) (= 3 (count (nth a 3))))
               [:call 'not [:call 'some (nth a 2) (nth (nth a 3) 2)]]
               :else (let [tr (truthiness ctx a)] (when (some? tr) [:lit (not tr)])))
+        ;; (keep (fn [x] (when p v)) xs), v never nil, keeps v for each x
+        ;; p takes: the map of v over the filter of p, as a for with :when is
+        keep (when (= 2 n)
+               (let [[f xs] args]
+                 (when (and (= :fn (head f)) (= 1 (count (second f))) (= :if (head (nth f 2))))
+                   (let [[_ ps [_ p v w]] f]
+                     (cond
+                       (and (= t/tnil w) (true? (truthiness ctx v)))
+                       [:call 'map [:fn ps v] [:call 'filter [:fn ps p] xs]]
+                       (and (= t/tnil v) (true? (truthiness ctx w)))
+                       [:call 'map [:fn ps w] [:call 'filter [:fn ps [:call 'not p]] xs]]
+                       :else nil)))))
+        ;; a fn value is a fn; data is not
+        fn? (when (= 1 n)
+              (cond (contains? #{:fn :cfn :dfn} (head a)) [:lit true]
+                    (or (int-term? ctx a) (contains? #{:lit :nil :sq} (head a))
+                        (and (= :call (head a)) (contains? '#{hash-map hash-set assoc} (second a))))
+                    [:lit false]
+                    :else nil))
         ;; an integer is a number, and a seq, nil or a fn is not
         number? (when (= 1 n)
                   (cond (int-term? ctx a) [:lit true]
@@ -1307,7 +1331,7 @@
         (:lemmas ctx)))
 
 (def ^:private boolean-fns
-  '#{writ.prove.term/same number? = not= not < <= > >= empty? zero? pos? neg? even? odd? nil? some? true? false? every? boolean})
+  '#{writ.prove.term/same number? fn? = not= not < <= > >= empty? zero? pos? neg? even? odd? nil? some? true? false? every? boolean})
 
 (defn- boolean-term?
   "Does t return true or false, never another value?  Only then is an

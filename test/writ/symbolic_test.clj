@@ -122,3 +122,10 @@
     (testing "a recursion into a form of any depth gives up, and soon"
       (is (= :tested (get status 'a-depth-is-never-negative)) (:message r))
       (is (< (- (System/currentTimeMillis) t0) 120000)))))
+
+(deftest some-over-a-seq-of-known-length-is-its-first-truthy-value
+  (let [opts {:types '{a Int b Int} :defs {} :tenv {}}
+        xs [:sq [:econs 'a [:econs 'b [:enil]]]]
+        pos [:fn '[x] [:if [:call 'pos? 'x] 'x [:nil]]]]
+    (is (sym/prove opts [] [:call '= [:call 'some pos xs] [:if [:call 'pos? 'a] 'a [:if [:call 'pos? 'b] 'b [:nil]]]]))
+    (is (sym/prove opts [] [:call 'nil? [:call 'some pos [:sq [:enil]]]]))))

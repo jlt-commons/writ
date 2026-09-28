@@ -217,7 +217,8 @@
                                         (for [[g v] (:elems sb)] [(conj-f [:not c] g) v]))))
                   :distinct (and (:distinct sa) (:distinct sb))
                   :elem (or (:elem sa) (:elem sb))}})
-    :fn (give-up! "a fn value chosen by a test")
+    ;; the same named fn either way is that fn
+    :fn (if (and (:named a) (= (:named a) (:named b))) a (give-up! "a fn value chosen by a test"))
     (cond-> {:vec (mapv #(merge-values st c %1 %2) (:vec a) (:vec b))}
       (and (:kind a) (= (:kind a) (:kind b))) (assoc :kind (:kind a))))))
 
@@ -860,6 +861,8 @@
       some? (lift st (fn [x] {:bool (not (:nil x))}) a)
       ;; an opaque value is none of the integers, so it is not one
       integer? (lift st (fn [x] {:bool (contains? x :int)}) a)
+      ;; a fn value is one; a law's values are data, so no other is
+      fn? (lift st (fn [x] {:bool (contains? x :fn)}) a)
       sequential? (lift st (fn [x] {:bool (sequential-value? st x)}) a)
       map? (lift st (fn [x] {:bool (if (:map x) true (map-value? st x))}) a)
       hash-map (reduce (fn [m [k v]] (map-assoc st m k v true)) {:map []} (partition 2 args))
@@ -892,6 +895,17 @@
                             (and (:vec xs) (<= (count (:vec xs)) 1)) (assoc xs :kind :seq)
                             :else (give-up! "distinct of more than one symbolic element")))
                      a)
+      ;; some over a seq of known length: the first element's value that is
+      ;; truthy, an if for each, nil when none is
+      some (lift st (fn [xs]
+                      (cond
+                        (:nil xs) {:nil true}
+                        (:vec xs) (reduce (fn [acc e]
+                                            (let [v (apply-fn st a [e])]
+                                              (merge-values st (truth v) v acc)))
+                                          {:nil true} (reverse (:vec xs)))
+                        :else (give-up! "some over a collection of unknown size")))
+                 b)
       every? (lift st (fn [xs]
                         (cond
                           (:nil xs) {:bool true}
@@ -1197,8 +1211,8 @@
       :app (let [[_ f & args] x] (app st f (mapv #(ev st env %) args)))
       :fn (let [[_ ps body] x]
             {:fn (fn [vs] (ev st (merge env (zipmap ps vs)) body))})
-      :cfn (let [f (second x)] {:fn (fn [vs] (folded (core st f vs)))})
-      :dfn (let [f (second x)] {:fn (fn [vs] (app st f vs))})
+      :cfn (let [f (second x)] {:fn (fn [vs] (folded (core st f vs))) :named x})
+      :dfn (let [f (second x)] {:fn (fn [vs] (app st f vs)) :named x})
       :ap (let [[_ f & args] x]
             (apply-fn st (ev st env f) (mapv #(ev st env %) args)))
       :lin (folded {:int (into [:+ (second x)] (for [[a k] (nth x 2)] [:* k (int-of (ev st env a))]))})

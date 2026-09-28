@@ -21,7 +21,7 @@
      vector? sequential? map? get nil? some?
      keyword? symbol? string? char? boolean?
      hash-map assoc dissoc merge keys vals
-     subvec mapv filterv keep remove not-any? range conj number?})
+     subvec mapv filterv keep remove not-any? range conj number? fn?})
 
 (def ^:private vector-fns
   "The clojure.core fns whose value is always a vector."
