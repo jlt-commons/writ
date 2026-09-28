@@ -37,6 +37,27 @@
 
 (defn head [t] (when (vector? t) (first t)))
 
+(defn- nan? [x] (and (float? x) (Double/isNaN x)))
+
+(defn same
+  "Clojure's =, but with NaN the same as NaN, at any depth: so every value
+  is the same as itself, which = does not promise.  Sequentials compare
+  element by element, maps by their keys and the values at them, sets as
+  = does; 1 is still not the same as 1.0."
+  [a b]
+  (cond
+    (and (nan? a) (nan? b)) true
+    (and (sequential? a) (sequential? b))
+    (loop [xs (seq a), ys (seq b)]
+      (cond (and (nil? xs) (nil? ys)) true
+            (or (nil? xs) (nil? ys)) false
+            (same (first xs) (first ys)) (recur (next xs) (next ys))
+            :else false))
+    (and (map? a) (map? b))
+    (and (= (count a) (count b))
+         (every? (fn [[k v]] (and (contains? b k) (same v (get b k)))) a))
+    :else (= a b)))
+
 (defn lit? [t] (= :lit (head t)))
 
 (defn int-lit? [t] (and (lit? t) (integer? (second t))))
@@ -142,7 +163,8 @@
          :lit (second t)
          :sq (apply list (eval-elems (second t) env))
          (:enil :econs :eapp :elems) (apply list (eval-elems t env))
-         :call (apply @(resolve (symbol "clojure.core" (name (second t))))
+         ;; a qualified head is writ's own, same
+         :call (apply @(resolve (if (namespace (second t)) (second t) (symbol "clojure.core" (name (second t)))))
                       (map ev (drop 2 t)))
          :app (apply @(res (second t)) (map ev (drop 2 t)))
          :fn (let [[_ ps body] t]

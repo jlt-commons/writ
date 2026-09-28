@@ -620,3 +620,17 @@
       (is (some #(str/includes? % "differs from the real fn on {n 0}") (:survivors (first (:gaps r)))))))
   (testing "a mutant no input tells apart is the same fn, and a spec that pins sign has no gap"
     (is (:ok (spec/check 'writ.spec-demo.sign-spec {:seed 42 :cache false :adequacy :mutants})))))
+
+(deftest a-bang-type-takes-in-nan
+  (is (some #(and (float? %) (Double/isNaN %)) (spec/sample 'Double! {} 200)))
+  (is (some #(and (float? %) (Double/isNaN %)) (spec/sample 'Any! {} 300)))
+  (is (not-any? #(and (float? %) (Double/isNaN %)) (spec/sample 'Double {} 300))))
+
+(deftest a-law-over-nan-compares-with-same
+  (let [r (spec/check 'writ.spec-demo.nan-spec {:seed 1 :cache false})]
+    (is (:ok r) (:message r))
+    (is (every? #(contains? #{:proved :evaluated} (:status %)) (:laws r))))
+  (testing "with =, a law over values that may be NaN fails at one, and the report says why"
+    (let [r (spec/check 'writ.spec-demo.nan-eq-spec {:seed 1 :cache false})]
+      (is (not (:ok r)))
+      (is (str/includes? (:message r) "false only because = says NaN is not NaN")))))

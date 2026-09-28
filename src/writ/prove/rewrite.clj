@@ -109,8 +109,6 @@
     ;; not=, max, min and abs, as the comparisons clojure.core makes
     [not=-def      [:call not= ?x ?y]                   [:call not [:call = ?x ?y]]]
     [boolean-def   [:call boolean ?x]                   [:if ?x [:lit true] [:lit false]]]
-    [max-def       [:call max ?a ?b]                    [:if [:call > ?a ?b] ?a ?b]]
-    [min-def       [:call min ?a ?b]                    [:if [:call < ?a ?b] ?a ?b]]
     [abs-def       [:call abs ?a]                       [:if [:call neg? ?a] [:call - ?a] ?a]]
     ;; a comparison of three is two, the second only if the first holds
     [le3           [:call <= ?a ?b ?c]                  [:if [:call <= ?a ?b] [:call <= ?b ?c] [:lit false]]]
@@ -170,8 +168,6 @@
     [filterv-def   [:call filterv ?f ?x]                [:call filter ?f ?x]]
     [remove-def    [:call remove ?f ?x]                 [:call filter [:fn [%rm] [:call not [:ap ?f %rm]]] ?x]]
     [not-any-def   [:call not-any? ?f ?x]               [:call not [:call some ?f ?x]]]
-    ;; whether some element passes does not depend on their order
-    [not-some-rev  [:call not [:call some ?f [:call reverse ?x]]] [:call not [:call some ?f ?x]]]
     ;; apply + sums; of nothing it is 0
     [apply-sum-nil     [:call apply [:cfn +] [:nil]]                [:lit 0]]
     [apply-sum-empty   [:call apply [:cfn +] [:sq [:enil]]]         [:lit 0]]
@@ -636,9 +632,13 @@
                           (= t (nth c 2)) (= :lit (head (nth c 3))) (exact-scalar? (second (nth c 3))))]
            (second (nth c 3)))))
 
+(defn- nan-lit? [t] (and (= :lit (head t)) (float? (second t)) (Double/isNaN (second t))))
+
 (defn- equality [ctx a b]
   (let [ha (head a) hb (head b)]
     (cond
+      ;; nothing is = to NaN, NaN included
+      (or (nan-lit? a) (nan-lit? b)) [:lit false]
       (and (= :lit ha) (= :lit hb)) [:lit (= (second a) (second b))]
       (and (= :nil ha) (= :nil hb)) [:lit true]
       (and (= :nil ha) (contains? #{:lit :sq} hb)) [:lit false]
@@ -844,9 +844,43 @@
         pos? (when (int-term? ctx a) (lt ctx [:lit 0] a))
         neg? (when (int-term? ctx a) (lt ctx a [:lit 0]))
         = (when (= 2 n) (equality ctx a b))
+        ;; writ's same is = with NaN the same as NaN: every value is the
+        ;; same as itself, and values that hold no NaN are same when =
+        writ.prove.term/same
+        (when (= 2 n)
+          (let [ea (when (= :sq (head a)) (second a)) eb (when (= :sq (head b)) (second b))
+                va (closed-value a) vb (closed-value b)]
+            (cond
+              (= a b) [:lit true]
+              (and (not= ::none va) (not= ::none vb)) [:lit (t/same va vb)]
+              (and (float-free? ctx a) (float-free? ctx b)) [:call '= a b]
+              (and (= :econs (head ea)) (= :econs (head eb)))
+              [:if [:call 'writ.prove.term/same (nth ea 1) (nth eb 1)]
+               [:call 'writ.prove.term/same [:sq (nth ea 2)] [:sq (nth eb 2)]]
+               [:lit false]]
+              (and (= :enil (head ea)) (= :enil (head eb))) [:lit true]
+              (or (and (= :enil (head ea)) (= :econs (head eb))) (and (= :econs (head ea)) (= :enil (head eb))))
+              [:lit false]
+              :else nil)))
+        ;; max and min are comparisons on integers; with a NaN in, the
+        ;; answer is NaN whichever way > goes, so only integers
+        max (when (and (= 2 n) (int-term? ctx a) (int-term? ctx b)) [:if [:call '> a b] a b])
+        min (when (and (= 2 n) (int-term? ctx a) (int-term? ctx b)) [:if [:call '< a b] a b])
+        ;; whether some element is in a set does not depend on their order:
+        ;; a set applied never throws, so some cannot stop short of a throw
         not (cond
               (= :le (head a)) [:le (lin->term (lin+ (lin* -1 (lin-of ctx (second a))) {:c -1 :m {}}))]
+              (and (= :call (head a)) (= 'some (second a)) (= 4 (count a))
+                   (= :call (head (nth a 2))) (= 'hash-set (second (nth a 2)))
+                   (= :call (head (nth a 3))) (= 'reverse (second (nth a 3))) (= 3 (count (nth a 3))))
+              [:call 'not [:call 'some (nth a 2) (nth (nth a 3) 2)]]
               :else (let [tr (truthiness ctx a)] (when (some? tr) [:lit (not tr)])))
+        ;; an integer is a number, and a seq, nil or a fn is not
+        number? (when (= 1 n)
+                  (cond (int-term? ctx a) [:lit true]
+                        (= :lit (head a)) [:lit (number? (second a))]
+                        (contains? #{:sq :nil :fn :cfn :dfn} (head a)) [:lit false]
+                        :else nil))
         ;; a truthy value is not nil, and a value that is neither nil nor
         ;; false is truthy
         some? (when (= 1 n) (if (true? (truthiness ctx a)) [:lit true] (when (= t/tnil a) [:lit false])))
@@ -1273,7 +1307,7 @@
         (:lemmas ctx)))
 
 (def ^:private boolean-fns
-  '#{= not= not < <= > >= empty? zero? pos? neg? even? odd? nil? some? true? false? every? boolean})
+  '#{writ.prove.term/same number? = not= not < <= > >= empty? zero? pos? neg? even? odd? nil? some? true? false? every? boolean})
 
 (defn- boolean-term?
   "Does t return true or false, never another value?  Only then is an
@@ -1436,9 +1470,12 @@
 (def ^:private gen-int (gen/choose -5 5))
 
 (def ^:private gen-value
+  ;; a NaN now and then, alone and inside a seq: a rule must hold for them too
   (gen/frequency [[1 (gen/return nil)]
                   [3 gen-int]
+                  [1 (gen/return ##NaN)]
                   [3 (gen/one-of [(gen/list gen-int) (gen/vector gen-int)])]
+                  [1 (gen/list (gen/one-of [gen-int (gen/return ##NaN)]))]
                   [1 (gen/list (gen/list gen-int))]]))
 
 (defn- gen-for [v]
@@ -1475,8 +1512,9 @@
                                             :else x))
                     l (returns #(t/evaluate (fill lhs)))]
                 (or (nil? l)
+                    ;; compared with same: a NaN on both sides is the same value
                     (let [r (returns #(t/evaluate (fill rhs)))]
-                      (and r (= (second l) (second r))))))))
+                      (and r (t/same (second l) (second r))))))))
         res (tc/quick-check trials p :seed seed)]
     (if (:pass? res)
       {:rule nm :ok true}
@@ -1503,7 +1541,7 @@
           [leaf
            (gen/fmap (fn [[f x]] [:call f x]) (gen/tuple (gen/elements unary) sub))
            (gen/fmap (fn [[f x y]] [:call f x y])
-                     (gen/tuple (gen/elements '[cons concat list =]) sub sub))
+                     (gen/tuple (gen/elements '[cons concat list = writ.prove.term/same]) sub sub))
            (gen/fmap (fn [[f x y]] [:call f x y])
                      (gen/tuple (gen/elements '[+ - < <= = max]) int-leaf int-leaf))
            (gen/fmap (fn [[x i]] [:call 'nth x [:lit i] [:nil]]) (gen/tuple sub (gen/choose -1 3)))
@@ -1533,7 +1571,7 @@
              (let [o (returns #(t/evaluate x))]
                (or (nil? o)
                    (let [n (returns #(t/evaluate (normalize (context {}) x)))]
-                     (and n (= (second o) (second n)))))))
+                     (and n (t/same (second o) (second n)))))))
          res (tc/quick-check trials p :seed seed)]
      (if (:pass? res)
        {:ok true}

@@ -660,3 +660,34 @@
         n (rw/normalize ctx [:call 'some [:fn [p] [:call '= [:call 'first p] [:lit 99]]] 'cs])]
     (is (not= [:lit true] n))
     (is (not (some #{[:fn [p] [:lit true]]} (t/subterms n))))))
+
+;; --- NaN -------------------------------------------------------------------------
+
+(deftest same-is-equality-with-nan-the-same-as-nan
+  (is (t/same ##NaN ##NaN))
+  (is (t/same [1 [##NaN]] '(1 (##NaN))))
+  (is (t/same {:a ##NaN} {:a ##NaN}))
+  (is (not (t/same 1 1.0)))
+  (is (not (t/same [##NaN] [##NaN 1]))))
+
+(deftest a-value-that-may-be-nan-is-the-same-as-itself-but-not-equal
+  (let [ctx {:types '{x Any! y Any}}]
+    (is (= [:lit true] (norm ctx [:call 'writ.prove.term/same 'x 'x])))
+    (is (= [:call '= 'x 'x] (norm ctx [:call '= 'x 'x])) "an Any! may be NaN, which = says is not itself")
+    (is (= [:lit true] (norm ctx [:call '= 'y 'y])) "an Any holds no NaN")
+    (is (= [:lit true] (norm ctx [:call 'writ.prove.term/same [:sq [:econs [:lit :v] [:econs 'x t/enil]]]
+                                  [:sq [:econs [:lit :v] [:econs 'x t/enil]]]])))
+    (is (= [:lit true] (norm [:call 'writ.prove.term/same [:lit ##NaN] [:lit ##NaN]])))
+    (is (= [:lit false] (norm [:call '= [:lit ##NaN] [:lit ##NaN]])))))
+
+(deftest the-rules-hold-with-nan-among-the-values
+  ;; the self-test's values take in NaN: max and min on a NaN are NaN, so
+  ;; they are comparisons only on integers
+  (is (:ok (rw/self-test)))
+  (is (:ok (rw/ground-check 600 7))))
+
+(deftest nothing-is-equal-to-a-nan-and-an-integer-is-a-number
+  (is (= [:lit false] (norm {:types '{v Any!}} [:call '= 'v [:lit ##NaN]])))
+  (is (= [:lit false] (norm [:call '= [:lit ##NaN] [:lit ##NaN]])))
+  (is (= [:lit true] (norm {:types '{n Int}} [:call 'number? 'n])))
+  (is (= [:lit false] (norm [:call 'number? [:sq [:econs [:lit 1] t/enil]]]))))
