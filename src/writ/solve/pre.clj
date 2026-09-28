@@ -130,8 +130,21 @@
 
 (declare formula)
 
+(declare term*)
+
 (defn- term
-  "The linear form of an integer term."
+  "The linear form of an integer term, once per distinct term: a formula
+  shares its subterms, and each is translated once however often it
+  occurs."
+  [st decls t]
+  (if (vector? t)
+    (or (get-in @st [:terms t])
+        (let [l (term* st decls t)]
+          (vswap! st assoc-in [:terms t] l)
+          l))
+    (term* st decls t)))
+
+(defn- term*
   [st decls t]
   (let [tm #(term st decls %)
         v [{} 0]]
@@ -216,8 +229,19 @@
   (let [ls (map #(term st decls %) ts)]
     (conj* (map rel ls (rest ls)))))
 
+(declare formula*)
+
 (defn- formula
-  "The negation normal form of a formula."
+  "The negation normal form of a formula, once per distinct subformula."
+  [st decls f]
+  (if (vector? f)
+    (or (get-in @st [:formulas f])
+        (let [g (formula* st decls f)]
+          (vswap! st assoc-in [:formulas f] g)
+          g))
+    (formula* st decls f)))
+
+(defn- formula*
   [st decls f]
   (let [fm #(formula st decls %)]
     (cond
@@ -265,8 +289,11 @@
 (defn- name-of!
   "A literal standing for f: f itself, or a fresh variable implying it."
   [st f]
-  (if (literal? f)
-    f
+  (cond
+    (literal? f) f
+    ;; a subformula that occurs again is the same name, not a new one
+    (get-in @st [:names f]) (get-in @st [:names f])
+    :else
     (let [p [:bool [:t (:n @st)] true]]
       (vswap! st update :n inc)
       (let [names (mapv #(name-of! st %) (rest f))]
@@ -274,6 +301,7 @@
                 (if (= :and (first f))
                   (map (fn [g] [(negate p) g]) names)
                   [(into [(negate p)] names)])))
+      (vswap! st assoc-in [:names f] p)
       p)))
 
 (defn- clausify! [st f]
