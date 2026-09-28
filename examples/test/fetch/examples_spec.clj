@@ -7,7 +7,8 @@
   core_spec.clj states the bands instead."
   (:require [writ.spec :refer [spec data ann graph law]]))
 
-(spec fetch.core)
+;; it is meant to fail, so a test runner does not check it
+(spec fetch.core {:test false})
 
 (data Class Done Redirect Transient Failed)
 

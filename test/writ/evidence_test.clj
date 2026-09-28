@@ -65,6 +65,8 @@
                      ":require must be :proved or :tested"))
   (is (str/includes? (expansion-error '(writ.spec/spec my.ns {:strict true}))
                      "unknown options"))
+  (is (str/includes? (expansion-error '(writ.spec/spec my.ns {:test :yes}))
+                     ":test takes true, false or a map"))
   (is (str/includes? (expansion-error '(writ.spec/law l {:require :tested} (= 1 1)))
                      "needs :because"))
   (is (str/includes? (expansion-error '(writ.spec/law l {:because "x"} (= 1 1)))

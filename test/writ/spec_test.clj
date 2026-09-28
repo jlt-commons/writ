@@ -634,3 +634,36 @@
     (let [r (spec/check 'writ.spec-demo.nan-eq-spec {:seed 1 :cache false})]
       (is (not (:ok r)))
       (is (str/includes? (:message r) "false only because = says NaN is not NaN")))))
+
+;; --- a spec is a clojure.test test ----------------------------------------
+
+(defn- run-test-var
+  "Run a test var the way a clojure.test runner does, collecting what it reports."
+  [v]
+  (let [reports (atom [])]
+    (binding [clojure.test/report #(swap! reports conj %)]
+      (clojure.test/test-vars [v]))
+    (filter #(#{:pass :fail :error} (:type %)) @reports)))
+
+(deftest a-spec-namespace-checks-itself-under-clojure-test
+  (require spec-ns)
+  (let [v (ns-resolve spec-ns 'writ-check)]
+    (is (var? v) "`spec` defines writ-check in the spec namespace")
+    (is (fn? (:test (meta v))) "writ-check is a clojure.test test")
+    (let [rs (run-test-var v)]
+      (is (= [:pass] (map :type rs))))))
+
+(deftest a-failing-spec-fails-its-test-with-the-report
+  (require 'writ.spec-demo.no-graph-spec)
+  (let [rs (run-test-var (ns-resolve 'writ.spec-demo.no-graph-spec 'writ-check))]
+    (is (= [:fail] (map :type rs)))
+    (is (str/includes? (:message (first rs)) "graph"))))
+
+(deftest the-spec-test-can-be-turned-off-or-given-check-options
+  (let [x (macroexpand-1 '(writ.spec/spec my.ns {:test false}))]
+    (is (not (str/includes? (pr-str x) "deftest"))))
+  (let [x (pr-str (macroexpand-1 '(writ.spec/spec my.ns {:test {:seed 42 :trials 10}})))]
+    (is (str/includes? x "deftest"))
+    (is (str/includes? x ":seed 42"))
+    (is (not (str/includes? x ":test {"))
+        "the check options are not left in the spec's own options")))
