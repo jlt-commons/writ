@@ -52,6 +52,7 @@
             [writ.norm :as norm]
             [writ.types :as ty]
             [writ.prove :as prover]
+            [writ.prove.term :as pterm]
             [clojure.test.check :as tc]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
@@ -416,6 +417,15 @@
       (fail! where ": :because goes with :require :tested, the reason a law is only tested"))
     opts))
 
+(def ^{:arglists '([a b])} same
+  "= with NaN the same as NaN, at any depth, so that every value is the
+  same as itself.  A law over a ! type -- Any!, Double!, whose values
+  take in NaN -- compares with same where it means the same value; = is
+  false of two NaNs, so a law that compares them with = is false there.
+  The prover takes same to be what it is: reflexive, and = on values that
+  hold no NaN."
+  pterm/same)
+
 (defmacro law
   "State a law about the target's behaviour.
 
@@ -548,9 +558,9 @@
         Char (char? v)
         Keyword (keyword? v)
         Symbol (symbol? v)
-        (Float Double) (number? v)
+        (Float Double Float! Double!) (number? v)
         Unit (nil? v)
-        Any true
+        (Any Any!) true
         (if-let [[d args] (data-decl t tenv)]
           (conforms-data? d args v tenv)
           true))
@@ -655,9 +665,14 @@
         Keyword gen/keyword
         Symbol gen/symbol
         (Float Double) finite-double
+        ;; a ! type's values take in NaN, alone and inside a vector
+        (Float! Double!) (gen/frequency [[4 finite-double] [1 (gen/return ##NaN)]])
         Unit (gen/return nil)
         Any (gen/one-of [gen/small-integer gen/string-alphanumeric gen/keyword
                          (gen/vector gen/small-integer)])
+        Any! (gen/one-of [gen/small-integer gen/string-alphanumeric gen/keyword
+                          (gen/return ##NaN) finite-double
+                          (gen/vector (gen/one-of [gen/small-integer (gen/return ##NaN)]))])
         (if-let [[d args] (data-decl t tenv)]
           (data-gen d args t tenv)
           (fail! "cannot generate values of type `" t "`: declare it with `data`")))
@@ -792,7 +807,11 @@
           show (fn [r] (if (contains? r :ok) (pr-str (:ok r)) (str "threw: " (:thrown r))))]
       (if (and (contains? ra :ok) (contains? rb :ok) (= (:ok ra) (:ok rb)))
         {:result :pass}
-        {:result :fail :detail [[a (show ra)] [b (show rb)]]}))
+        {:result :fail
+         :detail (cond-> [[a (show ra)] [b (show rb)]]
+                   ;; they print alike: a NaN inside, which = says is not itself
+                   (and (contains? ra :ok) (contains? rb :ok) (pterm/same (:ok ra) (:ok rb)))
+                   (conj [(list '= a b) "false only because = says NaN is not NaN; compare with same, where a NaN is the same as a NaN"]))}))
 
     (head? p "and")
     (or (first (remove #(= :pass (:result %)) (map #(holds ctx % env) (rest p))))
@@ -1022,7 +1041,7 @@
           v (assoc v i (put-at (nth v i) more x))]
       (if (vector? form) v (with-meta (apply list v) (meta form))))))
 
-(declare static-check defn-parts source-url)
+(declare static-check defn-parts source-url unbang)
 
 (defn- mutants
   "Mutants of signed fn nm, as impostors: its source changed at one place,
@@ -1186,8 +1205,9 @@
                       forms)
           missing (remove #(contains? defns %) (sort (keys anns)))
           refs (refines-of e)
-          anns (into {} (map (fn [[k sig]] [k (erase sig refs)])) anns)
-          data (mapv #(erase-data % refs) data)]
+          ;; to the type checker a ! type is its plain type: NaN is a Double
+          anns (into {} (map (fn [[k sig]] [k (unbang (erase sig refs))])) anns)
+          data (mapv #(unbang (erase-data % refs)) data)]
       (when (seq missing)
         (fail! "the spec gives `" (first missing) "` a signature, but `" target
                "` defines no fn `" (first missing) "`"))
@@ -2008,6 +2028,11 @@
     (vector? t) (mapv #(erase % refines) t)
     (map? t) (into {} (map (fn [[k v]] [k (erase v refines)])) t)
     :else t))
+
+(defn- unbang
+  "t with each ! type as the type it adds NaN to."
+  [t]
+  (walk/postwalk #(get '{Any! Any Double! Double Float! Float} % %) t))
 
 (defn- sig-str [{:keys [params ret]}]
   (str "[" (str/join " " (map pr-str params)) (when (seq params) " ") "-> " (pr-str ret) "]"))

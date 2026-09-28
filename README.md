@@ -287,6 +287,18 @@ Built in: `Nat Int Bool String Char Keyword Symbol Float Double Unit Any`,
 `(List T)`, `(Vec T)`, `(Set T)`, `(Map K V)`, `(Tuple T ...)`, and
 function types `(-> A B R)`. Declared types come from `data`.
 
+`Float`, `Double` and `Any` hold no NaN; `Float!`, `Double!` and `Any!`
+are the same with NaN among their values, and their generators produce
+it, alone and inside vectors. Clojure's `=` says NaN is not NaN, so a law
+that compares values of a `!` type with `=` is false at a NaN, and writ
+says so when it finds one. `writ.spec/same` is `=` with NaN the same as
+NaN, at any depth: compare with it where you mean the same value.
+
+```clojure
+(law a-binder-captures-any-value
+  (forall [s Symbol, v Any!] (same (capture [:Bind s] v) {s v})))
+```
+
 `(List T)` means any seq: a list, a vector, a lazy seq or nil. Generated
 inputs mix all four, so code that only works on one of them fails. `conj`,
 for example, prepends to a list and appends to a vector.
@@ -976,11 +988,14 @@ Clojure makes:
 - A lazy seq is truthy before it is realised, so deciding one never runs
   its elements.
 - `=` is Clojure's: sequentials compare element by element, and `1`
-  never equals `1.0`. writ's types range over values without `NaN`, as
-  its generators do, so a law over `Any` or `Double` says nothing about
-  `##NaN` (which is not `=` to itself). A term equals itself when it only
-  picks and arranges parts of such values; one that computes a float may
-  be a `NaN` of none, and equals itself only when that is ruled out.
+  never equals `1.0`. `Any` and `Double` range over values without NaN,
+  as their generators do, so a law over them says nothing about `##NaN`,
+  which is not `=` to itself; `Any!` and `Double!` take NaN in. A term
+  equals itself when it only picks and arranges parts of NaN-free values;
+  one that computes a float may be a NaN of none, and one of a `!` type
+  may be one. `same` is reflexive whatever the value, and is `=` on
+  values without NaN. The rewrite rules are checked against the runtime
+  on values that include NaN.
 - Integers are exact (jolt promotes on overflow). `+` is associative and
   commutative only on integers. Floats get no algebra. A term counts as
   an integer only when its form or a proved fact says so, never because a

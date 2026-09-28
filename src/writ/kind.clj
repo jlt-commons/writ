@@ -7,7 +7,9 @@
   dependent type may legitimately appear inside a type).")
 
 (def base-types
-  '#{Nat Bool Unit Int String Char Float Double Keyword Symbol Any})
+  '#{Nat Bool Unit Int String Char Float Double Keyword Symbol Any
+     ;; the same, but with NaN among their values
+     Any! Float! Double!})
 
 (def builtin-ctors
   "Built-in type constructors: name -> fixed arity, or :nary for one or more.
