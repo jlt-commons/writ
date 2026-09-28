@@ -685,3 +685,9 @@
   ;; they are comparisons only on integers
   (is (:ok (rw/self-test)))
   (is (:ok (rw/ground-check 600 7))))
+
+(deftest nothing-is-equal-to-a-nan-and-an-integer-is-a-number
+  (is (= [:lit false] (norm {:types '{v Any!}} [:call '= 'v [:lit ##NaN]])))
+  (is (= [:lit false] (norm [:call '= [:lit ##NaN] [:lit ##NaN]])))
+  (is (= [:lit true] (norm {:types '{n Int}} [:call 'number? 'n])))
+  (is (= [:lit false] (norm [:call 'number? [:sq [:econs [:lit 1] t/enil]]]))))

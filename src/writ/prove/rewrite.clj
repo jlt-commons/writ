@@ -632,9 +632,13 @@
                           (= t (nth c 2)) (= :lit (head (nth c 3))) (exact-scalar? (second (nth c 3))))]
            (second (nth c 3)))))
 
+(defn- nan-lit? [t] (and (= :lit (head t)) (float? (second t)) (Double/isNaN (second t))))
+
 (defn- equality [ctx a b]
   (let [ha (head a) hb (head b)]
     (cond
+      ;; nothing is = to NaN, NaN included
+      (or (nan-lit? a) (nan-lit? b)) [:lit false]
       (and (= :lit ha) (= :lit hb)) [:lit (= (second a) (second b))]
       (and (= :nil ha) (= :nil hb)) [:lit true]
       (and (= :nil ha) (contains? #{:lit :sq} hb)) [:lit false]
@@ -871,6 +875,12 @@
                    (= :call (head (nth a 3))) (= 'reverse (second (nth a 3))) (= 3 (count (nth a 3))))
               [:call 'not [:call 'some (nth a 2) (nth (nth a 3) 2)]]
               :else (let [tr (truthiness ctx a)] (when (some? tr) [:lit (not tr)])))
+        ;; an integer is a number, and a seq, nil or a fn is not
+        number? (when (= 1 n)
+                  (cond (int-term? ctx a) [:lit true]
+                        (= :lit (head a)) [:lit (number? (second a))]
+                        (contains? #{:sq :nil :fn :cfn :dfn} (head a)) [:lit false]
+                        :else nil))
         ;; a truthy value is not nil, and a value that is neither nil nor
         ;; false is truthy
         some? (when (= 1 n) (if (true? (truthiness ctx a)) [:lit true] (when (= t/tnil a) [:lit false])))
@@ -1297,7 +1307,7 @@
         (:lemmas ctx)))
 
 (def ^:private boolean-fns
-  '#{writ.prove.term/same = not= not < <= > >= empty? zero? pos? neg? even? odd? nil? some? true? false? every? boolean})
+  '#{writ.prove.term/same number? = not= not < <= > >= empty? zero? pos? neg? even? odd? nil? some? true? false? every? boolean})
 
 (defn- boolean-term?
   "Does t return true or false, never another value?  Only then is an
