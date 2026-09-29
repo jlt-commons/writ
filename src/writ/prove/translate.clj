@@ -4,8 +4,10 @@
   Definitions and law terms are lowered by writ.lower (so cond, when,
   if-let, and, or and destructuring are already let and if), then read
   into terms.  Only the fragment the rewrite rules model is accepted:
-  anything else -- conj, maps, host calls, a target fn passed as a value
-  -- raises `outside`, and a law that needs it is left to testing.  A
+  anything else -- a core fn not in `core-fns`, conj onto a value not
+  known to be a vector, host calls, named or variadic local fns, a
+  computed value called as a fn -- raises `outside`, and a law that
+  needs it is left to testing.  A
   loop becomes a recursive definition of its own, over its bindings and
   the locals it closes over, and recur a call of it."
   (:require [writ.lower :as l]
