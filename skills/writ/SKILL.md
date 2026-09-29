@@ -205,6 +205,31 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
 - `(flow f [param ...] [link link ...] ...)`: the path data takes through
   `f`. See [Flows](#flows).
 
+## Assumptions
+
+When the code calls something writ does not check (`clojure.string`, a
+library, another namespace), say what the spec takes as given:
+
+```clojure
+(assume str/trim [String -> String])                 ; a signature, via the spec's alias
+(assume trim-is-idempotent                           ; a law about such fns only
+  (forall [s String] (= (str/trim (str/trim s)) (str/trim s))))
+```
+
+A signature types the calls statically and is checked where the fn
+returns while laws run. A law is tested against the real fns every check
+and cited by the prover like a lemma, without proof. An assumption may
+not call the target's fns. Every report lists what is assumed, and
+`attest` counts a new assumption as weakening the spec, so assume what the
+dependency documents, not whatever closes a proof.
+
+- ``assumption `x` does not hold of the code it is about`` - the claim
+  about the dependency is false; fix the claim, not the code.
+- ``assumption `x` calls `f`, a fn of target`` - state what the target
+  does as a law instead.
+- ``assumes a signature for `ns/f`, which does not resolve`` - require
+  the namespace in the spec and name the fn through its alias.
+
 ## The proof namespace
 
 When a law holds but isn't proved, add what the prover needs in

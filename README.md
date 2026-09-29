@@ -284,6 +284,9 @@ A spec namespace requires `writ.spec` and uses these forms.
   through `f`. See [Flows](#flows).
 - `(machine name {...})` states that a fn steps a state machine by a
   transition table. See [Machines](#machines).
+- `(assume ns/f [A -> R])` and `(assume name proposition)` state what the
+  spec takes as given about code writ does not check. See
+  [Assumptions](#assumptions).
 
 A spec may define its own helper fns, like `ascending?` above. They run
 only when laws run. A helper may not share a name with a public fn of the
@@ -1160,6 +1163,8 @@ Several things guard the prover itself:
   looks at the code would say nothing about it.
 - A law that is proved and then refuted by a test value is reported as a
   writ bug.
+- What the spec assumes about code writ does not check is tested on every
+  check and named in every report; see [Assumptions](#assumptions).
 
 The prover covers:
 
@@ -1298,6 +1303,61 @@ fns
 `(spec/mermaid 'my.spec {:graph 'g})` draws graph `g` as a mermaid
 `stateDiagram-v2`.
 
+### Assumptions
+
+The code a spec covers calls code writ does not check: `clojure.string`,
+a library, another team's namespace. Calls into them pass the static
+check, but the prover cannot read them, so a law that depends on what
+they do stays tested. `assume` says what the spec takes as given:
+
+```clojure
+(ns my.slug-spec
+  (:require [clojure.string :as str]
+            [writ.spec :refer [spec ann law assume]]))
+
+(assume str/trim [String -> String])
+(assume str/lower-case [String -> String])
+
+(assume trim-is-idempotent
+  (forall [s String] (= (str/trim (str/trim s)) (str/trim s))))
+(assume trim-and-lower-case-commute
+  (forall [s String] (= (str/trim (str/lower-case s)) (str/lower-case (str/trim s)))))
+```
+
+An assumed signature types every call to the fn in the static check, so
+code that hands `str/trim` a number fails there. While the laws run, the
+fn is wrapped like a signed one, so a signature it does not keep fails
+where it returns. The prover takes its result to be of its return type.
+
+An assumed law is about such fns and never the target's: one that calls
+a fn of the target fails, since the target is what the spec checks. It
+is tested against the real fns on every check, and a counterexample fails
+the check:
+
+```
+assumption `trim-empties` does not hold of the code it is about for
+  s = "0"
+  (str/trim s) => "0"
+```
+
+The prover cites one that holds as it cites a lemma, but it is not proved,
+so every report names what the spec assumes, and a proof names the
+assumptions it cites:
+
+```
+writ.spec: my.slug-spec against my.slug: ok
+  7 of 7 laws proved (5 for every input, 2 on particular values) (the spec requires proof)
+  assumes, tested but not proved: clojure.string/lower-case [String -> String], clojure.string/trim [String -> String], trim-is-idempotent, trim-and-lower-case-commute
+  law `cleaning-twice-is-cleaning-once` proved by rewriting, citing trim-and-lower-case-commute, trim-is-idempotent, ...
+```
+
+An assumption counts toward no law and judges no stand-in, like a lemma.
+Each is an obligation, `assume.clojure.string/trim` and
+`assume.trim-is-idempotent`, `plan` lists them, and `attest` counts an
+assumption the earlier record did not make, or made differently, as a
+weaker spec. Assume what the dependency documents, not what the proof
+happens to need.
+
 ### Open questions
 
 `(question id "text")` records a question the spec does not answer yet.
@@ -1326,7 +1386,7 @@ namespace, which is checked afresh rather than trusted. It reports each
 way the later spec is weaker: a law removed or restated, its requirement
 lowered (`:proved` to `:tested`), its evidence dropped (proved, now only
 tested), another obligation gone, a blocking question no longer blocking,
-or a check that passed and now fails.
+a new or changed assumption, or a check that passed and now fails.
 
 ```clojure
 (spec/attest "spec-record.edn" 'my.spec)

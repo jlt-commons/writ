@@ -574,7 +574,7 @@
              (:ctors (get-in ctx [:tenv ty])))
      :else false)))
 
-(declare boolean-term?)
+(declare boolean-term? has-type?)
 
 (def ^:private selecting-fns
   "clojure.core fns whose value is made of parts of their data arguments
@@ -641,10 +641,15 @@
          ;; holds of every value the definition returns
          :app (let [[_ f & args] x
                     d (get-in ctx [:defs f])]
-                (and (:params d) (= (count args) (count (:params d)))
-                     (every? ff? args)
-                     (or (contains? seen f)
-                         (float-free? ctx (:body d) (set (:params d)) (conj seen f)))))
+                (if (:params d)
+                  (and (= (count args) (count (:params d)))
+                       (every? ff? args)
+                       (or (contains? seen f)
+                           (float-free? ctx (:body d) (set (:params d)) (conj seen f))))
+                  ;; a fn with no definition to read -- one the spec assumes a
+                  ;; signature for -- by its contract: a value of a scalar
+                  ;; type other than a float
+                  (boolean (some #(has-type? ctx % x) '[String Keyword Symbol Char Bool Int]))))
          false)))))
 
 (defn- exact-scalar?
