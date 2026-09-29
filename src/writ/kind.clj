@@ -15,8 +15,11 @@
   "Built-in type constructors: name -> fixed arity, or :nary for one or more.
   `List`, `Vec` and `Set` take an element type, `Map` a key and a value
   type; `Tuple` and `&` are n-ary products (the latter is a multi-value
-  return).  Each is Data when its arguments are."
-  {"List" 1 "Vec" 1 "Set" 1 "Map" 2 "Tuple" :nary "&" :nary})
+  return); `(Opt T)` is a T or nil.  Each is Data when its arguments are.
+  A map literal is a record type: {:id Nat, :nick (Opt String)} is a map
+  with those keys, each value of its type, and an (Opt T) key may be
+  absent."
+  {"List" 1 "Vec" 1 "Set" 1 "Map" 2 "Tuple" :nary "&" :nary "Opt" 1})
 
 (defn- builtin-arity [s] (get builtin-ctors (name s)))
 
@@ -50,6 +53,16 @@
           (fail! "`" ty "` is a type constructor; it needs " a " type argument(s)")))
       :else (fail! "`" ty "` is not a type"))
 
+    (map? ty)
+    (do (when (empty? ty)
+          (fail! "`{}` is not a type; a record names at least one key"))
+        (doseq [[k v] ty]
+          (when-not (keyword? k)
+            (fail! "`" (pr-str ty) "` is not a type; a record's keys are keywords, had `"
+                   (pr-str k) "`"))
+          (check-type v tenv allowed))
+        true)
+
     (seq? ty)
     (let [h (first ty)]
       (cond
@@ -81,6 +94,16 @@
 (def kind-Type :Type)
 (def kind-Data :Data)
 
+(defn record-type?
+  "Is ty a record type, a map of keyword keys to their types?"
+  [ty]
+  (and (map? ty) (seq ty) (every? keyword? (keys ty))))
+
+(defn opt-type?
+  "Is ty (Opt T), a T or nil?"
+  [ty]
+  (and (seq? ty) (symbol? (first ty)) (= 'Opt (plain (first ty))) (= 2 (count ty))))
+
 (defn function-type?
   "Is `ty` a function type `(-> A B ...)`?"
   [ty]
@@ -107,6 +130,9 @@
   (letfn [(k [t seen]
             (cond
               (function-type? t) kind-Type
+              ;; what inference knows only to be data
+              (= :writ/data t) kind-Data
+              (map? t) (if (some #(= kind-Type (k % seen)) (vals t)) kind-Type kind-Data)
               (symbol? t)
               (let [nm (plain t)
                     info (get tenv nm)]

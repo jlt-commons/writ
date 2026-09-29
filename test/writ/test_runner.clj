@@ -15,12 +15,13 @@
             writ.flow-test
             writ.shell-test
             writ.bench-test
-            writ.domain-test))
+            writ.domain-test
+            writ.record-test))
 
 (def test-namespaces
   '[writ.check-test writ.book-test writ.gaps-test writ.spec-test writ.prove-test writ.evidence-test
     writ.graph-test writ.solve-test writ.symbolic-test writ.proof-test writ.flow-test writ.shell-test
-    writ.bench-test writ.domain-test])
+    writ.bench-test writ.domain-test writ.record-test])
 
 (defn -main [& _]
   (let [{:keys [fail error]} (apply t/run-tests test-namespaces)]

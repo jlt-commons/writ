@@ -191,7 +191,7 @@
     (is (= [:call 'sort [:call 'distinct 'xs]] (norm [:call 'sort [:call 'distinct 'xs]])))))
 
 (deftest filter-and-every-walk-a-concatenation
-  (let [ctx {:types '{a {:elems Nat} b {:elems Nat}}}
+  (let [ctx {:types '{a {:writ/elems Nat} b {:writ/elems Nat}}}
         f [:fn '[y] [:call 'odd? 'y]]]
     (is (= (norm ctx [:sq [:eapp [:elems [:call 'filter f [:sq 'a]]] [:elems [:call 'filter f [:sq 'b]]]]])
            (norm ctx [:call 'filter f [:sq [:eapp 'a 'b]]])))
@@ -282,9 +282,9 @@
     (is (= [:lit 6] (norm [:call 'reduce plus [:lit 0] (t/value->term [1 2 3])])))
     (is (= [:lit 0] (norm [:call 'reduce plus [:lit 0] [:nil]])))
     (testing "over concatenated colls it folds one after the other"
-      (is (= (norm {:types '{xs {:elems Nat} ys {:elems Nat}}}
+      (is (= (norm {:types '{xs {:writ/elems Nat} ys {:writ/elems Nat}}}
                    [:call 'reduce plus [:call 'reduce plus [:lit 0] [:sq 'xs]] [:sq 'ys]])
-             (norm {:types '{xs {:elems Nat} ys {:elems Nat}}}
+             (norm {:types '{xs {:writ/elems Nat} ys {:writ/elems Nat}}}
                    [:call 'reduce plus [:lit 0] [:sq [:eapp 'xs 'ys]]]))))
     (testing "a fn that may return reduced is not unrolled"
       (is (= :call (first (norm [:call 'reduce [:fn '[a b] [:ap 'g 'a 'b]] [:lit 0]
@@ -494,7 +494,7 @@
       (let [fold [:call 'reduce [:fn '[s x] [:call 'cons 'x 's]] [:sq [:enil]] 'xs]]
         (is (= [:lit true] (norm ctx [:call '= fold fold])))))
     (testing "a shared first part leaves the rest to compare"
-      (let [ctx {:types '{a {:elems Nat} b Nat c Nat}}]
+      (let [ctx {:types '{a {:writ/elems Nat} b Nat c Nat}}]
         (is (= (norm ctx [:call '= 'b 'c])
                (norm ctx [:call '= [:sq [:eapp 'a [:econs 'b [:enil]]]] [:sq [:eapp 'a [:econs 'c [:enil]]]]])))))))
 

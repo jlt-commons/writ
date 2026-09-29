@@ -294,8 +294,9 @@ the spec instead, and says which name to rename.
 ### Types
 
 Built in: `Nat Int Bool String Char Keyword Symbol Float Double Unit Any`,
-`(List T)`, `(Vec T)`, `(Set T)`, `(Map K V)`, `(Tuple T ...)`, and
-function types `(-> A B R)`. Declared types come from `data`.
+`(List T)`, `(Vec T)`, `(Set T)`, `(Map K V)`, `(Tuple T ...)`, `(Opt T)`
+(a `T` or nil), records (see [Records](#records)), and function types
+`(-> A B R)`. Declared types come from `data`.
 
 `Float`, `Double` and `Any` hold no NaN; `Float!`, `Double!` and `Any!`
 are the same with NaN among their values, and their generators produce
@@ -345,6 +346,55 @@ writ checks this statically:
   first field that is exactly that parameter, and must agree after that.
 - The value is read only through that `case`. `first`, `second` or `nth`
   anywhere else is rejected.
+
+### Records
+
+Most Clojure code keeps its entities in maps. A map literal of keyword keys
+is a record type, each key with the type of its value:
+
+```clojure
+(refine Member [m {:id Nat, :email String, :points Nat, :nick (Opt String)}] true)
+(refine Fresh  [m Member] (zero? (:points m)))
+
+(ann join  [Nat String -> Member])
+(ann award [Member Nat -> Member])
+
+(law award-touches-only-points
+  (forall [m Member, n Nat] (= (dissoc (award m n) :points) (dissoc m :points))))
+```
+
+A value of the record is a map with every key whose type is not `(Opt T)`,
+each holding a value of its type. An `(Opt T)` key may be absent or nil.
+The map is open: keys the record does not name may be there too, though
+generated values carry only the named ones, an `(Opt T)` key now absent,
+now nil, now set. `refine` names a record, as `Member` above, and carves
+states out of it, as `Fresh`.
+
+The code builds records as map literals and reads them with `(:k m)`,
+`get`, `assoc`, `dissoc` and `{:keys [...]}` destructuring. The static
+check follows the keys:
+
+- A literal map where a record is expected must carry every required key,
+  each value fitting its type:
+
+  ```
+  `join` returns {:email String, :id Nat, :nick (Opt String), :points Nat} but its body has type {:email String, :id Nat}: the body leaves out :points
+  ```
+- Reading a key the record does not name fails. The map may hold it, but
+  far more often the name is misspelt:
+
+  ```
+  `award`: `m` is a record with keys :email, :id, :nick, :points, and has no key :point. Read one of its keys, or add :point to its type, as (Opt T) if it may be absent
+  ```
+- An `(Opt T)` key read without a default is `(Opt T)`, not `T`, so
+  returning it where a `T` is due fails with "it may be nil".
+- `assoc` and `dissoc` on literal keys give the record with that key set
+  or gone, so dissoc'ing a required key and returning the map fails too.
+
+The prover reads `get`, `assoc`, `dissoc` and `contains?` on literal keys,
+knows a record's key holds its type (so `(:points m)` is a `Nat`), and
+takes a map destructure of a record as the record itself. The member laws
+above are proved by rewriting.
 
 ### Laws
 
@@ -1115,6 +1165,7 @@ The prover covers:
 
 - `seq`, `first`, `rest`, `next`, `second`, `empty?`, `count`, `cons`,
   `list`, `vector`, `concat`, `filter`, `map`, `reduce` and `nth`
+- `get`, `assoc`, `dissoc` and `contains?` on literal keys, and records
 - `=`, integer arithmetic and comparisons, `integer?`, `if`, `case`, `let`
   and destructuring
 - core fns passed as values, with `apply` of `<=`, `<`, `>=`, `>` and `+`,

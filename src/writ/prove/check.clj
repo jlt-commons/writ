@@ -59,7 +59,7 @@
                  (check-goal opts g (conj hyps c) (:then p)))
                (check-goal opts g (conj hyps [:call 'not c]) (:else p)))
       :list-cases (let [v (:on p)]
-                    (when-not (map? (get-in opts [:types v]))
+                    (when-not (:writ/elems (get-in opts [:types v]))
                       (reject! "`" v "` is not a list of elements"))
                     (doseq [[[value types] sub] (map vector (sc/list-cases opts v) [(:empty p) (:cons p)])]
                       (let [[o g* hs] (sc/subst-all (update opts :types merge types) g hyps {v value})]

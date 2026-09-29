@@ -236,7 +236,7 @@
   [ctx c]
   (letfn [(elems-ok? [e]
             (cond
-              (symbol? e) (contains? #{{:elems 'Nat} {:elems 'Int}} (get-in ctx [:types e]))
+              (symbol? e) (contains? #{{:writ/elems 'Nat} {:writ/elems 'Int}} (get-in ctx [:types e]))
               :else (case (head e)
                       :enil true
                       :econs (and (or (t/int-lit? (nth e 1))
@@ -261,18 +261,24 @@
        (t/int-lit? (nth t 3)) (not (zero? (second (nth t 3))))
        (int-term? ctx (nth t 2))))
 
+(defn record-type?
+  "Is ty a record, a map of keys to their types?"
+  [ty]
+  (and (map? ty) (seq ty) (not (contains? ty :writ/elems)) (every? keyword? (keys ty))))
+
 (defn- term-type
   "The type of term t when its form says it: a variable's own, a list of
   a tail's elements, an element nth takes from a list (nth throws, rather
-  than give anything else), and a part of a Tuple, whose length is fixed.
-  nil otherwise; never from a fn's signature."
+  than give anything else), a part of a Tuple, whose length is fixed, and
+  a record's value at one of its keys.  nil otherwise; never from a fn's
+  signature."
   [ctx t]
   (let [list-el (fn [ty] (cond (and (seq? ty) (contains? '#{List Vec} (first ty))) (second ty)
-                               (and (map? ty) (:elems ty)) (:elems ty)
+                               (and (map? ty) (:writ/elems ty)) (:writ/elems ty)
                                :else nil))]
     (cond
       (symbol? t) (get-in ctx [:types t])
-      (and (= :sq (head t)) (symbol? (second t))) (some->> (get-in ctx [:types (second t)]) :elems (list 'List))
+      (and (= :sq (head t)) (symbol? (second t))) (some->> (get-in ctx [:types (second t)]) :writ/elems (list 'List))
       (not= :call (head t)) nil
       :else
       (let [[_ f x i] t
@@ -284,14 +290,16 @@
                 nil)]
         (cond
           (and ty (seq? ty) (= 'Tuple (first ty)) k (< -1 k (dec (count ty)))) (nth ty (inc k))
+          (and (= 'get f) (= 4 (count t)) (record-type? ty) (= :lit (head i)) (contains? ty (second i)))
+          (get ty (second i))
           (and (= 'nth f) (= 4 (count t)) (list-el ty)) (list-el ty)
           :else nil)))))
 
 (defn- tuple-part-type
   "The type of (first x), (second x) or (nth x k) for a term x of a Tuple
-  type, or nil."
+  type, or of (get x k) for a record x, or nil."
   [ctx t]
-  (when (and (= :call (head t)) (contains? '#{first second nth} (second t)))
+  (when (and (= :call (head t)) (contains? '#{first second nth get} (second t)))
     (term-type ctx t)))
 
 (defn int-term?
@@ -495,12 +503,32 @@
             (false? (get (:facts ctx) [:call 'some? c])))
     false))
 
+(defn- truthy-type?
+  "Is every value of ty truthy: never nil, never false?  A number, a
+  string, a vector, a set, a map, a record or a datatype's value; not a
+  Bool, a (List T), which may be nil, an (Opt T) or an Any."
+  [ctx ty]
+  (boolean
+    (or (contains? '#{Nat Int String Char Keyword Symbol Float Double Float! Double!} ty)
+        (and (seq? ty) (contains? '#{Vec Set Map Tuple} (first ty)))
+        (record-type? ty)
+        (and (symbol? ty) (map? (get-in ctx [:tenv ty])) (:ctors (get-in ctx [:tenv ty]))
+             (not (:tvar (get-in ctx [:tenv ty]))))
+        (and (seq? ty) (symbol? (first ty)) (:ctors (get-in ctx [:tenv (first ty)]))))))
+
+(declare truthiness*)
+
 (defn truthiness
   "true / false for a term whose truthiness is settled, else nil.  An if
   whose branches agree has their truthiness without its test being run:
   a lazy seq's elements can hide behind such an if, and computing them
   could throw where the seq, unrealised, would not."
   [ctx c]
+  (if (truthy-type? ctx (term-type ctx c))
+    true
+    (truthiness* ctx c)))
+
+(defn- truthiness* [ctx c]
   (case (head c)
     :nil false
     :lit (not (false? (second c)))
@@ -538,8 +566,9 @@
      (and (symbol? ty) (:tvar (get-in ctx [:tenv ty]))) true
      (contains? seen ty) true
      (and (seq? ty) (contains? '#{List Vec} (first ty))) (float-free-type? ctx (second ty) seen)
-     (and (seq? ty) (contains? '#{Map Set Tuple} (first ty))) (every? #(float-free-type? ctx % seen) (rest ty))
-     (and (map? ty) (:elems ty)) (float-free-type? ctx (:elems ty) seen)
+     (and (seq? ty) (contains? '#{Map Set Tuple Opt} (first ty))) (every? #(float-free-type? ctx % seen) (rest ty))
+     (record-type? ty) (every? #(float-free-type? ctx % seen) (vals ty))
+     (and (map? ty) (:writ/elems ty)) (float-free-type? ctx (:writ/elems ty) seen)
      (and (symbol? ty) (get-in ctx [:tenv ty]))
      (every? (fn [[_ c]] (every? #(float-free-type? ctx % (conj seen ty)) (:fields c)))
              (:ctors (get-in ctx [:tenv ty])))
@@ -804,6 +833,96 @@
                            (if (seq? r) (doall r) r)))
              (catch Throwable _ nil))))))
 
+;; --- maps on literal keys ------------------------------------------------------
+;; A lookup through an assoc or a dissoc on a literal key is decided by the
+;; key: the same key is the value set (or gone), another key looks further
+;; in.  Only keys = compares exactly, so no NaN key and no float; on a
+;; value that is not a map these throw, and a rule holds where its left
+;; side returns.
+
+(defn- exact-key? [k] (and (= :lit (head k)) (exact-scalar? (second k))))
+
+(defn- map-entries
+  "The entries of a hash-map term on exact literal keys, last one winning,
+  as [[k v] ...] in the order they print, or nil."
+  [x]
+  (when (and (= :call (head x)) (= 'hash-map (second x)) (even? (count (drop 2 x))))
+    (let [kvs (partition 2 (drop 2 x))]
+      (when (every? (comp exact-key? first) kvs)
+        (sort-by (comp pr-str second first)
+                 (vals (reduce (fn [m [k v]] (assoc m (second k) [k v])) {} kvs)))))))
+
+(defn- entries->term [es] (into [:call 'hash-map] (mapcat identity es)))
+
+(defn- map-lookup
+  "(get m k d) on an exact key k, when m's make-up decides it: `found` of
+  the value when k is there, `absent` when it is not, or a rewrite into m's
+  own lookup.  nil when it does not."
+  [m k found absent further]
+  (cond
+    (= t/tnil m) absent
+    (and (= :call (head m)) (= 'assoc (second m)) (= 5 (count m)) (exact-key? (nth m 3)))
+    (if (= k (nth m 3)) (found (nth m 4)) (further (nth m 2)))
+    (and (= :call (head m)) (= 'dissoc (second m)) (= 4 (count m)) (exact-key? (nth m 3)))
+    (if (= k (nth m 3)) absent (further (nth m 2)))
+    :else
+    (when-let [es (map-entries m)]
+      (if-let [[_ v] (first (filter #(= k (first %)) es))] (found v) absent))))
+
+(defn- non-nil-map?
+  "Is term m a map, never nil: built by hash-map or assoc, a dissoc of
+  one, or of a record or Map type?"
+  [ctx m]
+  (or (and (= :call (head m)) (contains? '#{hash-map assoc} (second m)))
+      (and (= :call (head m)) (= 'dissoc (second m)) (non-nil-map? ctx (nth m 2)))
+      (let [ty (term-type ctx m)]
+        (or (record-type? ty) (and (seq? ty) (= 'Map (first ty)))))))
+
+(defn- map-rule
+  "get, contains?, assoc and dissoc on literal keys; an assoc or dissoc of
+  several keys is one after another."
+  [ctx f args]
+  (let [n (count args) [m k] args]
+    (case f
+      get (when (and (<= 2 n 3) (exact-key? k))
+            (map-lookup m k identity (if (= 3 n) (nth args 2) t/tnil)
+                        #(into [:call 'get % k] (drop 2 args))))
+      contains? (when (and (= 2 n) (exact-key? k))
+                  (map-lookup m k (constantly [:lit true]) [:lit false] #(vector :call 'contains? % k)))
+      assoc (cond
+              (and (< 3 n) (odd? n))
+              (reduce (fn [acc [k v]] [:call 'assoc acc k v]) m (partition 2 (rest args)))
+              (and (= 3 n) (exact-key? k))
+              (cond
+                ;; a second assoc of a key replaces the first
+                (and (= :call (head m)) (= 'assoc (second m)) (= 5 (count m)) (= k (nth m 3)))
+                [:call 'assoc (nth m 2) k (nth args 2)]
+                (map-entries m)
+                (entries->term (sort-by (comp pr-str second first)
+                                        (conj (remove #(= k (first %)) (map-entries m)) [k (nth args 2)])))
+                :else nil)
+              :else nil)
+      ;; a map is not a seq, and nor is nil
+      seq? (when (and (= 1 n) (or (= t/tnil m) (non-nil-map? ctx m))) [:lit false])
+      dissoc (cond
+               (< 2 n) (reduce (fn [acc k] [:call 'dissoc acc k]) m (rest args))
+               (and (= 2 n) (exact-key? k))
+               (cond
+                 (= t/tnil m) t/tnil
+                 (and (= :call (head m)) (= 'assoc (second m)) (= 5 (count m)) (exact-key? (nth m 3)))
+                 (cond
+                   ;; on nil, the assoc makes a map and the dissoc leaves it
+                   ;; empty, where a dissoc of nil is nil
+                   (not= k (nth m 3)) [:call 'assoc [:call 'dissoc (nth m 2) k] (nth m 3) (nth m 4)]
+                   (non-nil-map? ctx (nth m 2)) [:call 'dissoc (nth m 2) k]
+                   :else nil)
+                 (and (= :call (head m)) (= 'dissoc (second m)) (= 4 (count m)) (= k (nth m 3)))
+                 m
+                 (map-entries m) (entries->term (remove #(= k (first %)) (map-entries m)))
+                 :else nil)
+               :else nil)
+      nil)))
+
 (defn- computed
   "The computed rules: a rewrite of t, or nil."
   [ctx x]
@@ -811,6 +930,7 @@
     :call
     (or
      (when-not (= 'hash-set (second x)) (ground-call x))
+     (map-rule ctx (second x) (drop 2 x))
      (let [[_ f & args] x
           n (count args)
           [a b] args]
@@ -1118,8 +1238,8 @@
   (let [ty (if (symbol? u) (get-in ctx [:types u]))]
     (cond
       (and (seq? ty) (contains? '#{List Vec} (first ty))) [(second ty) (= 'Vec (first ty))]
-      (and (= :sq (head u)) (symbol? (second u)) (:elems (get-in ctx [:types (second u)])))
-      [(:elems (get-in ctx [:types (second u)])) true]
+      (and (= :sq (head u)) (symbol? (second u)) (:writ/elems (get-in ctx [:types (second u)])))
+      [(:writ/elems (get-in ctx [:types (second u)])) true]
       (and (= :call (head u)) (contains? sublist-fns (second u)) (<= 3 (count u)))
       (when-let [[el] (elem-type ctx (last u))] [el true])
       :else nil)))
@@ -1134,7 +1254,7 @@
     (boolean
       (or (= ty (get-in ctx [:types u]))
           (and (= :sq (head u)) (symbol? (second u)) (el ty)
-               (= {:elems (el ty)} (get-in ctx [:types (second u)])))
+               (= {:writ/elems (el ty)} (get-in ctx [:types (second u)])))
           ;; a sublist of a list of its elements: never nil, so a Vec too
           (and (el ty) (= :call (head u))
                (let [[t non-nil?] (elem-type ctx u)]
@@ -1166,7 +1286,7 @@
         (and ty (or (and (symbol? u) (= ty (get-in ctx [:types u])))
                     (and (= :sq (head u)) (symbol? (second u)) (seq? ty)
                          (contains? '#{List Vec} (first ty))
-                         (= {:elems (second ty)} (get-in ctx [:types (second u)])))))
+                         (= {:writ/elems (second ty)} (get-in ctx [:types (second u)])))))
         [:lit true]
         (and (contains? (get-in ctx [:recognizers :lists]) r) (= :sq (head u)))
         (let [e (second u)]
