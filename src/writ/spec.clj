@@ -47,6 +47,7 @@
             [writ.book :as book]
             [writ.check :as ck]
             [writ.data :as dt]
+            [writ.hash :as hash]
             [writ.kind :as kind]
             [writ.law :as lw]
             [writ.lower :as l]
@@ -3492,13 +3493,88 @@
                       (= :machine kind) (met (get machine-ok of))
                       :else (met (get graph-ok of)))}))))
 
+(defn- source-hash [ns-sym]
+  (try (hash/sha256 (slurp (source-url ns-sym))) (catch Throwable _ nil)))
+
+(defn- record-of
+  "What a check found, as the record `attest` compares: the sources by
+  their hashes, each law as written with the evidence it needs and got,
+  each question and each obligation's status.  Nothing that varies from
+  run to run with the same seed, such as the proof cache, is in it."
+  [e spec-ns laws r level]
+  (let [written (into {} (map (juxt :name :prop)) laws)]
+    {:spec spec-ns
+     :target (:target e)
+     :ok (:ok r)
+     :hashes (cond-> {:spec (source-hash spec-ns) :target (source-hash (:target e))}
+               (:ns (::proof e)) (assoc :proof (source-hash (:ns (::proof e)))))
+     :laws (vec (for [{:keys [law status evidence because] :as res} (:laws r)]
+                  (cond-> {:law law :prop (get written law) :status status
+                           :require (or (:require res) level)}
+                    evidence (assoc :evidence evidence)
+                    because (assoc :because because))))
+     :questions (mapv #(select-keys % [:id :text :blocking]) (:questions r))
+     :obligations (:obligations r)}))
+
+(declare check)
+
+(defn- as-record
+  "A record from what `attest` is given: a record, a path to one, or a
+  spec namespace, checked afresh so its record says what is true now."
+  [x]
+  (cond
+    (map? x) x
+    (string? x) (edn/read-string (slurp x))
+    ;; a check that stops at its static rules checks no law
+    (symbol? x) (or (::record (check x {}))
+                    {:spec x :ok false :laws [] :questions [] :obligations []})
+    :else (fail! "`attest` compares records: a record, a path to one, or a spec namespace, had "
+                 (pr-str x))))
+
 (defn attest
-  "Compare a check's record with a later one, or with a fresh check of
-  the spec: {:ok :weakened [...]}.  The spec is weaker when a law is gone
-  or restated, needs less evidence than it did, or has less, or when a
-  blocking question stopped being one."
+  "Compare an earlier record of a spec with a later one: {:ok :weakened
+  [...]}.  Each argument is a record, a path to one (as check :record
+  writes it) or a spec namespace, checked afresh -- never a report taken
+  on trust.  The later spec is weaker when a law is gone (:removed) or
+  written differently (:restated), needs less evidence than it did
+  (:require-lowered) or has less (:evidence-dropped), when another
+  obligation is gone, when a blocking question stopped being one
+  (:no-longer-blocking), or when what passed then fails now
+  (:claimed-pass).  Changing the code is not weakening the spec; a
+  restated law the spec's owner agreed to is accepted by taking a new
+  record."
   [old new]
-  {:ok true :weakened []})
+  (let [old (as-record old)
+        new (as-record new)
+        rank {:proved 2 :tested 1}
+        ev-rank {:proof 2 :test 1}
+        now (into {} (map (juxt :law identity)) (:laws new))
+        law-ids (set (map #(str "law." (:law %)) (concat (:laws old) (:laws new))))
+        weakened
+        (vec (concat
+               (when (and (:ok old) (not (:ok new)))
+                 [{:what :claimed-pass
+                   :why "the earlier record passed, but the check fails now"}])
+               (for [{:keys [law prop require evidence]} (:laws old)
+                     :let [n (get now law)
+                           what (cond
+                                  (nil? n) :removed
+                                  (not= prop (:prop n)) :restated
+                                  (< (rank (:require n) 0) (rank require 0)) :require-lowered
+                                  (< (ev-rank (:evidence n) 0) (ev-rank evidence 0)) :evidence-dropped)]
+                     :when what]
+                 (cond-> {:law law :what what}
+                   (= :restated what) (assoc :was prop :now (:prop n))))
+               (let [ids (set (map :id (:obligations new)))]
+                 (for [{:keys [id]} (:obligations old)
+                       :when (and (not (contains? ids id)) (not (contains? law-ids id))
+                                  (not (str/starts-with? id "question.")))]
+                   {:obligation id :what :removed}))
+               (let [now-blocking (into {} (map (juxt :id :blocking)) (:questions new))]
+                 (for [{:keys [id blocking]} (:questions old)
+                       :when (and blocking (false? (get now-blocking id)))]
+                   {:question id :what :no-longer-blocking}))))]
+    {:ok (empty? weakened) :weakened weakened}))
 
 (defn check
   "Check a spec namespace against its target (or opts :target).  Returns a
@@ -3715,9 +3791,10 @@
                                     (empty? problems)
                                     (not-any? :blocking (:questions e))
                                     (not graphless)))
-                 r (assoc r :obligations (obligation-status (obligations* e) r))]
-         (do (when-let [rec (:record opts)]
-               (try (spit rec (pr-str (dissoc r :message))) (catch Throwable _ nil)))
+                 r (assoc r :obligations (obligation-status (obligations* e) r))
+                 r (assoc r ::record (record-of e spec-ns laws r level))]
+         (do (when-let [path (:record opts)]
+               (spit path (pr-str (::record r))))
              (assoc r :message (format-report (assoc r :machines machine-results
                                                      :graphs graph-results
                                                      ::explain (:explain opts))))))))))

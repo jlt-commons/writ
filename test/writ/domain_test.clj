@@ -6,6 +6,7 @@
   shows when a spec got weaker, and laws no code could satisfy together."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
+            [writ.hash]
             [writ.spec :as spec]))
 
 (defn- law-result [report nm]
@@ -136,6 +137,10 @@
 
 (def ^:private record-path "/tmp/writ-domain-record.edn")
 
+(deftest sha256-matches-the-standard
+  (is (= "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" (writ.hash/sha256 "abc")))
+  (is (= "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" (writ.hash/sha256 ""))))
+
 (deftest a-record-carries-hashes-and-each-law
   (spec/check 'writ.spec-demo.account-spec {:seed 42 :record record-path})
   (let [rec (read-string (slurp record-path))]
@@ -177,7 +182,7 @@
 
 (deftest attest-reruns-the-check-rather-than-trust-the-record
   (spit record-path (pr-str (assoc (rec) :ok true :spec 'writ.spec-demo.balance-spec)))
-  (let [w (spec/attest 'writ.spec-demo.balance-spec record-path)]
+  (let [w (spec/attest record-path 'writ.spec-demo.balance-spec)]
     (is (not (:ok w)))
     (is (some #(= :claimed-pass (:what %)) (:weakened w)))))
 
