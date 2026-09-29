@@ -170,7 +170,8 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
   records such as `{:id Nat, :nick (Opt String)}`, and declared data.
   `(List T)` is any seq: list, vector, lazy seq or nil. `(Opt T)` is a T
   or nil.
-  A generated `Int` stays within -50..50 and a `Nat` within 0..50 (the
+  A generated `String` is mostly letters and digits, sometimes printable
+  ASCII with whitespace. A generated `Int` stays within -50..50 and a `Nat` within 0..50 (the
   default `:max-size`), so a quantified law never reaches a value like
   `-127`. Anchor such values with a law that names them. A quarter of the
   time a `Keyword`, `Int`, `Nat` or `Any` is instead one of the literals the

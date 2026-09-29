@@ -697,3 +697,16 @@
       (is (string? one))
       (spec/check 'writ.spec-demo.signal-spec {:seed 42 :record path})
       (is (= one (slurp path))))))
+
+;; --- strings are more than letters and digits --------------------------------
+
+(deftest strings-take-in-whitespace-and-punctuation
+  (let [ss (spec/sample 'String {} 300)]
+    (is (every? string? ss))
+    (is (some #(re-find #"\s" %) ss))
+    (is (some #(re-find #"[^\sA-Za-z0-9]" %) ss))
+    (is (some #(re-matches #"[A-Za-z0-9]+" %) ss) "plain words still come up")))
+
+(deftest a-law-only-whitespace-breaks-is-caught
+  (let [r (spec/check 'writ.spec-demo.slug-length-spec {:seed 42 :adequacy false})]
+    (is (= :failed (:status (law-result r 'cleaning-keeps-the-length))) (:message r))))

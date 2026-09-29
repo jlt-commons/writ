@@ -774,6 +774,14 @@
                  (let [pick (if (and (<= size 1) (seq base)) base ctors)]
                    (gen/one-of (mapv #(ctor-gen % size) pick)))))))
 
+(def ^:private any-string
+  "Mostly words, but now and then printable ASCII with tabs and newlines,
+  so code that trims, splits or escapes meets what it is there for."
+  (gen/frequency [[3 gen/string-alphanumeric]
+                  [1 (gen/fmap #(apply str %)
+                               (gen/vector (gen/frequency [[8 gen/char-ascii]
+                                                           [1 (gen/elements [\tab \newline])]])))]]))
+
 (def ^:private finite-double
   (gen/double* {:NaN? false :infinite? false}))
 
@@ -809,7 +817,7 @@
         Int gen/small-integer
         Bool gen/boolean
         Char gen/char-alpha
-        String gen/string-alphanumeric
+        String any-string
         Keyword gen/keyword
         Symbol gen/symbol
         (Float Double) finite-double

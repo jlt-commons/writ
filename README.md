@@ -317,7 +317,9 @@ NaN, at any depth: compare with it where you mean the same value.
 inputs mix all four, so code that only works on one of them fails. `conj`,
 for example, prepends to a list and appends to a vector.
 
-A generated `Int` stays between `-max-size` and `max-size`, so -50 to 50
+A generated `String` is most often letters and digits, and now and then
+any printable ASCII with tabs and newlines, so code that trims or splits
+meets whitespace. A generated `Int` stays between `-max-size` and `max-size`, so -50 to 50
 by default, and a `Nat` between 0 and `max-size`. A law quantified over
 `Int` therefore never reaches a value like `-127`. When specific values
 matter, such as a return code's sentinels, anchor each one with a law that
