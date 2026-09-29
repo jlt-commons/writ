@@ -126,6 +126,10 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
   passes the guard; for an `and` test, `g:s:f:when.N` says clause N fails
   while the others hold. Guard what the problem refuses, rather than
   folding the refusal into the targets.
+- A frame, on a record state: `{[award Nat] {:to #{:active} :changes
+  [:points]}}`. `g:s:f:frame` says the step changes only those keys and
+  keeps every other one, named by the record or not, as it was. It can go
+  with `:when`, and then holds under the guard.
 - `:runs N` (with `:depth D`, default 20) walks N seeded runs from a
   `[state value]` start through the real fns: every landing must be in an
   allowed state and hold its invariants, and every final state the graph
