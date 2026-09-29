@@ -193,3 +193,37 @@
     (is (:ok r) (:message r))
     (is (= :proved (:status (law-result r 'sorting:unsorted:isort))))
     (is (= :proved (:status (law-result r 'sorting:sorted:insert))))))
+
+(deftest an-invariant-of-a-state-holds-at-every-landing
+  (let [r (spec/check 'writ.spec-demo.gauge-spec {:seed 42})]
+    (is (:ok r) (:message r))
+    (is (str/includes? (:message r) "invariant of :hot"))))
+
+(deftest an-edge-that-breaks-a-state-invariant-fails
+  (let [r (spec/check 'writ.spec-demo.gauge-spec {:seed 42 :target 'writ.spec-demo.gauge-bad})]
+    (is (not (:ok r)))
+    (is (str/includes? (:message r) "invariant"))))
+
+(deftest an-invariant-is-checked-for-shape
+  (is (str/includes? (expansion-error '(writ.spec/invariant gauge hot [g] (even? (second g))))
+                     "keyword")))
+
+(deftest runs-walk-the-graph-from-its-start
+  (let [r (spec/check 'writ.spec-demo.counter-spec {:seed 42})]
+    (is (:ok r) (:message r))
+    (is (str/includes? (:message r) "50 runs"))))
+
+(deftest a-run-that-leaves-the-graph-fails
+  (let [r (spec/check 'writ.spec-demo.counter-spec {:seed 42 :target 'writ.spec-demo.counter-drift})]
+    (is (not (:ok r)))
+    (is (str/includes? (:message r) "run"))
+    (is (str/includes? (:message r) "[:High 96]"))))
+
+(deftest runs-are-checked-for-shape
+  (is (str/includes? (expansion-error '(writ.spec/graph g {:states {} :edges {} :runs :many}))
+                     "runs")))
+
+(deftest a-sink-state-that-is-not-final-fails
+  (let [r (spec/check 'writ.spec-demo.shelf-spec {:seed 42})]
+    (is (not (:ok r)))
+    (is (str/includes? (:message r) ":done cannot be left and is not final"))))

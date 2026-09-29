@@ -681,3 +681,19 @@
     (is (str/includes? x ":seed 42"))
     (is (not (str/includes? x ":test {"))
         "the check options are not left in the spec's own options")))
+
+(deftest laws-that-no-implementation-can-satisfy-together
+  (let [r (spec/check 'writ.spec-demo.balance-spec {:seed 42})]
+    (is (not (:ok r)))
+    (is (= :failed (:status (law-result r 'rises))))
+    (is (= :failed (:status (law-result r 'falls))))))
+
+
+(deftest a-check-can-write-its-record
+  (let [path "/tmp/writ-check-record.edn"]
+    (let [r (spec/check 'writ.spec-demo.signal-spec {:seed 42 :record path})]
+      (is (:ok r) (:message r)))
+    (let [one (try (slurp path) (catch Throwable t ::missing))]
+      (is (string? one))
+      (spec/check 'writ.spec-demo.signal-spec {:seed 42 :record path})
+      (is (= one (slurp path))))))
