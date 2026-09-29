@@ -6,7 +6,8 @@
             [writ.book]
             [writ.prove :as prover]
             [writ.prove.symbolic :as sym]
-            [writ.spec :as spec]))
+            [writ.spec :as spec]
+            [clojure.string :as str]))
 
 (require 'writ.spec-demo.shapes 'writ.spec-demo.signal 'writ.spec-demo.court)
 
@@ -170,3 +171,9 @@
     (is (sym/prove opts [] [:call '= [:call 'count [:call 'sort-by id [:call 'filter le5 ab]]]
                             [:call 'count [:call 'filter le5 ab]]]))
     (is (not (try (sym/prove opts [] [:call '= [:call 'sort-by id ab] ab]) (catch Throwable _ false))))))
+
+(deftest a-throw-folded-on-literals-is-a-throw-not-a-crash
+  (let [r (spec/check 'writ.spec-demo.pick-spec {:seed 42 :adequacy false :cache false})
+        l (first (filter #(= 'true-picks-one (:law %)) (:laws r)))]
+    (is (not (str/includes? (str (:unproved l)) "the prover failed")) (str (:unproved l)))
+    (is (= :proved (:status l)) (str (:unproved l)))))

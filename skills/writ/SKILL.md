@@ -273,6 +273,9 @@ dependency documents, not whatever closes a proof.
   about the dependency is false; fix the claim, not the code.
 - ``assumption `x` calls `f`, a fn of target`` - state what the target
   does as a law instead.
+- A law left tested as "outside the prover: `frequencies`" can rest on an
+  assumption about it: `(assume clojure.core/frequencies [...])` and a
+  law about it, which the prover then cites.
 - ``assumes a signature for `ns/f`, which does not resolve`` - require
   the namespace in the spec and name the fn through its alias.
 

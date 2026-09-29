@@ -81,3 +81,9 @@
         (macroexpand '(writ.spec/assume trim [String -> String]))))
   (is (thrown-with-msg? Exception #"`assume` takes"
         (macroexpand '(writ.spec/assume str/trim 5)))))
+
+(deftest a-core-fn-outside-the-prover-can-be-assumed
+  (let [r (spec/check 'writ.spec-demo.tally-spec {:seed 42 :cache false :require :tested})]
+    (is (:ok r) (:message r))
+    (is (= :proved (:status (law-result r 'every-value-is-counted))) (str (:unproved (law-result r 'every-value-is-counted))))
+    (is (has? r "citing the-counts-add-up"))))

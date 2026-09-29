@@ -13,9 +13,14 @@
   `store-of` shortens a generated list of URLs into an empty store."
   (:require [clojure.string :as str]
             [shortener.core :refer [handle]]
-            [writ.spec :refer [spec data ann refine graph flow law calls]]))
+            [writ.spec :refer [spec data ann refine graph flow law calls assume]]))
 
 (spec shortener.core)
+
+;; clojure.string is not checked: what the spec takes as given of it
+(assume str/trim [String -> String])
+(assume trim-is-idempotent
+  (forall [s String] (= (str/trim (str/trim s)) (str/trim s))))
 
 (data Route Index Shorten (Follow String) Missing)
 (data Reply (Created String) (Found String) (Text Nat String))

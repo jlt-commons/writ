@@ -720,6 +720,8 @@
   (let [by-code (into {} (map (fn [[c k]] [k c])) (:codes @st))]
     ((fn walk [v]
        (cond
+         ;; a throw, or anything else that is no value's description
+         (not (map? v)) ::none
          (and (contains? v :int) (integer? (:int v))) (:int v)
          (and (contains? v :bool) (boolean? (:bool v))) (:bool v)
          (and (contains? v :const) (contains? by-code (:const v))) (by-code (:const v))
@@ -833,6 +835,9 @@
   "A clojure.core fn applied to values."
   [st f args]
   (if-let [v (and (contains? pure-fns f)
+                  ;; a throw in an argument is a throw of the call, as
+                  ;; lift makes it for the fns it handles
+                  (not-any? #{:bottom} args)
                   (let [xs (map #(concrete st %) args)]
                     (when (not-any? #{::none} xs)
                       (try (let [r (apply @(resolve (symbol "clojure.core" (name f))) xs)]

@@ -1585,6 +1585,9 @@
                   book/*extra-sigs* (let [sig-of #(unbang (erase (get (:assumes e) %) refs))
                                           {:keys [refers]} (some-> (first nsf) ns-names)]
                                       (merge (into {} (for [q (keys (:assumes e))] [q (sig-of q)]))
+                                             (into {} (for [q (keys (:assumes e))
+                                                            :when (= "clojure.core" (namespace q))]
+                                                        [(symbol (name q)) (sig-of q)]))
                                              (into {} (for [[r q] refers :when (contains? (:assumes e) q)]
                                                         [r (sig-of q)]))))]
           (book/check-book (vec (concat nsf data others))))
@@ -3507,6 +3510,12 @@
   aliases and refers names them: alias-qualified, referred, or in full."
   [aliases refers assumed]
   (merge (into {} (for [q assumed] [q q]))
+         ;; a clojure.core fn the prover does not model, by its plain name;
+         ;; one it models keeps its model
+         (into {} (for [q assumed
+                        :when (and (= "clojure.core" (namespace q))
+                                   (not (contains? writ.prove.translate/core-fns (symbol (name q)))))]
+                    [(symbol (name q)) q]))
          (into {} (for [[a lib] aliases, q assumed :when (= (str lib) (namespace q))]
                     [(symbol (str a) (name q)) q]))
          (into {} (for [[r q] refers :when (contains? assumed q)] [r q]))))

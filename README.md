@@ -1342,7 +1342,19 @@ A law quantified over fns is proved with the fn left unknown: the
 prover never needs to know what it answers.
 
 Anything else leaves the law tested, with `:unproved` saying why, for
-example "outside the prover: `frequencies`".
+example "outside the prover: `frequencies`". What the spec needs of such
+a fn can be assumed, and the prover cites it; see
+[Assumptions](#assumptions). A clojure.core fn it does not model is
+assumed by its full name and read wherever the code calls it:
+
+```clojure
+(assume clojure.core/frequencies [(List Nat) -> (Map Nat Nat)])
+(assume the-counts-add-up
+  (forall [xs (List Nat)] (= (apply + (vals (frequencies xs))) (count xs))))
+```
+
+An assumption about a fn the prover does model is tested like any other,
+but the model is what the prover reads.
 
 ### Symbolic evaluation and the solver
 
