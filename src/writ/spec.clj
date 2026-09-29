@@ -1774,6 +1774,30 @@
         (recur (into (vec (rest todo)) ts) (into seen ts)))
       seen)))
 
+(defn- find-cycle
+  "The first loop a depth-first walk from `from` runs into, as the path
+  around it, [a b a]; nil when every walk ends."
+  [edges from]
+  (let [succ (reduce (fn [m [a _ b]] (update m a (fnil conj []) b)) {} edges)]
+    (letfn [(walk [s path on done]
+              (reduce (fn [done t]
+                        (cond
+                          (:cycle done) done
+                          (contains? on t) {:cycle (conj (subvec path (first (keep-indexed #(when (= t %2) %1) path))) t)}
+                          (contains? done t) done
+                          :else (walk t (conj path t) (conj on t) done)))
+                      (conj done s)
+                      (get succ s)))]
+      (:cycle (walk from [from] #{from} #{})))))
+
+(defn- no-final-error
+  "From s no final state can be reached, with the loop that keeps it
+  there when there is one."
+  [edges s]
+  (str "from " (pr-str s) " no final state can be reached"
+       (when-let [c (find-cycle edges s)]
+         (str ": it loops " (str/join " -> " (map pr-str c))))))
+
 (defn- show-path [path]
   (apply str (pr-str (first (first path)))
          (for [[_ ev t] path] (str " -" (pr-str ev) "-> " (pr-str t)))))
@@ -1819,7 +1843,7 @@
                         (for [s states
                               :when (and (contains? from-start s)
                                          (not-any? (reachable edges s) final))]
-                          (str "from " (pr-str s) " no final state can be reached")))
+                          (no-final-error edges s)))
                       (for [[a b] never
                             :let [p (find-path edges a b nil)]
                             :when p]
@@ -2038,7 +2062,7 @@
            (when (and start (seq (:final m)))
              (for [s (keys (:states m))
                    :when (and (contains? from-start s) (not-any? (reachable edges s) (:final m)))]
-               (str "from " (pr-str s) " no final state can be reached")))
+               (no-final-error edges s)))
            (for [[a b] (:never m) :let [p (find-path edges a b nil)] :when p]
              (str (pr-str a) " must never lead to " (pr-str b) ", but it does: " (show-path p)))
            (for [[a b] (:before m)
@@ -2143,6 +2167,24 @@
         (let [rs (map run (range n))]
           {:failures (vec (distinct (filter :reason rs)))
            :visited (set (mapcat :path rs))})))))
+
+(defn- vacuous-invariants
+  "Invariants the state's own type already says: the prover shows them
+  from the refinement alone, without the code, so they constrain
+  nothing a landing in the state does not already."
+  [[gname m] invs refs data-tenv]
+  (vec (for [[g st [b] pred] invs
+             :when (and (= gname g) (contains? (:states m) st))
+             :let [t (get (:states m) st)
+                   r (let [p (plain t)] (when (symbol? p) (get refs p)))
+                   prop (if r
+                          (list 'forall [b (:base r)]
+                                (list '=> (subst-var (:pred r) (:var r) b) pred))
+                          (list 'forall [b t] pred))]
+             :when (try (try-prove (desugar prop) data-tenv #{} #{}) (catch Throwable _ false))]
+         (str "invariant `" g " " st "` is vacuous: " (pr-str t) " already says " (pr-str pred)
+              ", so it holds of the state whatever the code does. State what a landing in "
+              (pr-str st) " must keep that its type does not."))))
 
 (defn- invariant-errors
   "Each invariant names a graph and a state of it."
@@ -2605,7 +2647,7 @@
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
   [{:keys [ok target spec static laws gaps unspecified rejected calls flows machines proof graphs graph-missing
-           lemmas off-graph uses]
+           lemmas off-graph uses problems]
     ambiguous ::ambiguous explain ::explain}]
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
        (when (and proof (pos? (:laws proof)))
@@ -2674,6 +2716,7 @@
                          (when (seq held)
                            (str ", holding the invariant of " (str/join " and " (map pr-str held)))))))
        (when-not (:ok static) (str "\n\n" (:error static)))
+       (apply str (map #(str "\n\n" %) problems))
        (apply str (for [{n :name :keys [where whose]} ambiguous]
                     (str "\n\n`" n "` is defined by " where " and by " target
                          ", so a law cannot tell which one it means."
@@ -2695,7 +2738,8 @@
                            (str "\n\ngraph `" g "` breaks on its runs"
                                 (apply str (for [rf runs-failed]
                                              (str "\n  " (:reason rf)
-                                                  "\n    walked " (str/join " -> " (map pr-str (:path rf)))
+                                                  (when (:path rf)
+                                                    (str "\n    walked " (str/join " -> " (map pr-str (:path rf)))))
                                                   "\n    (replay with {:seed " (:seed rf) "})"))))))))
        (apply str (for [{m :machine st :status :keys [shown errors step]} machines
                         :when (= :failed st)]
@@ -3410,11 +3454,28 @@
                                    (let [q #(qualify % #{} publics interns target spec-ns)
                                          errs (vec (concat (graph-flow-errors g anns refs)
                                                            (graph-start-errors g spec-ns tenv q (:invariants e))
-                                                           (invariant-errors g (:invariants e))))
+                                                           (invariant-errors g (:invariants e))
+                                                           (vacuous-invariants g (:invariants e) refs data-tenv)))
                                          rules (graph-rule-errors g)
                                          run-seed (or seed (rand-int 1000000))
                                          walked (graph-runs g spec-ns tenv (:invariants e) q run-seed)
-                                         run-errs (mapv #(assoc % :seed run-seed) (:failures walked))
+                                         reached (let [[_ gm] g
+                                                       st (:start gm)
+                                                       start (if (vector? st) (first st) st)
+                                                       es (for [{:keys [from key tos]} (graph-edges g), t tos]
+                                                            [from key t])]
+                                                   (when start (reachable es start)))
+                                         run-errs (vec (concat
+                                                         (map #(assoc % :seed run-seed) (:failures walked))
+                                                         (when (and walked (empty? (:failures walked)))
+                                                           (for [f (:final (second g))
+                                                                 :when (and (contains? reached f)
+                                                                            (not (contains? (:visited walked) f)))]
+                                                             {:seed run-seed
+                                                              :reason (str "no run of " (:runs (second g)) " reached "
+                                                                           (pr-str f) " in " (or (:depth (second g)) default-depth)
+                                                                           " steps; a run from the start should reach every"
+                                                                           " final state, so walk more runs, or longer ones (:depth)")}))))
                                          obls (filter #(= (first g) (:graph %)) results)]
                                      (let [ok? (and (empty? errs) (empty? rules) (empty? run-errs))]
                                        (cond-> {:graph (first g) :states (count (:states (second g)))
@@ -3434,12 +3495,16 @@
                                                 (seq run-errs) (assoc :runs-failed run-errs)))))
                                  (:graphs e))
              graphless (and (empty? (:graphs e)) (empty? (:machines e)))
+             problems (vec (for [[g st] (:invariants e)
+                                 :when (not-any? #(= g (first %)) (:graphs e))]
+                             (str "invariant `" g " " st "` names a graph the spec does not have")))
              r (assoc base :laws results :gaps gaps :calls call-results :flows flow-results
                            :uses (:report imports)
                            ;; the proved laws, erased and qualified, for a spec that uses this one
                            ::proved-props proved-props
                            :lemmas lemma-results
                            :graph-missing graphless
+                           :problems problems
                            :graphs (mapv #(dissoc % ::unproved ::obligations ::steps ::held :runs-failed) graph-results)
                            :proof (proof-coverage results level)
                            :machines (mapv #(dissoc % :shown :step) machine-results)
@@ -3453,6 +3518,7 @@
                                     (every? #(= :ok (:status %)) flow-results)
                                     (every? #(= :ok (:status %)) machine-results)
                                     (every? #(= :ok (:status %)) graph-results)
+                                    (empty? problems)
                                     (not graphless)))]
          (do (when-let [rec (:record opts)]
                (try (spit rec (pr-str (dissoc r :message))) (catch Throwable _ nil)))
