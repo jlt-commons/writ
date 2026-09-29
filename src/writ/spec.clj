@@ -3599,18 +3599,19 @@
         flow-ok (ok-of flows :fn) call-ok (ok-of calls :fn) machine-ok (ok-of machines :machine)
         met #(if % :met :failed)]
     (vec (for [{:keys [id kind of law blocking]} os]
-           {:id id
-            :status (cond
-                      law (case (get by-law law)
-                            (:proved :tested :evaluated :witnessed) :met
-                            :unproved :unproved
-                            :failed)
-                      (= :question kind) (if blocking :blocking :open)
-                      (= :signature kind) (met (:ok static))
-                      (= :flow kind) (met (get flow-ok of))
-                      (= :calls kind) (met (get call-ok of))
-                      (= :machine kind) (met (get machine-ok of))
-                      :else (met (get graph-ok of)))}))))
+           (cond-> {:id id
+                    :status (cond
+                              law (case (get by-law law)
+                                    (:proved :tested :evaluated :witnessed) :met
+                                    :unproved :unproved
+                                    :failed)
+                              (= :question kind) (if blocking :blocking :open)
+                              (= :signature kind) (met (:ok static))
+                              (= :flow kind) (met (get flow-ok of))
+                              (= :calls kind) (met (get call-ok of))
+                              (= :machine kind) (met (get machine-ok of))
+                              :else (met (get graph-ok of)))}
+                   law (assoc :law law))))))
 
 (defn- source-hash [ns-sym]
   (try (hash/sha256 (slurp (source-url ns-sym))) (catch Throwable _ nil)))
@@ -3685,8 +3686,10 @@
                  (cond-> {:law law :what what}
                    (= :restated what) (assoc :was prop :now (:prop n))))
                (let [ids (set (map :id (:obligations new)))]
-                 (for [{:keys [id]} (:obligations old)
+                 (for [{:keys [id law]} (:obligations old)
                        :when (and (not (contains? ids id)) (not (contains? law-ids id))
+                                  ;; a law's own obligation is reported as the law
+                                  (not law)
                                   (not (str/starts-with? id "question.")))]
                    {:obligation id :what :removed}))
                (let [now-blocking (into {} (map (juxt :id :blocking)) (:questions new))]
@@ -3866,7 +3869,8 @@
                                                    (when start (reachable es start)))
                                          run-errs (vec (concat
                                                          (map #(assoc % :seed run-seed) (:failures walked))
-                                                         (when (and walked (empty? (:failures walked)))
+                                                         (when (and walked (empty? (:failures walked))
+                                                                    (seq (:visited walked)))
                                                            (for [f (:final (second g))
                                                                  :when (and (contains? reached f)
                                                                             (not (contains? (:visited walked) f)))]
