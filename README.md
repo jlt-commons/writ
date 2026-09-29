@@ -452,7 +452,29 @@ A proposition is built from:
 - `(=> P Q)`, where cases in which `P` does not hold are skipped
 - `(forall [x T, y U] P)`
 - `(exists [x T] P)`
+- `(throws? e)`, true when evaluating `e` throws (a lazy seq it returns
+  is realised first). An error writ raises, an argument or result that
+  breaks a signature, is not counted: it is rethrown, and the law fails
+  with it, since the law misuses the code rather than finding it throws.
 - any other expression, which holds when it is truthy
+
+```clojure
+(law reading-past-the-end-throws
+  (forall [v (Vec Nat), i Nat] (= (throws? (at v i)) (>= i (count v)))))
+```
+
+A `forall` may range over fns: a variable of type `(-> Nat Bool)` is a
+pure fn, each one answering the same arguments the same way, drawn at
+random like any value. A law over them says what the code does with any
+fn it is given:
+
+```clojure
+(law what-is-kept-passes
+  (forall [p (-> Nat Bool), xs (List Nat)] (every? p (keep-where p xs))))
+```
+
+A generated fn in a counterexample prints as the calls it answered, `p =
+(fn {0 true, 3 false})`.
 
 Inside a law, a free name refers first to the target's public fns, then to
 the spec's own helpers, then to `clojure.core`.
@@ -1278,6 +1300,9 @@ The prover covers:
   so a predicate like `(apply <= xs)` translates
 - fn literals, `loop`/`recur`, and the target's and the spec's own
   `defn`s
+
+A law quantified over fns is proved with the fn left unknown: the
+prover never needs to know what it answers.
 
 Anything else leaves the law tested, with `:unproved` saying why, for
 example "outside the prover: `frequencies`".
