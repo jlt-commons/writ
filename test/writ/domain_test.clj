@@ -53,7 +53,8 @@
   (let [r (spec/check 'writ.spec-demo.account-spec {:seed 42 :target 'writ.spec-demo.account-lossy})]
     (is (not (:ok r)))
     (is (= :failed (:status (law-result r 'account:open:withdraw:refused))))
-    (is (has? r "when its guard fails"))))
+    (is (has? r "when its guard fails"))
+    (is (has? r "though its guard fails there and it must leave it as it was"))))
 
 (deftest a-guard-that-never-holds-fails
   (let [r (spec/check 'writ.spec-demo.account-never-spec {:seed 42})]

@@ -17,7 +17,8 @@
    :states {:open Open, :closed Closed}
    :edges  {:open {[withdraw Nat] {:to #{:open} :when (fn [a amt] (<= amt (second a))) :else :keep}
                    [close] #{:closed}}}
-   :final  [:closed]})
+   :final  [:closed]
+   :runs   30})
 
 (law withdraw-pays-out
   (forall [a Open, amt Nat]

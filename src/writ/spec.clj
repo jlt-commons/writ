@@ -1011,7 +1011,7 @@
              :detail (:detail (holds ctx* body small))})
 
           (= @discards (:num-tests res))
-          {:law name :status :failed :counterexample {} :seed (:seed res)
+          {:law name :status :failed :counterexample {} :seed (:seed res) :no-hypothesis true
            :detail [[body (str "the hypothesis never held in " (:num-tests res) " trials")]]}
 
           :else
@@ -1926,6 +1926,22 @@
   [invs g s]
   (for [[g' s' [b] pred] invs :when (and (= g g') (= s s'))] [b pred]))
 
+(defn- guard-of
+  "An edge's guard, (fn [state arg ...] test), as its test of the call's
+  own arguments: each parameter replaced, all at once, by what the call
+  passes in its place."
+  [[_ ps body] call-args]
+  (let [tmp (vec (for [i (range (count ps))] (symbol (str "guard%" i))))
+        body (reduce (fn [b [p t]] (subst-var b p t)) body (map vector ps tmp))]
+    (reduce (fn [b [t a]] (subst-var b t a)) body (map vector tmp call-args))))
+
+(defn- guard-clauses
+  "The clauses of a guard's test: the parts of a top-level `and`, or
+  nothing when there is only one."
+  [test]
+  (when (and (seq? test) (= 'and (first test)) (< 2 (count test)))
+    (vec (rest test))))
+
 (defn- graph-obligations
   "Laws for each edge whose targets are refinements.  One says every value
   of its state goes, by the edge's fn, to a value of one of its targets,
@@ -1933,19 +1949,29 @@
   the step is taken: some value of the state, and some arguments, land
   there.  Without those the graph only bounds the code, and code that
   never leaves its state keeps every bound.  An edge into plain types
-  needs no law; the signatures and the static check keep it."
+  needs no law; the signatures and the static check keep it.
+
+  A guarded edge, {:to #{...} :when (fn [state arg ...] test) :else s},
+  is taken only when its test holds: the landing law and each step are
+  under the test.  Where it fails the step is refused, and a law says so:
+  the state is left as it was (:else :keep, the default) or lands in the
+  :else state.  One more law says some value passes the guard, and, for a
+  test that is an `and`, one per clause says it fails while the others
+  hold, so each clause rules out something of its own."
   [[gname m :as g] refs invs]
-  (vec (for [{:keys [from f args tos pos]} (graph-edges g)
+  (vec (for [{:keys [from f args tos pos guard else]} (graph-edges g)
              :let [ty #(get (:states m) %)
-                   ref-of #(let [t (plain (ty %))] (when (symbol? t) (get refs t)))]
-             :when (every? ref-of tos)
+                   ref-of #(let [t (plain (ty %))] (when (symbol? t) (get refs t)))
+                   refined? (every? ref-of tos)]
+             :when (or refined? guard)
              :let [v (or (:var (ref-of from)) 's)
                    avs (reduce (fn [acc [i t]]
                                  (conj acc (if (fixed-arg? t) (second t) (arg-var t i (set (conj acc v))))))
                                [] (map-indexed vector args))
                    binders (vec (concat [v (ty from)]
                                         (mapcat (fn [a t] (when-not (fixed-arg? t) [a t])) avs args)))
-                   call (apply list f (insert-at avs pos v))
+                   call-args (insert-at avs pos v)
+                   call (apply list f call-args)
                    ;; each target's predicate, of the call itself: the law
                    ;; reads as the spec would write it, (ascending? (isort xs)),
                    ;; the shape the prover takes apart
@@ -1955,26 +1981,62 @@
                              (let [ps (for [[b pred] (invariants-of invs gname t)] (subst-var pred b call))]
                                (if (seq ps) (list* 'and (in t) ps) (in t))))
                    held-of (filterv #(seq (invariants-of invs gname %)) tos)
-                   lands (fn [ts] (if (next ts) (cons 'or (map in-held ts)) (in-held (first ts))))]
-             law (cons (cond-> {:name (symbol (str gname ":" (name from) ":" f))
-                                :prop (list 'forall binders (lands tos))
-                                :explain (str "a " f " from " (name from) " must land in "
-                                              (str/join " or " (map name tos))
-                                              (when (seq held-of)
-                                                (str ", holding the invariant of "
-                                                     (str/join " and " (map #(str ":" (name %)) held-of)))))
-                                :graph gname
-                                :total true}
-                         (get-in m [:tested from])
-                         (assoc :opts {:require :tested :because (get-in m [:tested from])}))
-                       (for [t tos]
-                         (cond-> {:name (symbol (str gname ":" (name from) ":" f "->" (name t)))
-                                  :prop (list 'exists binders (in t))
-                                  :explain (str "the graph says a " f " can take " (name from) " to "
-                                                (name t) ", but no generated " (name from) " does")
-                                  :step-of gname}
-                           (get-in m [:witnesses [from t]])
-                           (assoc :witness (get-in m [:witnesses [from t]])))))]
+                   lands (fn [ts] (if (next ts) (cons 'or (map in-held ts)) (in-held (first ts))))
+                   test (when guard (guard-of guard call-args))
+                   under (fn [p] (if test (list '=> test p) p))
+                   edge (str gname ":" (name from) ":" f)
+                   tested (get-in m [:tested from])
+                   off-proof #(cond-> % tested (assoc :opts {:require :tested :because tested}))]
+             law (concat
+                   (when refined?
+                     (cons (off-proof
+                             {:name (symbol edge)
+                              :prop (list 'forall binders (under (lands tos)))
+                              :explain (str "a " f " from " (name from)
+                                            (when test " that passes its guard")
+                                            " must land in " (str/join " or " (map name tos))
+                                            (when (seq held-of)
+                                              (str ", holding the invariant of "
+                                                   (str/join " and " (map #(str ":" (name %)) held-of)))))
+                              :graph gname
+                              :total true})
+                           (for [t tos]
+                             (cond-> {:name (symbol (str edge "->" (name t)))
+                                      :prop (list 'exists binders (if test (list 'and test (in t)) (in t)))
+                                      :explain (str "the graph says a " f " can take " (name from) " to "
+                                                    (name t) ", but no generated " (name from) " does")
+                                      :step-of gname}
+                               (get-in m [:witnesses [from t]])
+                               (assoc :witness (get-in m [:witnesses [from t]]))))))
+                   (when guard
+                     (concat
+                       (when (or (= :keep else) (ref-of else))
+                         [(off-proof
+                            {:name (symbol (str edge ":refused"))
+                             :prop (list 'forall binders
+                                         (list '=> (list 'not test)
+                                               (if (= :keep else) (list '= call v) (in-held else))))
+                             :explain (str "when its guard fails, a " f " from " (name from)
+                                           (if (= :keep else)
+                                             " must leave it as it was"
+                                             (str " must land in " (name else))))
+                             :graph gname
+                             :total true})])
+                       [{:name (symbol (str edge ":when"))
+                         :prop (list 'exists binders test)
+                         :explain (str "the guard of " f " from " (name from) " never holds: no generated "
+                                       (name from) " and arguments pass it, so the step can never be taken")
+                         :step-of gname :guard-law true}]
+                       (let [cs (guard-clauses test)]
+                         (for [[i c] (map-indexed vector cs)]
+                           {:name (symbol (str edge ":when." (inc i)))
+                            :prop (list 'exists binders
+                                        (list* 'and (list 'not c) (concat (take i cs) (drop (inc i) cs))))
+                            :explain (str "clause " (pr-str (nth (guard-clauses (nth guard 2)) i))
+                                          " of the guard of " f " from " (name from)
+                                          " never fails on its own: whenever the other clauses hold,"
+                                          " so does it, and it rules out nothing they do not")
+                            :step-of gname :guard-law true})))))]
          law)))
 
 (defn- fits?
@@ -2001,8 +2063,9 @@
   (let [base #(plain (erase % refs))
         ty #(get (:states m) %)]
     (vec (concat (same-type-errors g refs)
-         (for [{:keys [from f args tos pos key]} (graph-edges g)
-               :let [proj (get projections f)
+         (for [{:keys [from f args pos key else] tos :tos} (graph-edges g)
+               :let [tos (cond-> tos (and else (not= :keep else) (not-any? #{else} tos)) (conj else))
+                     proj (get projections f)
                      tup (let [t (base (ty from))] (when (and (seq? t) (= 'Tuple (first t))) (vec (rest t))))
                      sig (if proj
                            (when tup {:params [(base (ty from))] :ret (get tup (proj (count tup)))})
@@ -2130,15 +2193,18 @@
           start-v (try (binding [*ns* (the-ns spec-ns)] (eval (qualify-form (second st))))
                        (catch Throwable _ ::none))
           pick (fn [k r] (gen/generate (gen/choose 0 (dec k)) 30 r))
-          call-edge (fn [v {:keys [f args pos]} r]
+          call-edge (fn [v {:keys [f args pos guard]} r]
                       (let [avs (map-indexed
                                   (fn [j t] (if (fixed-arg? t)
                                               (second t)
                                               (list 'quote (gen/generate (type->gen t tenv)
-                                                                         (min 30 (+ 3 j)) (+ r j 1)))))
+                                                                         30 (+ r j 1)))))
                                   args)
-                            call (qualify-form (apply list f (insert-at (vec avs) pos (list 'quote v))))]
-                        (try {:v (binding [*ns* (the-ns spec-ns)] (eval call))}
+                            call-args (insert-at (vec avs) pos (list 'quote v))
+                            call (qualify-form (apply list f call-args))
+                            ev #(binding [*ns* (the-ns spec-ns)] (eval %))]
+                        (try (cond-> {:v (ev call)}
+                               guard (assoc :passes (boolean (ev (qualify-form (guard-of guard call-args))))))
                              (catch Throwable ex {:thrown (ex-message ex)}))))
           conforms (fn [s v] (try (conforms? (get (:states m) s) v tenv) (catch Throwable _ false)))
           run (fn [i]
@@ -2147,13 +2213,18 @@
                     (if (or (empty? es) (= k depth))
                       {:path path}
                       (let [r (+ (or seed 0) (* 7919 i) (* 31 k))
-                            {:keys [tos] :as e} (nth es (pick (count es) r))
-                            {nv :v thrown :thrown} (call-edge v e r)
+                            {:keys [tos guard else] :as e} (nth es (pick (count es) r))
+                            {nv :v thrown :thrown passes :passes} (call-edge v e r)
+                            refused (and guard (not passes))
+                            tos (if refused (if (= :keep else) [state] [else]) tos)
                             land (first (filter #(conforms % nv) tos))
                             fail (fn [why] {:path path :value v :reason why})]
                         (cond
                           thrown (fail (str "a " (:f e) " from " (pr-str state) " at " (pr-str v)
                                             " throws: " thrown))
+                          (and refused (= :keep else) (not= v nv))
+                          (fail (str "a " (:f e) " takes " (pr-str v) " to " (pr-str nv)
+                                     ", though its guard fails there and it must leave it as it was"))
                           (nil? land)
                           (fail (str "a " (:f e) " takes " (pr-str v) " to " (pr-str nv)
                                      ", which is in none of " (str/join ", " (map pr-str tos))))
@@ -2323,9 +2394,14 @@
                        (apply str (for [[s t] (:states m)]
                                     (str "\n    " (format (str "%-" w "s") (str s)) (show-type t))))
                        "\n  steps"
-                       (apply str (for [{:keys [from key tos]} (graph-edges g)]
+                       (apply str (for [{:keys [from key tos guard else]} (graph-edges g)]
                                     (str "\n    " from " -" key "-> "
-                                         (str/join " or " (map str tos)))))
+                                         (str/join " or " (map str tos))
+                                         (when guard
+                                           (str " when " (pr-str guard)
+                                                (if (= :keep else)
+                                                  ", else it stays"
+                                                  (str ", else to " else)))))))
                        (apply str (for [[k label] [[:never "never"] [:before "only through"]]
                                         [a b] (get m k)]
                                     (if (= k :never)
@@ -3207,6 +3283,12 @@
                                           (seq (:lemmas pr)) (assoc :lemmas (:lemmas pr))))
                               (conj lemmas {:name (:law r) :prop (:prop r)})]
 
+                             ;; a law whose hypothesis never held is true of
+                             ;; every input, and tested nothing: the failure
+                             ;; stands, and it is no refutation of the proof
+                             (and (:proved pr) (:no-hypothesis r))
+                             [(conj out r) lemmas]
+
                              (and (:proved pr) (not (thrown? r)))
                              [(conj out (assoc r :prover-bug true :proof (:summary pr))) lemmas]
 
@@ -3363,7 +3445,7 @@
              ;; caller's own instrument stays in place
              wrapped (wrap! e)
              results (try
-                       (vec (for [{:keys [name prop explain graph total lemma step-of witness]} laws
+                       (vec (for [{:keys [name prop explain graph total lemma step-of witness guard-law]} laws
                                   :let [p (desugar prop)]]
                               (try
                                 (lw/check-prop-shape! p)
@@ -3372,11 +3454,13 @@
                                   ;; a lemma is proof, not contract: one about
                                   ;; clojure.core alone is a fact the proof uses
                                   (cond
-                                    (and (not lemma) (not (calls-target? qp target)))
+                                    ;; a guard's own laws are about the spec's
+                                    ;; test, not the code: that some value passes it
+                                    (and (not lemma) (not guard-law) (not (calls-target? qp target)))
                                     {:law name :status :vacuous
                                      :why (str "it calls no fn of " target)}
 
-                                    (and (not lemma) (try-prove p data-tenv opaque numeric-fns))
+                                    (and (not lemma) (not guard-law) (try-prove p data-tenv opaque numeric-fns))
                                     {:law name :status :vacuous
                                      :why (str "writ.norm proves it without looking at the "
                                                "implementation, so any code satisfies it")}
@@ -3388,6 +3472,7 @@
                                       explain (assoc :explain explain)
                                       graph (assoc :graph graph)
                                       step-of (assoc :step-of step-of)
+                                      guard-law (assoc :guard-law true)
                                       total (assoc :total true)
                                       lemma (assoc :lemma true))))
                                 ;; a law that cannot be run (a malformed
@@ -3482,7 +3567,7 @@
                                                 :edges (count (graph-edges g))
                                                 :status (if ok? :ok :failed)
                                               ::obligations (count obls)
-                                              ::steps (count (filter #(and (= (first g) (:step-of %))
+                                              ::steps (count (filter #(and (= (first g) (:step-of %)) (not (:guard-law %))
                                                                            (= :witnessed (:status %)))
                                                                      results))
                                               ::unproved (count (remove #(= :proof (:evidence %)) obls))}
