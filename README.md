@@ -298,7 +298,8 @@ the spec instead, and says which name to rename.
 
 Built in: `Nat Int Bool String Char Keyword Symbol Float Double Unit Any`,
 `(List T)`, `(Vec T)`, `(Set T)`, `(Map K V)`, `(Tuple T ...)`, `(Opt T)`
-(a `T` or nil), records (see [Records](#records)), and function types
+(a `T` or nil), records (see [Records](#records)), `(Index :key Record)`
+(see [Collections of records](#collections-of-records)), and function types
 `(-> A B R)`. Declared types come from `data`.
 
 `Float`, `Double` and `Any` hold no NaN; `Float!`, `Double!` and `Any!`
@@ -351,6 +352,44 @@ writ checks this statically:
   first field that is exactly that parameter, and must agree after that.
 - The value is read only through that `case`. `first`, `second` or `nth`
   anywhere else is rejected.
+
+### Collections of records
+
+A problem with many entities keeps them together, and its rules are about
+all of them at once: no two members share an email. `(Index :id Member)`
+is a map of `Member`s, each kept under its own `:id`, and `:unique
+[:email]` says no two share an email:
+
+```clojure
+(refine Member [m {:id Nat, :email String}] true)
+(refine Db [db (Index :id Member :unique [:email])] true)
+
+(ann register [Db Member -> Db])
+
+(graph registry
+  {:start  [:db {}]
+   :states {:db Db}
+   :edges  {:db {[register Member] #{:db}}}
+   :final  [:db]})
+```
+
+Generated values are built that way, keyed and with no field shared, not
+filtered for it. A refinement of an Index checks the same in its
+predicate, so the edge law `registry:db:register` says a registration
+lands in a `Db`: keyed by id, no email twice. A `register` that forgets
+to look at the emails fails it:
+
+```
+law `registry:db:register` fails for
+  db     = {1 {:email "", :id 1}}
+  member = {:email "", :id 0}
+  a register from db must land in db
+```
+
+A rule across the records that the type cannot say goes in an invariant
+or the refinement's predicate; `writ.spec/unique-by?` says no two of a
+collection share a value of a fn. Such a rule is usually kept by
+induction, and each edge assumes the invariants of the state it leaves.
 
 ### Records
 
@@ -625,7 +664,10 @@ graph `spin` breaks its own rules
 a state's values, whichever edge they came in by. Every edge that may
 land in the state carries the predicate in its law, so a landing in
 `:hot` must be a `Hot` and hold it too, and a `[state value]` start must
-satisfy it. An invariant the state's own refinement already implies is
+satisfy it. Every edge out of the state may assume it: a step keeps an
+invariant when it holds before the step, so one that holds only by
+induction, such as an even count that climbs by two, is kept, and with
+the start holding it every run does. An invariant the state's own refinement already implies is
 vacuous and fails, as a vacuous law does: say what a landing must keep
 that the type does not.
 

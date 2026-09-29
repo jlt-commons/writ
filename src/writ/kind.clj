@@ -29,11 +29,45 @@
 (defn- fail! [& msg]
   (throw (ex-info (str "Writ: " (apply str msg)) {:writ/error true})))
 
+(defn index-type?
+  "Is ty an (Index :key Record ...), a map of records keyed by a field?"
+  [ty]
+  (and (seq? ty) (symbol? (first ty)) (= 'Index (plain (first ty)))))
+
+(defn index-parts
+  "{:key :of :unique} of an (Index :key Record :unique [:field ...])."
+  [ty]
+  (let [[_ k r & opts] ty]
+    {:key k :of r :unique (vec (:unique (apply hash-map opts)))}))
+
+(declare check-type record-type?)
+
+(defn- check-index [ty tenv allowed]
+  (let [[_ k r & opts] ty
+        shape (str "an Index is (Index :key Record), or (Index :key Record :unique [:field ...]), had "
+                   (pr-str ty))]
+    (when-not (and (keyword? k) (some? r) (even? (count opts))
+                   (every? #{:unique} (take-nth 2 opts)))
+      (fail! shape))
+    (check-type r tenv allowed)
+    (let [{:keys [unique]} (index-parts ty)]
+      (when-not (every? keyword? unique)
+        (fail! shape))
+      (when (record-type? r)
+        (when-not (contains? r k)
+          (fail! "`" (pr-str ty) "` keys each record by " k ", which the record does not have"))
+        (doseq [u unique :when (not (contains? r u))]
+          (fail! "`" (pr-str ty) "`: :unique names " u ", which the record does not have"))))
+    true))
+
 (defn check-type
   "Check `ty` under `tenv` (name -> {:arity n}) with `allowed` names in scope.
   Returns true or throws."
   [ty tenv allowed]
   (cond
+    (and (index-type? ty) (not (contains? tenv 'Index)))
+    (check-index ty tenv allowed)
+
     (and (symbol? ty) (namespace ty) (not (contains? #{"writ.kind" "writ.core"} (namespace ty))))
     (fail! "`" ty "` is not a type; a type name is unqualified (or writ.kind/...)")
 
@@ -132,6 +166,7 @@
               (function-type? t) kind-Type
               ;; what inference knows only to be data
               (= :writ/data t) kind-Data
+              (and (index-type? t) (not (contains? tenv 'Index))) (k (:of (index-parts t)) seen)
               (map? t) (if (some #(= kind-Type (k % seen)) (vals t)) kind-Type kind-Data)
               (symbol? t)
               (let [nm (plain t)
