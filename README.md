@@ -441,7 +441,12 @@ check follows the keys:
 The prover reads `get`, `assoc`, `dissoc` and `contains?` on literal keys,
 knows a record's key holds its type (so `(:points m)` is a `Nat`), and
 takes a map destructure of a record as the record itself. The member laws
-above are proved by rewriting.
+above are proved by rewriting. Symbolic evaluation runs on records too,
+so an edge over a record state is proved never to throw, and the solver
+finds a record no test generates, such as a member with more points than
+any generated one. A record's value may hold keys the record does not
+name, so a law that counts or lists all of its keys, or compares it with
+a map built afresh, is never proved, only tested.
 
 ### Laws
 
