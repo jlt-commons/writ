@@ -47,6 +47,8 @@
             [writ.book :as book]
             [writ.check :as ck]
             [writ.data :as dt]
+            [writ.hash :as hash]
+            [writ.solve :as solve]
             [writ.kind :as kind]
             [writ.law :as lw]
             [writ.lower :as l]
@@ -106,6 +108,8 @@
                    :calls (update e :calls (fnil conj []) v)
                    :flow (update e :flows (fnil conj []) v)
                    :machine (update e :machines (fnil conj []) v)
+                   :invariant (update e :invariants (fnil conj []) v)
+                   :question (update e :questions (fnil conj []) v)
                    :ann (assoc-in e [:anns (first v)] (second v))
                    :law (update e :laws conj v))))
   nil)
@@ -282,7 +286,52 @@
          (-register! '~(ns-name *ns*) :refine '~{:name nm :var v :base base :pred pred
                                                  :pred-name pred-name}))))
 
-(def ^:private graph-keys #{:states :edges :start :never :before :final :tested :witnesses})
+(defmacro invariant
+  "State what always holds of a graph state's values, wherever they come
+  from:
+
+    (invariant signal :red [l] (pos? (second l)))
+
+  Every edge that may land in :red carries the predicate as its own
+  obligation, proved and tested with the edge itself, and the start
+  value must satisfy it too.  A graph with every edge proved holds its
+  invariants for every run of the code."
+  [g state binder pred]
+  (let [where (str "`invariant " g " " state "`")]
+    (when-not (simple-sym? g)
+      (fail! "an `invariant` names a graph by a simple symbol, had: `" (pr-str g) "`"))
+    (when-not (keyword? state)
+      (fail! "an `invariant` of `" g "` names a state by a keyword, had: " (pr-str state)))
+    (when-not (and (vector? binder) (= 1 (count binder)) (simple-sym? (first binder)))
+      (fail! "an `invariant` of `" g "` takes one binder for the state's value: [v predicate], had: "
+             (pr-str binder)))
+    `(-register! '~(ns-name *ns*) :invariant '~[g state binder pred])))
+
+(defn- question*
+  "The registration of a `question`, once its parts are checked."
+  [id text opts]
+  (when-not (simple-sym? id)
+    (fail! "a `question` is named by a simple symbol, had: " (pr-str id)))
+  (when-not (and (string? text) (not (str/blank? text)))
+    (fail! "`question " id "` needs the question, as a string"))
+  (when-not (and (map? opts) (every? #{:blocking} (keys opts)))
+    (fail! "`question " id "` takes {:blocking true|false}, had: " (pr-str opts)))
+  `(-register! '~(ns-name *ns*) :question '~{:id id :text text
+                                              :blocking (boolean (:blocking opts))}))
+
+(defmacro question
+  "Record a question the spec does not answer yet:
+
+    (question refund-reopens \"does a refund reopen a closed order?\")
+    (question refund-reopens \"...\" {:blocking true})
+
+  Every report lists the open questions, since a spec with one is not
+  finished.  A blocking question, one the next piece of work depends on,
+  fails the check until it is answered and removed."
+  ([id text] (question* id text {}))
+  ([id text opts] (question* id text opts)))
+
+(def ^:private graph-keys #{:states :edges :start :never :before :final :tested :witnesses :runs :depth})
 
 (def ^:private projections
   "clojure.core fns an edge may use to take a state out of a tuple state:
@@ -328,6 +377,9 @@
       (fail! where " needs a map with :states (state -> type) and :edges"))
     (when-let [bad (seq (remove graph-keys (keys m)))]
       (fail! where " has unknown keys: " (pr-str bad) "; it takes " (pr-str (sort graph-keys))))
+    (when (and (contains? m :runs) (not (pos-int? (:runs m))))
+      (fail! where ": :runs is how many runs to walk from :start, a positive integer, had "
+             (pr-str (:runs m))))
     (let [states (set (keys (:states m)))
           known! (fn [what s] (when-not (contains? states s)
                                 (fail! where ": " what " names " (pr-str s) ", which is not a state")))]
@@ -358,9 +410,23 @@
           (when (and (contains? projections (first k)) (next k))
             (fail! where ": the edge " (pr-str from) " " (pr-str k) " -- `" (first k)
                    "` takes the state alone, a " (pr-str (get (:states m) from))))
-          (when-not (and (coll? tos) (seq tos))
+          (when (map? tos)
+            (let [edge (str where ": the edge " (pr-str from) " " (pr-str k))
+                  {w :when el :else} tos
+                  n (inc (count (remove #{'_} (rest k))))]
+              (when-let [bad (seq (remove #{:to :when :else} (keys tos)))]
+                (fail! edge " has unknown keys " (pr-str bad) "; a guarded edge takes :to, :when and :else"))
+              (when-not (and (seq? w) (= 'fn (first w)) (vector? (second w)) (= 3 (count w)))
+                (fail! edge " needs :when (fn [state arg ...] test), had " (pr-str w)))
+              (when-not (= n (count (second w)))
+                (fail! edge ": its :when takes the fn's " n " argument(s), in the fn's order, had "
+                       (pr-str (second w))))
+              (when-not (or (nil? el) (= :keep el) (contains? states el))
+                (fail! edge ": :else is :keep, the state unchanged when the guard fails, or a state, had "
+                       (pr-str el)))))
+          (when-not (let [tos (if (map? tos) (:to tos) tos)] (and (coll? tos) (not (map? tos)) (seq tos)))
             (fail! where ": the edge " (pr-str from) " " (pr-str k) " needs a set of target states"))
-          (doseq [t tos]
+          (doseq [t (if (map? tos) (:to tos) tos)]
             (when-not (contains? states t)
               (fail! where ": the edge from " (pr-str from) " names " (pr-str t) ", which is not a state")))))
       (when-let [st (:start m)]
@@ -883,6 +949,7 @@
       (let [[_ [x t] body] p] (recur body (conj bs [x t])))
       [bs p])))
 
+
 (def ^:private witness-trials 1000)
 
 (defn- test-law
@@ -947,7 +1014,7 @@
              :detail (:detail (holds ctx* body small))})
 
           (= @discards (:num-tests res))
-          {:law name :status :failed :counterexample {} :seed (:seed res)
+          {:law name :status :failed :counterexample {} :seed (:seed res) :no-hypothesis true
            :detail [[body (str "the hypothesis never held in " (:num-tests res) " trials")]]}
 
           :else
@@ -1710,6 +1777,30 @@
         (recur (into (vec (rest todo)) ts) (into seen ts)))
       seen)))
 
+(defn- find-cycle
+  "The first loop a depth-first walk from `from` runs into, as the path
+  around it, [a b a]; nil when every walk ends."
+  [edges from]
+  (let [succ (reduce (fn [m [a _ b]] (update m a (fnil conj []) b)) {} edges)]
+    (letfn [(walk [s path on done]
+              (reduce (fn [done t]
+                        (cond
+                          (:cycle done) done
+                          (contains? on t) {:cycle (conj (subvec path (first (keep-indexed #(when (= t %2) %1) path))) t)}
+                          (contains? done t) done
+                          :else (walk t (conj path t) (conj on t) done)))
+                      (conj done s)
+                      (get succ s)))]
+      (:cycle (walk from [from] #{from} #{})))))
+
+(defn- no-final-error
+  "From s no final state can be reached, with the loop that keeps it
+  there when there is one."
+  [edges s]
+  (str "from " (pr-str s) " no final state can be reached"
+       (when-let [c (find-cycle edges s)]
+         (str ": it loops " (str/join " -> " (map pr-str c))))))
+
 (defn- show-path [path]
   (apply str (pr-str (first (first path)))
          (for [[_ ev t] path] (str " -" (pr-str ev) "-> " (pr-str t)))))
@@ -1755,7 +1846,7 @@
                         (for [s states
                               :when (and (contains? from-start s)
                                          (not-any? (reachable edges s) final))]
-                          (str "from " (pr-str s) " no final state can be reached")))
+                          (no-final-error edges s)))
                       (for [[a b] never
                             :let [p (find-path edges a b nil)]
                             :when p]
@@ -1789,10 +1880,12 @@
   parameters (where `_` marks it, else first), the edge's key as written,
   and its targets in the order the graph lists its states."
   [[_ m]]
-  (for [[from es] (:edges m), [[f & args :as k] tos] es]
-    {:from from :f f :args (vec (remove #{'_} args)) :key k
-     :pos (or (first (keep-indexed #(when (= '_ %2) %1) args)) 0)
-     :tos (filterv (set tos) (keys (:states m)))}))
+  (for [[from es] (:edges m), [[f & args :as k] v] es
+        :let [tos (if (map? v) (:to v) v)]]
+    (cond-> {:from from :f f :args (vec (remove #{'_} args)) :key k
+             :pos (or (first (keep-indexed #(when (= '_ %2) %1) args)) 0)
+             :tos (filterv (set tos) (keys (:states m)))}
+      (map? v) (assoc :guard (:when v) :else (or (:else v) :keep)))))
 
 (defn- insert-at [v i x] (vec (concat (take i v) [x] (drop i v))))
 
@@ -1830,47 +1923,127 @@
         v (symbol base)]
     (if (contains? taken v) (symbol (str base i)) v)))
 
+(defn- invariants-of
+  "The predicates the spec's invariants give state `s` of graph `g`, each
+  as [binder pred]."
+  [invs g s]
+  (for [[g' s' [b] pred] invs :when (and (= g g') (= s s'))] [b pred]))
+
+(defn- guard-of
+  "An edge's guard, (fn [state arg ...] test), as its test of the call's
+  own arguments: each parameter replaced, all at once, by what the call
+  passes in its place."
+  [[_ ps body] call-args]
+  (let [tmp (vec (for [i (range (count ps))] (symbol (str "guard%" i))))
+        body (reduce (fn [b [p t]] (subst-var b p t)) body (map vector ps tmp))]
+    (reduce (fn [b [t a]] (subst-var b t a)) body (map vector tmp call-args))))
+
+(defn- guard-clauses
+  "The clauses of a guard's test: the parts of a top-level `and`, or
+  nothing when there is only one."
+  [test]
+  (when (and (seq? test) (= 'and (first test)) (< 2 (count test)))
+    (vec (rest test))))
+
 (defn- graph-obligations
   "Laws for each edge whose targets are refinements.  One says every value
-  of its state goes, by the edge's fn, to a value of one of its targets.
-  One per target says the step is taken: some value of the state, and
-  some arguments, land there.  Without those the graph only bounds the
-  code, and code that never leaves its state keeps every bound.  An edge
-  into plain types needs no law; the signatures and the static check keep
-  it."
-  [[gname m :as g] refs]
-  (vec (for [{:keys [from f args tos pos]} (graph-edges g)
+  of its state goes, by the edge's fn, to a value of one of its targets,
+  holding every invariant of the state it lands in.  One per target says
+  the step is taken: some value of the state, and some arguments, land
+  there.  Without those the graph only bounds the code, and code that
+  never leaves its state keeps every bound.  An edge into plain types
+  needs no law; the signatures and the static check keep it.
+
+  A guarded edge, {:to #{...} :when (fn [state arg ...] test) :else s},
+  is taken only when its test holds: the landing law and each step are
+  under the test.  Where it fails the step is refused, and a law says so:
+  the state is left as it was (:else :keep, the default) or lands in the
+  :else state.  One more law says some value passes the guard, and, for a
+  test that is an `and`, one per clause says it fails while the others
+  hold, so each clause rules out something of its own."
+  [[gname m :as g] refs invs]
+  (vec (for [{:keys [from f args tos pos guard else]} (graph-edges g)
              :let [ty #(get (:states m) %)
-                   ref-of #(let [t (plain (ty %))] (when (symbol? t) (get refs t)))]
-             :when (every? ref-of tos)
+                   ref-of #(let [t (plain (ty %))] (when (symbol? t) (get refs t)))
+                   refined? (every? ref-of tos)]
+             :when (or refined? guard)
              :let [v (or (:var (ref-of from)) 's)
                    avs (reduce (fn [acc [i t]]
                                  (conj acc (if (fixed-arg? t) (second t) (arg-var t i (set (conj acc v))))))
                                [] (map-indexed vector args))
                    binders (vec (concat [v (ty from)]
                                         (mapcat (fn [a t] (when-not (fixed-arg? t) [a t])) avs args)))
-                   call (apply list f (insert-at avs pos v))
+                   call-args (insert-at avs pos v)
+                   call (apply list f call-args)
                    ;; each target's predicate, of the call itself: the law
                    ;; reads as the spec would write it, (ascending? (isort xs)),
                    ;; the shape the prover takes apart
                    in (fn [t] (let [r (ref-of t)] (subst-var (:pred r) (:var r) call)))
-                   lands (fn [ts] (if (next ts) (cons 'or (map in ts)) (in (first ts))))]
-             law (cons (cond-> {:name (symbol (str gname ":" (name from) ":" f))
-                                :prop (list 'forall binders (lands tos))
-                                :explain (str "a " f " from " (name from) " must land in "
-                                              (str/join " or " (map name tos)))
-                                :graph gname
-                                :total true}
-                         (get-in m [:tested from])
-                         (assoc :opts {:require :tested :because (get-in m [:tested from])}))
-                       (for [t tos]
-                         (cond-> {:name (symbol (str gname ":" (name from) ":" f "->" (name t)))
-                                  :prop (list 'exists binders (lands [t]))
-                                  :explain (str "the graph says a " f " can take " (name from) " to "
-                                                (name t) ", but no generated " (name from) " does")
-                                  :step-of gname}
-                           (get-in m [:witnesses [from t]])
-                           (assoc :witness (get-in m [:witnesses [from t]])))))]
+                   ;; a landing in t holds t's invariants: (and (Hot? ..) (even? ..))
+                   in-held (fn [t]
+                             (let [ps (for [[b pred] (invariants-of invs gname t)] (subst-var pred b call))]
+                               (if (seq ps) (list* 'and (in t) ps) (in t))))
+                   held-of (filterv #(seq (invariants-of invs gname %)) tos)
+                   lands (fn [ts] (if (next ts) (cons 'or (map in-held ts)) (in-held (first ts))))
+                   test (when guard (guard-of guard call-args))
+                   under (fn [p] (if test (list '=> test p) p))
+                   edge (str gname ":" (name from) ":" f)
+                   tested (get-in m [:tested from])
+                   off-proof #(cond-> % tested (assoc :opts {:require :tested :because tested}))]
+             law (concat
+                   (when refined?
+                     (cons (off-proof
+                             {:name (symbol edge) :oid (str "edge." gname "." (name from) "." f)
+                              :prop (list 'forall binders (under (lands tos)))
+                              :explain (str "a " f " from " (name from)
+                                            (when test " that passes its guard")
+                                            " must land in " (str/join " or " (map name tos))
+                                            (when (seq held-of)
+                                              (str ", holding the invariant of "
+                                                   (str/join " and " (map #(str ":" (name %)) held-of)))))
+                              :graph gname
+                              :total true})
+                           (for [t tos]
+                             (cond-> {:name (symbol (str edge "->" (name t)))
+                                      :oid (str "step." gname "." (name from) "." f "." (name t))
+                                      :prop (list 'exists binders (if test (list 'and test (in t)) (in t)))
+                                      :explain (str "the graph says a " f " can take " (name from) " to "
+                                                    (name t) ", but no generated " (name from) " does")
+                                      :step-of gname}
+                               (get-in m [:witnesses [from t]])
+                               (assoc :witness (get-in m [:witnesses [from t]]))))))
+                   (when guard
+                     (concat
+                       (when (or (= :keep else) (ref-of else))
+                         [(off-proof
+                            {:name (symbol (str edge ":refused"))
+                             :oid (str "refused." gname "." (name from) "." f)
+                             :prop (list 'forall binders
+                                         (list '=> (list 'not test)
+                                               (if (= :keep else) (list '= call v) (in-held else))))
+                             :explain (str "when its guard fails, a " f " from " (name from)
+                                           (if (= :keep else)
+                                             " must leave it as it was"
+                                             (str " must land in " (name else))))
+                             :graph gname
+                             :total true})])
+                       [{:name (symbol (str edge ":when"))
+                         :oid (str "guard." gname "." (name from) "." f)
+                         :prop (list 'exists binders test)
+                         :explain (str "the guard of " f " from " (name from) " never holds: no generated "
+                                       (name from) " and arguments pass it, so the step can never be taken")
+                         :step-of gname :guard-law true}]
+                       (let [cs (guard-clauses test)]
+                         (for [[i c] (map-indexed vector cs)]
+                           {:name (symbol (str edge ":when." (inc i)))
+                            :oid (str "guard." gname "." (name from) "." f "." (inc i))
+                            :prop (list 'exists binders
+                                        (list* 'and (list 'not c) (concat (take i cs) (drop (inc i) cs))))
+                            :explain (str "clause " (pr-str (nth (guard-clauses (nth guard 2)) i))
+                                          " of the guard of " f " from " (name from)
+                                          " never fails on its own: whenever the other clauses hold,"
+                                          " so does it, and it rules out nothing they do not")
+                            :step-of gname :guard-law true})))))]
          law)))
 
 (defn- fits?
@@ -1897,8 +2070,9 @@
   (let [base #(plain (erase % refs))
         ty #(get (:states m) %)]
     (vec (concat (same-type-errors g refs)
-         (for [{:keys [from f args tos pos key]} (graph-edges g)
-               :let [proj (get projections f)
+         (for [{:keys [from f args pos key else] tos :tos} (graph-edges g)
+               :let [tos (cond-> tos (and else (not= :keep else) (not-any? #{else} tos)) (conj else))
+                     proj (get projections f)
                      tup (let [t (base (ty from))] (when (and (seq? t) (= 'Tuple (first t))) (vec (rest t))))
                      sig (if proj
                            (when tup {:params [(base (ty from))] :ret (get tup (proj (count tup)))})
@@ -1958,18 +2132,35 @@
            (when (and start (seq (:final m)))
              (for [s (keys (:states m))
                    :when (and (contains? from-start s) (not-any? (reachable edges s) (:final m)))]
-               (str "from " (pr-str s) " no final state can be reached")))
+               (no-final-error edges s)))
            (for [[a b] (:never m) :let [p (find-path edges a b nil)] :when p]
              (str (pr-str a) " must never lead to " (pr-str b) ", but it does: " (show-path p)))
            (for [[a b] (:before m)
                  :let [p (when (and start (not= start a)) (find-path edges start b a))]
                  :when p]
              (str (pr-str b) " must be reached only through " (pr-str a) ", but "
-                  (show-path p) " avoids it"))))))
+                  (show-path p) " avoids it"))
+           (let [finals (set (:final m))
+                 out (fn [s] (some #(= s (nth % 0)) edges))]
+             (for [s (keys (:states m))
+                   :when (and (contains? from-start s) (not (finals s)) (not (out s)))]
+               (str (pr-str s) " cannot be left and is not final")))))))
+
+(defn- invariant-check
+  "A fn of one value that returns the first invariant of state `s` it
+  breaks, or nil when it holds them all.  A predicate that throws is
+  broken."
+  [invs g s spec-ns qualify-form]
+  (let [fs (vec (for [[b pred] (invariants-of invs g s)]
+                  [pred (binding [*ns* (the-ns spec-ns)]
+                          (eval (list 'fn [b] (qualify-form pred))))]))]
+    (fn [v]
+      (some (fn [[pred f]] (when-not (try (f v) (catch Throwable _ false)) pred)) fs))))
 
 (defn- graph-start-errors
-  "A [state value] start: the value, run once, must be in its state."
-  [[gname m] spec-ns tenv qualify-form]
+  "A [state value] start: the value, run once, must be in its state and
+  hold its invariants."
+  [[gname m :as g] spec-ns tenv qualify-form invs]
   (let [st (:start m)]
     (when (vector? st)
       (let [[s expr] st
@@ -1982,7 +2173,104 @@
           (not (conforms? t (:ok v) tenv))
           [(str "graph `" gname "`: the start " (pr-str (:ok v)) " is not a " (pr-str t)
                 ", the type of " (pr-str s))]
-          :else nil)))))
+          :else
+          (when-let [pred ((invariant-check invs gname s spec-ns qualify-form) (:ok v))]
+            [(str "graph `" gname "`: the start " (pr-str (:ok v)) " breaks the invariant of "
+                  (pr-str s) ": " (pr-str pred))]))))))
+
+(def ^:private default-depth 20)
+
+(defn- graph-runs
+  "Walk :runs runs through the graph's real steps.  Each starts at the
+  :start value and takes up to :depth steps (default 20): at each, an
+  edge out of the current state, chosen by the seed, is called with
+  generated arguments.  A run stops early at a state with no edges out.
+  Each landing must be a state the edge allows and hold that state's
+  invariants.  Returns {:failures [...] :visited #{state ...}}: a failure
+  carries the path walked, the value it was at and the reason."
+  [[gname m :as g] spec-ns tenv invs qualify-form seed]
+  (when-let [n (:runs m)]
+    (let [st (:start m)
+          _ (when-not (vector? st)
+              (fail! "graph `" gname "`: :runs needs a :start of [state value] to walk from"))
+          depth (or (:depth m) default-depth)
+          edges (group-by :from (graph-edges g))
+          checks (into {} (for [s (keys (:states m))]
+                            [s (invariant-check invs gname s spec-ns qualify-form)]))
+          start-v (try (binding [*ns* (the-ns spec-ns)] (eval (qualify-form (second st))))
+                       (catch Throwable _ ::none))
+          pick (fn [k r] (gen/generate (gen/choose 0 (dec k)) 30 r))
+          call-edge (fn [v {:keys [f args pos guard]} r]
+                      (let [avs (map-indexed
+                                  (fn [j t] (if (fixed-arg? t)
+                                              (second t)
+                                              (list 'quote (gen/generate (type->gen t tenv)
+                                                                         30 (+ r j 1)))))
+                                  args)
+                            call-args (insert-at (vec avs) pos (list 'quote v))
+                            call (qualify-form (apply list f call-args))
+                            ev #(binding [*ns* (the-ns spec-ns)] (eval %))]
+                        (try (cond-> {:v (ev call)}
+                               guard (assoc :passes (boolean (ev (qualify-form (guard-of guard call-args))))))
+                             (catch Throwable ex {:thrown (ex-message ex)}))))
+          conforms (fn [s v] (try (conforms? (get (:states m) s) v tenv) (catch Throwable _ false)))
+          run (fn [i]
+                (loop [state (first st), v start-v, path [(first st)], k 0]
+                  (let [es (get edges state)]
+                    (if (or (empty? es) (= k depth))
+                      {:path path}
+                      (let [r (+ (or seed 0) (* 7919 i) (* 31 k))
+                            {:keys [tos guard else] :as e} (nth es (pick (count es) r))
+                            {nv :v thrown :thrown passes :passes} (call-edge v e r)
+                            refused (and guard (not passes))
+                            tos (if refused (if (= :keep else) [state] [else]) tos)
+                            land (first (filter #(conforms % nv) tos))
+                            fail (fn [why] {:path path :value v :reason why})]
+                        (cond
+                          thrown (fail (str "a " (:f e) " from " (pr-str state) " at " (pr-str v)
+                                            " throws: " thrown))
+                          (and refused (= :keep else) (not= v nv))
+                          (fail (str "a " (:f e) " takes " (pr-str v) " to " (pr-str nv)
+                                     ", though its guard fails there and it must leave it as it was"))
+                          (nil? land)
+                          (fail (str "a " (:f e) " takes " (pr-str v) " to " (pr-str nv)
+                                     ", which is in none of " (str/join ", " (map pr-str tos))))
+                          :else
+                          (if-let [pred ((checks land) nv)]
+                            (fail (str "a " (:f e) " takes " (pr-str v) " to " (pr-str nv) ", which breaks"
+                                       " the invariant of " (pr-str land) ": " (pr-str pred)))
+                            (recur land nv (conj path land) (inc k)))))))))]
+      (if (= ::none start-v)
+        {:failures [] :visited #{}}
+        (let [rs (map run (range n))]
+          {:failures (vec (distinct (filter :reason rs)))
+           :visited (set (mapcat :path rs))})))))
+
+(defn- vacuous-invariants
+  "Invariants the state's own type already says: the prover shows them
+  from the refinement alone, without the code, so they constrain
+  nothing a landing in the state does not already."
+  [[gname m] invs refs data-tenv]
+  (vec (for [[g st [b] pred] invs
+             :when (and (= gname g) (contains? (:states m) st))
+             :let [t (get (:states m) st)
+                   r (let [p (plain t)] (when (symbol? p) (get refs p)))
+                   prop (if r
+                          (list 'forall [b (:base r)]
+                                (list '=> (subst-var (:pred r) (:var r) b) pred))
+                          (list 'forall [b t] pred))]
+             :when (try (try-prove (desugar prop) data-tenv #{} #{}) (catch Throwable _ false))]
+         (str "invariant `" g " " st "` is vacuous: " (pr-str t) " already says " (pr-str pred)
+              ", so it holds of the state whatever the code does. State what a landing in "
+              (pr-str st) " must keep that its type does not."))))
+
+(defn- invariant-errors
+  "Each invariant names a graph and a state of it."
+  [[gname m] invs]
+  (vec (keep (fn [[g state _ _]]
+               (when (and (= gname g) (not (contains? (:states m) state)))
+                 (str "invariant `" g " " state "` names a state the graph does not have")))
+             invs)))
 
 (defn- state-id [s]
   (let [id (-> (str/join "_" (map #(if (keyword? %) (name %) (str %)) (flatten [s])))
@@ -2113,9 +2401,14 @@
                        (apply str (for [[s t] (:states m)]
                                     (str "\n    " (format (str "%-" w "s") (str s)) (show-type t))))
                        "\n  steps"
-                       (apply str (for [{:keys [from key tos]} (graph-edges g)]
+                       (apply str (for [{:keys [from key tos guard else]} (graph-edges g)]
                                     (str "\n    " from " -" key "-> "
-                                         (str/join " or " (map str tos)))))
+                                         (str/join " or " (map str tos))
+                                         (when guard
+                                           (str " when " (pr-str guard)
+                                                (if (= :keep else)
+                                                  ", else it stays"
+                                                  (str ", else to " else)))))))
                        (apply str (for [[k label] [[:never "never"] [:before "only through"]]
                                         [a b] (get m k)]
                                     (if (= k :never)
@@ -2146,6 +2439,10 @@
                                                  (str "\n    flow: "
                                                       (str/join " -> " (map #(if (= :result %) "result" (str %)) c)))))
                                     (when-let [gs (get calls f)] (calls-str gs))))))))
+         (when (seq (:questions e))
+           (str "\n\nopen questions"
+                (apply str (for [{:keys [id text blocking]} (:questions e)]
+                             (str "\n  " id (when blocking " (blocking)") ": " text)))))
          (apply str (for [[mname m] (:machines e)]
                       (str "\n\nmachine `" mname "`: " (:step m) " steps it from " (pr-str (:start m))
                            (apply str (for [[st evs] (:transitions m), [ev to] evs]
@@ -2434,10 +2731,16 @@
          (when (seq stuck)
            "\n  A lemma that proves such a goal from what it is given would close it."))))
 
+(defn- unqualify-form
+  "form with each namespace-qualified symbol shown by its name."
+  [form]
+  (walk/postwalk #(if (and (symbol? %) (namespace %)) (symbol (name %)) %) form))
+
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
   [{:keys [ok target spec static laws gaps unspecified rejected calls flows machines proof graphs graph-missing
-           lemmas off-graph uses]
+           lemmas off-graph uses problems questions]
+    contras ::contradictions
     ambiguous ::ambiguous explain ::explain}]
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
        (when (and proof (pos? (:laws proof)))
@@ -2448,6 +2751,8 @@
               (when (= :proved (:require proof)) " (the spec requires proof)")
               (when-let [ts (seq (filter #(= :test (:evidence %)) laws))]
                 (str "; tested, not proved: " (str/join ", " (map :law ts))))))
+       (apply str (for [{:keys [id text blocking]} questions :when (not blocking)]
+                    (str "\n  open question `" id "`: " text)))
        (apply str (for [{d :spec n :imported sk :skipped} uses]
                     (str "\n  uses " d ": " n (if (= 1 n) " proved law" " proved laws") " to cite"
                          (apply str (for [[l why] sk]
@@ -2488,12 +2793,13 @@
        (when ok
          (apply str (for [{m :machine n :states k :events} machines]
                       (str "\n  machine `" m "`: " (* n k) " transitions checked"))))
-       (apply str (for [{g :graph n :edges st :status u ::unproved m ::obligations k ::steps} graphs
+       (apply str (for [{g :graph n :edges st :status u ::unproved m ::obligations k ::steps run-n :runs held ::held} graphs
                         :when (= :ok st)
                         :let [m (or m 0) u (or u 0) k (or k 0)
                               edges (fn [k] (str k (if (= 1 k) " edge" " edges")))
                               flow (- n m)]]
                     (str "\n  graph `" g "`: "
+                         (when run-n (str run-n " runs walked, "))
                          (cond (zero? m) (str (edges n) ", data flow checked against the signatures")
                                (zero? u) (str (edges m) " proved")
                                :else (str (- m u) " of " (edges m) " proved"))
@@ -2501,8 +2807,22 @@
                            (str ", each of " (if (= 1 m) "its " "their ") k (if (= 1 k) " step" " steps")
                                 " taken"))
                          (when (and (pos? m) (pos? flow))
-                           (str ", " flow " more checked against the signatures")))))
+                           (str ", " flow " more checked against the signatures"))
+                         (when (seq held)
+                           (str ", holding the invariant of " (str/join " and " (map pr-str held)))))))
        (when-not (:ok static) (str "\n\n" (:error static)))
+       (apply str (map #(str "\n\n" %) problems))
+       (apply str (for [{[a b] :laws at :at c :call} contras]
+                    (str "\n\nlaws `" a "` and `" b "` cannot both hold: at "
+                         (str/join ", " (for [[x v] at] (str x " = " (pr-str v))))
+                         ", no value of " (pr-str (unqualify-form c)) " meets both, so no code passes them"
+                         " together (the solver shows it, and its certificate is checked)."
+                         "\n  Fixing the code cannot help; the spec's owner must say which law is meant.")))
+       (apply str (for [{:keys [id text blocking]} questions :when blocking]
+                    (str "\n\nthe spec is not finished: open question `" id "` blocks the next piece of work"
+                         "\n  " text
+                         "\n  Ask the spec's owner. Write the answer into the spec as laws or states,"
+                         " then remove the question.")))
        (apply str (for [{n :name :keys [where whose]} ambiguous]
                     (str "\n\n`" n "` is defined by " where " and by " target
                          ", so a law cannot tell which one it means."
@@ -2515,11 +2835,18 @@
               "\n  Its states are types, refinements most often; each edge is a fn, proved to take"
               "\n  its state into one of the states it names. A transition table can be a"
               "\n  `machine` instead."))
-       (apply str (for [{g :graph :keys [errors rules]} graphs]
+       (apply str (for [{g :graph :keys [errors rules runs-failed]} graphs]
                     (str (apply str (map #(str "\n\n" %) errors))
                          (when (seq rules)
                            (str "\n\ngraph `" g "` breaks its own rules"
-                                (apply str (map #(str "\n  " %) rules)))))))
+                                (apply str (map #(str "\n  " %) rules))))
+                         (when (seq runs-failed)
+                           (str "\n\ngraph `" g "` breaks on its runs"
+                                (apply str (for [rf runs-failed]
+                                             (str "\n  " (:reason rf)
+                                                  (when (:path rf)
+                                                    (str "\n    walked " (str/join " -> " (map pr-str (:path rf)))))
+                                                  "\n    (replay with {:seed " (:seed rf) "})"))))))))
        (apply str (for [{m :machine st :status :keys [shown errors step]} machines
                         :when (= :failed st)]
                     (str (when (seq shown)
@@ -2986,6 +3313,12 @@
                                           (seq (:lemmas pr)) (assoc :lemmas (:lemmas pr))))
                               (conj lemmas {:name (:law r) :prop (:prop r)})]
 
+                             ;; a law whose hypothesis never held is true of
+                             ;; every input, and tested nothing: the failure
+                             ;; stands, and it is no refutation of the proof
+                             (and (:proved pr) (:no-hypothesis r))
+                             [(conj out r) lemmas]
+
                              (and (:proved pr) (not (thrown? r)))
                              [(conj out (assoc r :prover-bug true :proof (:summary pr))) lemmas]
 
@@ -3072,6 +3405,299 @@
                  (when-let [p (:ns (::proof e))]
                    (by (str "the proof namespace " p) "the proof namespace's" (keys (proof-own p))))))))
 
+;; --- obligations and records ------------------------------------------------------
+
+;; --- laws that contradict ---------------------------------------------------------
+
+(defn- calls-of
+  "The distinct calls in form to fns in the set fs."
+  [form fs]
+  (set (filter #(and (seq? %) (contains? fs (first %))) (tree-seq coll? seq form))))
+
+(defn- has-term? [form t] (some #(= t %) (tree-seq coll? seq form)))
+
+(defn- ->formula
+  "form as a writ.solve formula (or term, with `term?`) over the variable
+  y standing for the call c: each part without c is evaluated by ev, so
+  what is left is linear arithmetic and logic around c.  nil when some
+  part is outside that."
+  [form c ev term?]
+  (letfn [(t [f]
+            (cond
+              (= f c) 'y
+              (not (has-term? f c)) (let [v (ev f)] (when (int? v) v))
+              (and (seq? f) (symbol? (first f)))
+              (let [[op & xs] f, ts (map t xs), all? (every? some? ts)]
+                (case (name (first f))
+                  "+" (when all? (into [:+] ts))
+                  "-" (when all? (if (next ts) (into [:-] ts) [:neg (first ts)]))
+                  "inc" (when all? [:+ (first ts) 1])
+                  "dec" (when all? [:- (first ts) 1])
+                  "*" (when (and all? (= 2 (count ts)))
+                        (let [[a b] ts]
+                          (cond (int? a) [:* a b] (int? b) [:* b a])))
+                  nil))
+              :else nil))
+          (p [f]
+            (cond
+              (not (has-term? f c)) (boolean (ev f))
+              (and (seq? f) (symbol? (first f)))
+              (let [op (name (first f)), xs (rest f)]
+                (case op
+                  ("and" "or") (let [ps (map p xs)] (when (every? some? ps) (into [(keyword op)] ps)))
+                  "not" (when-let [q (p (first xs))] [:not q])
+                  "=>" (let [[a b] (map p xs)] (when (and (some? a) (some? b)) [:=> a b]))
+                  ("=" "<" "<=" ">" ">=" "not=")
+                  (let [ts (map t xs)]
+                    (when (and (every? some? ts) (< 1 (count ts)))
+                      (if (= "not=" op) [:not (into [:=] ts)] (into [(keyword op)] ts))))
+                  nil))
+              :else nil))]
+    (if term? (t form) (p form))))
+
+(defn- contradictions
+  "Pairs of laws no code could satisfy together.  For a failing law and
+  another law about the same fn, each saying what one call of it returns,
+  the call is replaced by an unknown result at generated inputs, every
+  other part evaluated, and the solver asked whether any result meets
+  both.  A pair is reported only with the solver's certificate that none
+  does, checked, so it is never a guess from samples."
+  [laws results signed ev gen-of rets seed]
+  (let [status (into {} (map (juxt :law :status)) results)
+        shape (fn [{:keys [name prop]}]
+                (let [[bs body] (leading-foralls (desugar prop))
+                      cs (calls-of body signed)]
+                  (when (and (seq bs) (= 1 (count cs))
+                             (= 1 (count (set (map first cs)))))
+                    {:name name :binders bs :body body :call (first cs)})))
+        shapes (keep shape laws)
+        order (into {} (map-indexed (fn [i l] [(:name l) i])) laws)
+        pairs (for [a shapes :when (= :failed (status (:name a)))
+                    b shapes :when (and (not= (:name a) (:name b))
+                                        (= (first (:call a)) (first (:call b))))
+                    :let [bargs (rest (:call b)) bvars (set (map first (:binders b)))]
+                    :when (and (= (count bargs) (count (rest (:call a))))
+                               (every? bvars bargs) (apply distinct? bargs)
+                               (= bvars (set bargs)))]
+                [a b])
+        at-value (fn [form bs vals] (reduce (fn [f [[x] v]] (subst-var f x (list 'quote v)))
+                                            form (map vector bs vals)))
+        found (for [[a b] pairs
+                    :let [f (first (:call a))
+                          ret (get rets f)]
+                    :when (contains? '#{Int Nat} ret)
+                    i (range 30)
+                    :let [vals (mapv (fn [[_ t] j] (gen/generate (gen-of t) (min 30 (* 2 i)) (+ seed (* 97 i) j)))
+                                     (:binders a) (range))
+                          argv (try (mapv ev (rest (at-value (:call a) (:binders a) vals)))
+                                    (catch Throwable _ nil))]
+                    :when argv
+                    ;; one call, f of the argument values, stands in both laws
+                    :let [c (apply list f (map #(list 'quote %) argv))
+                          body-a (walk/prewalk-replace {(at-value (:call a) (:binders a) vals) c}
+                                                       (at-value (:body a) (:binders a) vals))
+                          body-b (at-value (:body b) (map vector (rest (:call b))) argv)
+                          safe-ev #(try (ev %) (catch Throwable _ ::none))
+                          fa (->formula body-a c safe-ev false)
+                          fb (->formula body-b c safe-ev false)]
+                    :when (and (some? fa) (some? fb))
+                    :let [form [:and fa fb (if (= 'Nat ret) [:>= 'y 0] true)]
+                          res (try (solve/check form {'y :int} {:budget 2000}) (catch Throwable _ nil))]
+                    :when (and (= :unsat (:result res))
+                               (try (solve/verify form {'y :int} (:certificate res)) (catch Throwable _ false)))]
+                {:laws (mapv :name (sort-by #(order (:name %)) [a b]))
+                 :at (zipmap (map first (:binders a)) vals)
+                 :failing (:name a)
+                 :call (:call a)})]
+    (vec (vals (reduce (fn [m c] (if (contains? m (:laws c)) m (assoc m (:laws c) c))) (sorted-map) found)))))
+
+
+(defn- names-in [form]
+  (set (filter symbol? (tree-seq coll? seq form))))
+
+(defn- obligations*
+  "Every obligation of a registry entry, each {:id :kind :of :fns :text},
+  and :law for one a law of the check decides."
+  [e]
+  (let [refs (refines-of e)
+        signed (set (keys (:anns e)))
+        fns-of (fn [form] (into (sorted-set) (filter signed) (names-in form)))
+        glaws (mapcat #(graph-obligations % refs (:invariants e)) (:graphs e))
+        law-oids (set (keep :oid glaws))]
+    (vec (concat
+           (for [{:keys [name prop]} (:laws e)]
+             {:id (str "law." name) :kind :law :of name :law name :fns (fns-of prop) :text (pr-str prop)})
+           (for [[f sig] (sort-by (comp str key) (:anns e))]
+             {:id (str "signature." f) :kind :signature :of f :fns #{f} :text (sig-str sig)})
+           (for [[gname m :as g] (:graphs e)
+                 o (concat
+                     (for [{:keys [name oid prop explain]} (graph-obligations g refs (:invariants e))]
+                       {:id oid :kind (keyword (first (str/split oid #"\."))) :of gname :law name
+                        :fns (fns-of prop) :text explain})
+                     ;; an edge into plain types has no law: it is data flow, checked
+                     ;; against the signatures
+                     (for [{:keys [from f]} (graph-edges g)
+                           :let [id (str "edge." gname "." (name from) "." f)]
+                           :when (not (contains? law-oids id))]
+                       {:id id :kind :edge :of gname :fns (fns-of [f])
+                        :text (str "a " f " from " (name from) " gives a value of its targets' type")})
+                     (when (:start m)
+                       [{:id (str "reach." gname) :kind :reach :of gname :fns #{}
+                         :text "every state is reached from the start"}])
+                     (when (vector? (:start m))
+                       [{:id (str "start." gname) :kind :start :of gname :fns #{}
+                         :text (str "the start " (pr-str (second (:start m))) " is in " (pr-str (first (:start m))))}])
+                     (when (and (:start m) (seq (:final m)))
+                       [{:id (str "final." gname) :kind :final :of gname :fns #{}
+                         :text (str "a final state (" (str/join ", " (map pr-str (:final m)))
+                                    ") is reached from every state, and every state it leaves is left")}])
+                     (for [[a b] (:never m)]
+                       {:id (str "never." gname "." (name a) "." (name b)) :kind :never :of gname :fns #{}
+                        :text (str (pr-str a) " never leads to " (pr-str b))})
+                     (for [[a b] (:before m)]
+                       {:id (str "before." gname "." (name a) "." (name b)) :kind :before :of gname :fns #{}
+                        :text (str (pr-str b) " is reached only through " (pr-str a))})
+                     (for [[g' st _ pred] (:invariants e) :when (= g' gname)]
+                       {:id (str "invariant." gname "." (name st)) :kind :invariant :of gname
+                        :fns #{} :text (pr-str pred)})
+                     (when (:runs m)
+                       [{:id (str "runs." gname) :kind :runs :of gname
+                         :fns (into (sorted-set) (map :f (graph-edges g)))
+                         :text (str (:runs m) " runs from the start keep to the graph and reach every final state")}]))]
+             o)
+           (for [f (distinct (map first (:flows e)))]
+             {:id (str "flow." f) :kind :flow :of f :fns #{f} :text (str "the path data takes through " f)})
+           (for [[f gs] (:calls e)]
+             {:id (str "calls." f) :kind :calls :of f :fns #{f} :text (pr-str gs)})
+           (for [[mname m] (:machines e)]
+             {:id (str "machine." mname) :kind :machine :of mname :fns #{(:step m)}
+              :text (str (:step m) " steps by the table")})
+           (for [{:keys [id text blocking]} (:questions e)]
+             {:id (str "question." id) :kind :question :of id :fns #{} :text text :blocking blocking})))))
+
+(defn obligations
+  "Every obligation the spec sets, from the spec alone, as data an agent
+  can track: [{:id :kind :of :fns :text} ...].  An id reads kind.subject:
+  law.name, signature.f, edge.graph.state.f, step.graph.state.f.target,
+  guard.graph.state.f (and .n for each clause), refused.graph.state.f,
+  invariant.graph.state, reach.graph, start.graph, final.graph,
+  never.graph.a.b, before.graph.a.b, runs.graph, flow.f, calls.f,
+  machine.m, question.q.  :fns are the signed fns it names.  The target
+  need not exist."
+  [spec-ns]
+  (require spec-ns)
+  (obligations* (or (get @registry spec-ns) (fail! "`" spec-ns "` is not a spec namespace"))))
+
+(defn- obligation-status
+  "What a check's report says of each obligation: :met, :failed,
+  :unproved (it needs proof, and is only tested) or, for a question,
+  :open or :blocking."
+  [os {:keys [laws static graphs flows calls machines]}]
+  (let [by-law (into {} (map (juxt :law :status)) laws)
+        graph-ok (into {} (map (juxt :graph #(= :ok (:status %)))) graphs)
+        ok-of (fn [rs k] (into {} (map (juxt k #(= :ok (:status %)))) rs))
+        flow-ok (ok-of flows :fn) call-ok (ok-of calls :fn) machine-ok (ok-of machines :machine)
+        met #(if % :met :failed)]
+    (vec (for [{:keys [id kind of law blocking]} os]
+           (cond-> {:id id
+                    :status (cond
+                              law (case (get by-law law)
+                                    (:proved :tested :evaluated :witnessed) :met
+                                    :unproved :unproved
+                                    :failed)
+                              (= :question kind) (if blocking :blocking :open)
+                              (= :signature kind) (met (:ok static))
+                              (= :flow kind) (met (get flow-ok of))
+                              (= :calls kind) (met (get call-ok of))
+                              (= :machine kind) (met (get machine-ok of))
+                              :else (met (get graph-ok of)))}
+                   law (assoc :law law))))))
+
+(defn- source-hash [ns-sym]
+  (try (hash/sha256 (slurp (source-url ns-sym))) (catch Throwable _ nil)))
+
+(defn- record-of
+  "What a check found, as the record `attest` compares: the sources by
+  their hashes, each law as written with the evidence it needs and got,
+  each question and each obligation's status.  Nothing that varies from
+  run to run with the same seed, such as the proof cache, is in it."
+  [e spec-ns laws r level]
+  (let [written (into {} (map (juxt :name :prop)) laws)]
+    {:spec spec-ns
+     :target (:target e)
+     :ok (:ok r)
+     :hashes (cond-> {:spec (source-hash spec-ns) :target (source-hash (:target e))}
+               (:ns (::proof e)) (assoc :proof (source-hash (:ns (::proof e)))))
+     :laws (vec (for [{:keys [law status evidence because] :as res} (:laws r)]
+                  (cond-> {:law law :prop (get written law) :status status
+                           :require (or (:require res) level)}
+                    evidence (assoc :evidence evidence)
+                    because (assoc :because because))))
+     :questions (mapv #(select-keys % [:id :text :blocking]) (:questions r))
+     :obligations (:obligations r)}))
+
+(declare check)
+
+(defn- as-record
+  "A record from what `attest` is given: a record, a path to one, or a
+  spec namespace, checked afresh so its record says what is true now."
+  [x]
+  (cond
+    (map? x) x
+    (string? x) (edn/read-string (slurp x))
+    ;; a check that stops at its static rules checks no law
+    (symbol? x) (or (::record (check x {}))
+                    {:spec x :ok false :laws [] :questions [] :obligations []})
+    :else (fail! "`attest` compares records: a record, a path to one, or a spec namespace, had "
+                 (pr-str x))))
+
+(defn attest
+  "Compare an earlier record of a spec with a later one: {:ok :weakened
+  [...]}.  Each argument is a record, a path to one (as check :record
+  writes it) or a spec namespace, checked afresh -- never a report taken
+  on trust.  The later spec is weaker when a law is gone (:removed) or
+  written differently (:restated), needs less evidence than it did
+  (:require-lowered) or has less (:evidence-dropped), when another
+  obligation is gone, when a blocking question stopped being one
+  (:no-longer-blocking), or when what passed then fails now
+  (:claimed-pass).  Changing the code is not weakening the spec; a
+  restated law the spec's owner agreed to is accepted by taking a new
+  record."
+  [old new]
+  (let [old (as-record old)
+        new (as-record new)
+        rank {:proved 2 :tested 1}
+        ev-rank {:proof 2 :test 1}
+        now (into {} (map (juxt :law identity)) (:laws new))
+        law-ids (set (map #(str "law." (:law %)) (concat (:laws old) (:laws new))))
+        weakened
+        (vec (concat
+               (when (and (:ok old) (not (:ok new)))
+                 [{:what :claimed-pass
+                   :why "the earlier record passed, but the check fails now"}])
+               (for [{:keys [law prop require evidence]} (:laws old)
+                     :let [n (get now law)
+                           what (cond
+                                  (nil? n) :removed
+                                  (not= prop (:prop n)) :restated
+                                  (< (rank (:require n) 0) (rank require 0)) :require-lowered
+                                  (< (ev-rank (:evidence n) 0) (ev-rank evidence 0)) :evidence-dropped)]
+                     :when what]
+                 (cond-> {:law law :what what}
+                   (= :restated what) (assoc :was prop :now (:prop n))))
+               (let [ids (set (map :id (:obligations new)))]
+                 (for [{:keys [id law]} (:obligations old)
+                       :when (and (not (contains? ids id)) (not (contains? law-ids id))
+                                  ;; a law's own obligation is reported as the law
+                                  (not law)
+                                  (not (str/starts-with? id "question.")))]
+                   {:obligation id :what :removed}))
+               (let [now-blocking (into {} (map (juxt :id :blocking)) (:questions new))]
+                 (for [{:keys [id blocking]} (:questions old)
+                       :when (and blocking (false? (get now-blocking id)))]
+                   {:question id :what :no-longer-blocking}))))]
+    {:ok (empty? weakened) :weakened weakened}))
+
 (defn check
   "Check a spec namespace against its target (or opts :target).  Returns a
   report map; :ok says whether everything held and :message explains any
@@ -3088,6 +3714,8 @@
   goals a tested law's proof got stuck on)."
   ([spec-ns] (check spec-ns {}))
   ([spec-ns opts]
+   (when (and (contains? opts :record) (not (string? (:record opts))))
+     (fail! "`check` :record is a path to write the report to, had: " (pr-str (:record opts))))
    (let [{:keys [trials seed max-size] :or {trials 100 max-size 50}} opts
          e (entry spec-ns (:target opts) (:proof opts))
          {:keys [target anns data laws]} e
@@ -3109,7 +3737,7 @@
        (let [refs (refines-of e)
              tenv (type-env-of e spec-ns)
              data-tenv (tenv-of data)
-             laws (into (vec laws) (mapcat #(graph-obligations % refs) (:graphs e)))
+             laws (into (vec laws) (mapcat #(graph-obligations % refs (:invariants e)) (:graphs e)))
              publics (set (keys (ns-publics (the-ns target))))
              interns (set (keys (ns-interns (the-ns spec-ns))))
              proof-own* (proof-own (:ns proof-e))
@@ -3123,7 +3751,7 @@
              ;; caller's own instrument stays in place
              wrapped (wrap! e)
              results (try
-                       (vec (for [{:keys [name prop explain graph total lemma step-of witness]} laws
+                       (vec (for [{:keys [name prop explain graph total lemma step-of witness guard-law]} laws
                                   :let [p (desugar prop)]]
                               (try
                                 (lw/check-prop-shape! p)
@@ -3132,11 +3760,13 @@
                                   ;; a lemma is proof, not contract: one about
                                   ;; clojure.core alone is a fact the proof uses
                                   (cond
-                                    (and (not lemma) (not (calls-target? qp target)))
+                                    ;; a guard's own laws are about the spec's
+                                    ;; test, not the code: that some value passes it
+                                    (and (not lemma) (not guard-law) (not (calls-target? qp target)))
                                     {:law name :status :vacuous
                                      :why (str "it calls no fn of " target)}
 
-                                    (and (not lemma) (try-prove p data-tenv opaque numeric-fns))
+                                    (and (not lemma) (not guard-law) (try-prove p data-tenv opaque numeric-fns))
                                     {:law name :status :vacuous
                                      :why (str "writ.norm proves it without looking at the "
                                                "implementation, so any code satisfies it")}
@@ -3148,6 +3778,7 @@
                                       explain (assoc :explain explain)
                                       graph (assoc :graph graph)
                                       step-of (assoc :step-of step-of)
+                                      guard-law (assoc :guard-law true)
                                       total (assoc :total true)
                                       lemma (assoc :lemma true))))
                                 ;; a law that cannot be run (a malformed
@@ -3202,6 +3833,17 @@
                                      :when (and (:prop r) (= :proved (:status r)) (not (:lemma r)))]
                                  {:name (symbol (str spec-ns) (str (:law r)))
                                   :prop (erase-law (:prop r) refs spec-ns)}))
+             contras (when (some #(= :failed (:status %)) results)
+                       (let [signed (set (map #(symbol (name target) (name %)) (keys anns)))]
+                         (contradictions
+                           (for [r results :when (and (:prop r) (not (:lemma r)))]
+                             {:name (:law r) :prop (:prop r)})
+                           results signed
+                           #(binding [*ns* (the-ns spec-ns)] (eval %))
+                           #(type->gen % (:tenv ctx))
+                           (into {} (for [[f sig] anns]
+                                      [(symbol (name target) (name f)) (plain (:ret sig))]))
+                           (or seed 0))))
              ;; whether each law is about every input, read before :prop goes
              results (mapv #(cond-> (dissoc % :prop) (head? (:prop %) "forall") (assoc ::general true))
                            (remove :lemma results))
@@ -3211,31 +3853,65 @@
              flow-results (check-flows e target-forms forms-of)
              machine-results (mapv #(check-machine % e target) (:machines e))
              graph-results (mapv (fn [g]
-                                   (let [errs (vec (concat (graph-flow-errors g anns refs)
-                                                           (graph-start-errors
-                                                             g spec-ns tenv
-                                                             #(qualify % #{} publics interns target spec-ns))))
+                                   (let [q #(qualify % #{} publics interns target spec-ns)
+                                         errs (vec (concat (graph-flow-errors g anns refs)
+                                                           (graph-start-errors g spec-ns tenv q (:invariants e))
+                                                           (invariant-errors g (:invariants e))
+                                                           (vacuous-invariants g (:invariants e) refs data-tenv)))
                                          rules (graph-rule-errors g)
+                                         run-seed (or seed (rand-int 1000000))
+                                         walked (graph-runs g spec-ns tenv (:invariants e) q run-seed)
+                                         reached (let [[_ gm] g
+                                                       st (:start gm)
+                                                       start (if (vector? st) (first st) st)
+                                                       es (for [{:keys [from key tos]} (graph-edges g), t tos]
+                                                            [from key t])]
+                                                   (when start (reachable es start)))
+                                         run-errs (vec (concat
+                                                         (map #(assoc % :seed run-seed) (:failures walked))
+                                                         (when (and walked (empty? (:failures walked))
+                                                                    (seq (:visited walked)))
+                                                           (for [f (:final (second g))
+                                                                 :when (and (contains? reached f)
+                                                                            (not (contains? (:visited walked) f)))]
+                                                             {:seed run-seed
+                                                              :reason (str "no run of " (:runs (second g)) " reached "
+                                                                           (pr-str f) " in " (or (:depth (second g)) default-depth)
+                                                                           " steps; a run from the start should reach every"
+                                                                           " final state, so walk more runs, or longer ones (:depth)")}))))
                                          obls (filter #(= (first g) (:graph %)) results)]
-                                     (cond-> {:graph (first g) :states (count (:states (second g)))
-                                              :edges (count (graph-edges g))
-                                              :status (if (and (empty? errs) (empty? rules)) :ok :failed)
+                                     (let [ok? (and (empty? errs) (empty? rules) (empty? run-errs))]
+                                       (cond-> {:graph (first g) :states (count (:states (second g)))
+                                                :edges (count (graph-edges g))
+                                                :status (if ok? :ok :failed)
                                               ::obligations (count obls)
-                                              ::steps (count (filter #(and (= (first g) (:step-of %))
+                                              ::steps (count (filter #(and (= (first g) (:step-of %)) (not (:guard-law %))
                                                                            (= :witnessed (:status %)))
                                                                      results))
                                               ::unproved (count (remove #(= :proof (:evidence %)) obls))}
-                                       (seq errs) (assoc :errors errs)
-                                       (seq rules) (assoc :rules rules))))
+                                                (and ok? (:runs (second g))) (assoc :runs (:runs (second g)))
+                                                (and ok? (some #(= (first g) (first %)) (:invariants e)))
+                                                (assoc ::held (vec (distinct (for [[g' st] (:invariants e)
+                                                                                   :when (= g' (first g))] st))))
+                                                (seq errs) (assoc :errors errs)
+                                                (seq rules) (assoc :rules rules)
+                                                (seq run-errs) (assoc :runs-failed run-errs)))))
                                  (:graphs e))
              graphless (and (empty? (:graphs e)) (empty? (:machines e)))
+             problems (vec (for [[g st] (:invariants e)
+                                 :when (not-any? #(= g (first %)) (:graphs e))]
+                             (str "invariant `" g " " st "` names a graph the spec does not have")))
              r (assoc base :laws results :gaps gaps :calls call-results :flows flow-results
                            :uses (:report imports)
                            ;; the proved laws, erased and qualified, for a spec that uses this one
                            ::proved-props proved-props
                            :lemmas lemma-results
                            :graph-missing graphless
-                           :graphs (mapv #(dissoc % ::unproved ::obligations ::steps) graph-results)
+                           :problems problems
+                           :contradictions (mapv #(dissoc % :call) contras)
+                           ::contradictions contras
+                           :questions (vec (:questions e))
+                           :graphs (mapv #(dissoc % ::unproved ::obligations ::steps ::held :runs-failed) graph-results)
                            :proof (proof-coverage results level)
                            :machines (mapv #(dissoc % :shown :step) machine-results)
                            :rejected (mapv #(select-keys % [:fn :laws :rejected]) per-fn)
@@ -3248,11 +3924,16 @@
                                     (every? #(= :ok (:status %)) flow-results)
                                     (every? #(= :ok (:status %)) machine-results)
                                     (every? #(= :ok (:status %)) graph-results)
-                                    (not graphless)))]
-         (assoc r :message (format-report (assoc r :machines machine-results
-                                                   :graphs graph-results
-                                                   ::explain (:explain opts)))))))))
-
+                                    (empty? problems)
+                                    (not-any? :blocking (:questions e))
+                                    (not graphless)))
+                 r (assoc r :obligations (obligation-status (obligations* e) r))
+                 r (assoc r ::record (record-of e spec-ns laws r level))]
+         (do (when-let [path (:record opts)]
+               (spit path (pr-str (::record r))))
+             (assoc r :message (format-report (assoc r :machines machine-results
+                                                     :graphs graph-results
+                                                     ::explain (:explain opts))))))))))
 (defn check!
   "`check`, throwing with the report's message when anything fails."
   ([spec-ns] (check! spec-ns {}))
