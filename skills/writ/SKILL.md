@@ -3,7 +3,8 @@ name: writ
 description: >-
   Use when writing a writ spec -- the problem statement as a state graph
   and checkable laws about what code means and how it calls (writ.spec:
-  spec/graph/refine/ann/data/law/calls/flow/machine/plan) -- or its proof namespace
+  spec/graph/refine/invariant/question/ann/data/law/calls/flow/machine/plan/
+  obligations/attest) -- or its proof namespace
   (proof-of/lemma/hint), or the plain Clojure implementation it
   constrains, or when reading a writ.spec report or any
   "Writ:" error (purity, termination, ordering, arity, types, tagged data,
@@ -27,7 +28,10 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
 - The spec (`spec`, `ann`, `data`, `law`) is the contract. A person or an
   agent may write it; once written, it is the contract. Do not weaken a
   law, loosen an `ann`, lower a `:require`, or delete any of them to get a
-  check to pass. If the spec looks wrong, say so and ask.
+  check to pass. If the spec looks wrong, say so and ask. Do not answer or
+  downgrade a blocking `question` yourself. `(spec/attest record 'my.spec)`
+  compares a recorded check with the spec now and names every way it got
+  weaker.
 - The implementation is yours. Change it until `check` reports `:ok`.
 - If you are asked to write the spec, write the intent: see
   [What a spec should say](#what-a-spec-should-say).
@@ -46,7 +50,9 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
 4. The wiring: `flow` for the path data takes through each fn that
    composes steps, `calls` for the layers it must (or must not) reach.
    See [Flows](#flows) and [The call graph](#the-call-graph).
-5. Laws for what each step means.
+5. Laws for what each step means. Record anything the problem statement
+   leaves open as `(question id "...")`; add `{:blocking true}` when the
+   next piece of work depends on the answer. Never invent the answer.
 6. Show the plan: `(spec/plan 'my.spec)` prints states, steps, signatures,
    laws and wiring from the spec alone. When a person asked for the
    feature, show it to them and have them confirm it before writing code.
@@ -106,7 +112,24 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
 - `:start`, `:final`, `:never`, `:before` are rules of the graph itself.
   With every edge proved, `:never` and `:before` hold for every run of the
   code. Reachability and `:final` say each step can happen, not that a
-  run from the start gets there.
+  run from the start gets there. A state reached from the start with no
+  edges out must be listed in `:final`.
+- `(invariant g :state [v] pred)`: what every value of the state holds,
+  whichever edge it came by. Each edge landing there carries it, and a
+  `[state value]` start must satisfy it. One the refinement already
+  implies is vacuous and fails.
+- A guarded edge: `{[withdraw Nat] {:to #{:open} :when (fn [a amt] (<= amt
+  (second a))) :else :keep}}`. The `:when` fn takes the edge fn's own
+  arguments, in the fn's order. The edge law and steps hold under the
+  test; `g:s:f:refused` says a refused step keeps the state (`:keep`, the
+  default) or lands in the `:else` state; `g:s:f:when` says some value
+  passes the guard; for an `and` test, `g:s:f:when.N` says clause N fails
+  while the others hold. Guard what the problem refuses, rather than
+  folding the refusal into the targets.
+- `:runs N` (with `:depth D`, default 20) walks N seeded runs from a
+  `[state value]` start through the real fns: every landing must be in an
+  allowed state and hold its invariants, and every final state the graph
+  reaches must be reached by some run.
 
 ## A spec
 
@@ -413,6 +436,9 @@ value anywhere else is rejected.
 (spec/plan 'my.spec)                              ; the plan, for a person to confirm
 (spec/flow-facts 'my.ns 'f)                       ; what `flow` reads from f
 (spec/instrument 'my.sort-spec)                   ; runtime arg/return checks
+(spec/obligations 'my.spec)                       ; every obligation, with ids, from the spec alone
+(spec/check 'my.spec {:record "rec.edn"})         ; write a record of the check
+(spec/attest "rec.edn" 'my.spec)                  ; how the spec got weaker since the record
 ```
 
 `(spec my.sort)` defines `writ-check`, a clojure.test test that runs the
@@ -553,6 +579,23 @@ confirm it, then without one.
 - ``cannot find the source of `ns` on the classpath`` - the target file is
   not under a source path.
 - ``is not a spec namespace`` - the namespace has no `(spec target)` form.
+
+- ``graph `g` breaks on its runs`` - a run from the start, through the
+  real fns, left the graph, broke an invariant, or never reached a final
+  state. The path and seed replay it. Fix the code at that value; if no
+  run reaches a final state only because runs are short, raise `:depth`.
+- ``invariant `g :s` is vacuous`` - the state's refinement already says
+  it; state what a landing must keep that the type does not.
+- ``law `g:s:f:refused` fails`` - where the guard fails, the code changed
+  the state; a refused step must leave it as it was (or go to `:else`).
+- ``the guard of f from s never holds`` / ``clause ... never fails on its
+  own`` - the guard is wrong or has a clause that says nothing; that is
+  the spec's owner's to fix.
+- ``the spec is not finished: open question `q` blocks ...`` - ask the
+  spec's owner; write the answer in as laws or states, then remove the
+  question.
+- ``laws `a` and `b` cannot both hold`` - no code satisfies both; the
+  solver shows it. Do not change the code: ask which law is meant.
 
 - ``writ bug: law `x` was proved (...) but a test refutes it`` - the
   prover is wrong, not your code. Report it with the seed, and rerun with

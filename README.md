@@ -556,6 +556,69 @@ has. Reachability and `:final` are about the steps, each of which some
 value of its state takes; they do not promise that a run from the start
 gets there.
 
+A state that is reached from the start and has no edges out must be
+`:final`: absence of a way out is not the same as an end, so the graph
+says which states a run may stop in. When a state reached from the start
+can reach no final state, the report shows the loop that keeps it there:
+
+```
+graph `spin` breaks its own rules
+  from :a no final state can be reached: it loops :a -> :b -> :a
+```
+
+**Invariants.** `(invariant g state [v] pred)` says what always holds of
+a state's values, whichever edge they came in by. Every edge that may
+land in the state carries the predicate in its law, so a landing in
+`:hot` must be a `Hot` and hold it too, and a `[state value]` start must
+satisfy it. An invariant the state's own refinement already implies is
+vacuous and fails, as a vacuous law does: say what a landing must keep
+that the type does not.
+
+```clojure
+(invariant gauge :hot [g] (even? (second g)))
+```
+
+**Guards.** An edge can be taken only under a test. Its value is then a
+map: `:to` the targets, `:when` a `(fn [state arg ...] test)` taking the
+fn's own arguments in the fn's order, and `:else` what the step does when
+the test fails, `:keep` (the default) to leave the state as it was, or a
+state to land in:
+
+```clojure
+(graph account
+  {:start  [:open [:Open 10]]
+   :states {:open Open, :closed Closed}
+   :edges  {:open {[withdraw Nat] {:to #{:open} :when (fn [a amt] (<= amt (second a)))}
+                   [close] #{:closed}}}
+   :final  [:closed]})
+```
+
+The edge law, `account:open:withdraw`, holds under the test, and so do
+its steps. Three more laws come with the guard.
+`account:open:withdraw:refused` says a refused withdrawal leaves the
+account as it was: code that empties the account instead fails it.
+`account:open:withdraw:when` says some value passes the test, since a
+guard that never holds means the step can never be taken. And for a test
+that is an `and`, `:when.1`, `:when.2`, ... say each clause fails while
+the others hold. A clause that never fails on its own rules out nothing
+the others do not: `(<= 0 amt)` on a `Nat` amount is such a clause.
+
+**Runs.** `:runs N` walks N runs through the real fns from a `[state
+value]` start, up to `:depth` steps each (default 20). At each step it
+takes an edge chosen by the seed, with generated arguments. Each landing
+must be in a state the edge allows (for a refused step, the state it
+stays in or its `:else`) and hold that state's invariants, and every
+final state reached by the graph must be reached by some run. A run finds
+what sampling each state apart can miss, a value only a long climb from
+the start produces:
+
+```
+graph `counter` breaks on its runs
+  a step takes [:High 95] to [:High 96], which is in none of :high
+    walked :low -> :low -> ... -> :high
+    (replay with {:seed 42})
+```
+
 States must say what sets them apart. Two states of the same plain type,
 like `:unsorted (List Nat)` and `:sorted (List Nat)`, fail the check: a
 value of one is a value of the other, so an edge between them checks the
@@ -1183,6 +1246,58 @@ fns
 
 `(spec/mermaid 'my.spec {:graph 'g})` draws graph `g` as a mermaid
 `stateDiagram-v2`.
+
+### Open questions
+
+`(question id "text")` records a question the spec does not answer yet.
+Every report lists the open questions, and `plan` shows them, since a
+spec with one is not finished. `(question id "text" {:blocking true})` is
+one the next piece of work depends on: the check fails until the answer
+is written into the spec and the question removed.
+
+### Obligations and records
+
+`(spec/obligations 'my.spec)` lists everything the spec obliges, from the
+spec alone, as data an agent can keep track of: each law, signature, edge,
+step, guard and refusal, invariant, graph rule, run, flow, call set,
+machine and question, with an id (`law.permutation`,
+`edge.account.open.withdraw`, `guard.account.open.withdraw.2`,
+`invariant.gauge.hot`, `final.account`), its kind and the signed fns it
+names. A check's report has `:obligations`, each id with its status:
+`:met`, `:failed`, `:unproved`, or `:open`/`:blocking` for a question.
+
+`(spec/check 'my.spec {:record "path"})` writes a record of the check:
+the spec, target and proof sources by SHA-256, each law as written with
+the evidence it needs and got, the questions and each obligation's status.
+Checks with the same seed write the same record. `(spec/attest old new)`
+compares two records. Each side is a record, a path to one, or a spec
+namespace, which is checked afresh rather than trusted. It reports each
+way the later spec is weaker: a law removed or restated, its requirement
+lowered (`:proved` to `:tested`), its evidence dropped (proved, now only
+tested), another obligation gone, a blocking question no longer blocking,
+or a check that passed and now fails.
+
+```clojure
+(spec/attest "spec-record.edn" 'my.spec)
+;; => {:ok false :weakened [{:law sorted :what :require-lowered}]}
+```
+
+Changing the code never weakens the spec; a restated law its owner agreed
+to is accepted by writing a new record.
+
+### Laws that contradict
+
+When a law fails, writ looks for another law about the same fn that no
+code could satisfy along with it. At generated inputs it replaces the
+fn's call by an unknown result, evaluates the rest of both laws, and asks
+the solver whether any result meets both. It reports a pair only with the
+solver's certificate that none does, checked, so the report is never a
+guess from samples:
+
+```
+laws `rises` and `falls` cannot both hold: at x = 0, no value of (flip x) meets both, ...
+  Fixing the code cannot help; the spec's owner must say which law is meant.
+```
 
 ## What the static check enforces
 
