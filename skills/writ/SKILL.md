@@ -155,6 +155,10 @@ failures: a law over every input may already answer one.
   passes the guard; for an `and` test, `g:s:f:when.N` says clause N fails
   while the others hold. Guard what the problem refuses, rather than
   folding the refusal into the targets.
+- Who may act: `:actors {:type User :role :role}` on the graph names the
+  argument that acts and the key holding its role, and `:by #{:owner}` on
+  an edge the roles that may take it. It is a guard, so a step by anyone
+  else must be refused and keep the state; `plan` lists who may do what.
 - A frame, on a record state: `{[award Nat] {:to #{:active} :changes
   [:points]}}`. `g:s:f:frame` says the step changes only those keys and
   keeps every other one, named by the record or not, as it was. It can go

@@ -412,7 +412,42 @@
   ([id text] (question* id text {}))
   ([id text opts] (question* id text opts)))
 
-(def ^:private graph-keys #{:states :edges :start :never :before :final :tested :witnesses :runs :depth})
+(def ^:private graph-keys #{:states :edges :start :never :before :final :tested :witnesses :runs :depth :actors})
+
+(defn- by->when
+  "A graph's edges with each :by, the roles that may take the step, made
+  a guard: the step is taken when the acting argument -- the one of the
+  graph's :actors type -- has one of the roles, and joined by `and` with
+  the edge's own :when.  Anyone else is refused, as by any guard."
+  [where {:keys [actors edges] :as m}]
+  (assoc m :edges
+         (into {} (for [[from es] edges]
+                    [from (into {} (for [[k tos] es]
+                                     [k (if-not (and (map? tos) (contains? tos :by))
+                                          tos
+                                          (let [edge (str where ": the edge " (pr-str from) " " (pr-str k))
+                                                by (:by tos)
+                                                _ (when-not (map? actors)
+                                                    (fail! edge ": :by needs the graph's :actors, {:type T :role :key},"
+                                                           " to know which argument acts"))
+                                                _ (when-not (and (set? by) (seq by))
+                                                    (fail! edge ": :by is a set of the roles that may take the step, had "
+                                                           (pr-str by)))
+                                                args (rest k)
+                                                order (if (some #{'_} args) (vec args) (into ['_] args))
+                                                i (first (keep-indexed #(when (= (:type actors) %2) %1) order))
+                                                _ (when-not i
+                                                    (fail! edge " takes no " (:type actors) ", so no one is there to act;"
+                                                           " give it one, or drop :by"))
+                                                ps (vec (for [j (range (count order))] (symbol (str "by%" j))))
+                                                who (nth ps i)
+                                                test (list 'contains? by (if (:role actors) (list 'get who (:role actors)) who))
+                                                w (:when tos)
+                                                body (if w
+                                                       (list 'and (list* 'let (vec (interleave (second w) ps)) [(nth w 2)]) test)
+                                                       test)]
+                                            (cond-> (assoc tos :when (list 'fn ps body))
+                                              w (assoc :own-when w))))]))]))))
 
 (def ^:private projections
   "clojure.core fns an edge may use to take a state out of a tuple state:
@@ -452,15 +487,28 @@
   state to an example: a value of from and the edge fn's other arguments
   that land in to.  The check tries it before any generated one, for a
   step no generated value takes -- one whose arguments must agree with
-  each other, as a reply must carry the alias its request made."
-  [nm m]
-  (let [where (str "`graph " nm "`")]
+  each other, as a reply must carry the alias its request made.
+
+  :actors {:type User :role :role} names the argument that acts, by its
+  type, and the key of it that holds its role; an edge's :by #{:owner}
+  then says which roles may take the step.  :by is a guard: anyone else
+  is refused, and the state stays as it was."
+  [nm m0]
+  (let [where (str "`graph " nm "`")
+        m (if (and (map? m0) (map? (:edges m0)) (every? map? (vals (:edges m0))))
+            (by->when where m0)
+            m0)]
     (when-not (simple-sym? nm)
       (fail! "a `graph` name must be a simple symbol: `" (pr-str nm) "`"))
     (when-not (and (map? m) (map? (:states m)) (map? (:edges m)))
       (fail! where " needs a map with :states (state -> type) and :edges"))
     (when-let [bad (seq (remove graph-keys (keys m)))]
       (fail! where " has unknown keys: " (pr-str bad) "; it takes " (pr-str (sort graph-keys))))
+    (when-let [a (:actors m)]
+      (when-not (and (map? a) (symbol? (:type a)) (every? #{:type :role} (keys a))
+                     (or (nil? (:role a)) (keyword? (:role a))))
+        (fail! where ": :actors is {:type T :role :key}: the type of the argument that acts, and the key"
+               " of it that holds the role (none when the value is the role), had " (pr-str a))))
     (when (and (contains? m :runs) (not (pos-int? (:runs m))))
       (fail! where ": :runs is how many runs to walk from :start, a positive integer, had "
              (pr-str (:runs m))))
@@ -498,8 +546,8 @@
             (let [edge (str where ": the edge " (pr-str from) " " (pr-str k))
                   {w :when el :else ch :changes} tos
                   n (inc (count (remove #{'_} (rest k))))]
-              (when-let [bad (seq (remove #{:to :when :else :changes} (keys tos)))]
-                (fail! edge " has unknown keys " (pr-str bad) "; an edge map takes :to, :when, :else and :changes"))
+              (when-let [bad (seq (remove #{:to :when :else :changes :by} (keys tos)))]
+                (fail! edge " has unknown keys " (pr-str bad) "; an edge map takes :to, :when, :else, :changes and :by"))
               (when (contains? tos :changes)
                 (when-not (and (vector? ch) (seq ch) (every? keyword? ch))
                   (fail! edge ": :changes is a vector of the keys the step may change, had " (pr-str ch))))
@@ -2099,7 +2147,8 @@
     (cond-> {:from from :f f :args (vec (remove #{'_} args)) :key k
              :pos (or (first (keep-indexed #(when (= '_ %2) %1) args)) 0)
              :tos (filterv (set tos) (keys (:states m)))}
-      (and (map? v) (:when v)) (assoc :guard (:when v) :else (or (:else v) :keep))
+      (and (map? v) (:when v)) (assoc :guard (:when v) :else (or (:else v) :keep)
+                                      :by (:by v) :own-when (:own-when v))
       (and (map? v) (:changes v)) (assoc :changes (:changes v)))))
 
 (defn- insert-at [v i x] (vec (concat (take i v) [x] (drop i v))))
@@ -2177,7 +2226,7 @@
   test that is an `and`, one per clause says it fails while the others
   hold, so each clause rules out something of its own."
   [[gname m :as g] refs invs]
-  (vec (for [{:keys [from f args tos pos guard else changes]} (graph-edges g)
+  (vec (for [{:keys [from f args tos pos guard else changes by]} (graph-edges g)
              :let [ty #(get (:states m) %)
                    ref-of #(let [t (plain (ty %))] (when (symbol? t) (get refs t)))
                    refined? (every? ref-of tos)]
@@ -2253,7 +2302,14 @@
                              :prop (list 'forall binders
                                          (list '=> (if held (list 'and held (list 'not test)) (list 'not test))
                                                (if (= :keep else) (list '= call v) (in-held else))))
-                             :explain (str "when its guard fails, a " f " from " (name from)
+                             :explain (str (if by
+                                             (str "taken by anyone but " (str/join " or " (sort-by str by))
+                                                  (when-let [w (:own-when (first (filter #(and (= from (:from %)) (= f (:f %)))
+                                                                                          (graph-edges g))))]
+                                                    ", or when its guard fails")
+                                                  ",")
+                                             "when its guard fails,")
+                                           " a " f " from " (name from)
                                            (if (= :keep else)
                                              " must leave it as it was"
                                              (str " must land in " (name else))))
@@ -2703,11 +2759,13 @@
                        (apply str (for [[s t] (:states m)]
                                     (str "\n    " (format (str "%-" w "s") (str s)) (show-type t))))
                        "\n  steps"
-                       (apply str (for [{:keys [from key tos guard else]} (graph-edges g)]
+                       (apply str (for [{:keys [from key tos guard else by own-when]} (graph-edges g)]
                                     (str "\n    " from " -" key "-> "
                                          (str/join " or " (map str tos))
                                          (when guard
-                                           (str " when " (pr-str guard)
+                                           (str (when by (str " by " (str/join " or " (sort-by str by))))
+                                                (when (or own-when (not by))
+                                                  (str " when " (pr-str (or own-when guard))))
                                                 (if (= :keep else)
                                                   ", else it stays"
                                                   (str ", else to " else)))))))
@@ -2717,7 +2775,16 @@
                                       (str "\n  " a " never leads to " b)
                                       (str "\n  " b " is reached only through " a))))
                        (when (seq (:final m))
-                         (str "\n  final: " (str/join ", " (map str (:final m))))))))
+                         (str "\n  final: " (str/join ", " (map str (:final m)))))
+                       ;; each role, and the steps it may take
+                       (let [steps (for [[from es] (:edges m), [[f] tos] es
+                                         :when (and (map? tos) (:by tos))
+                                         r (sort-by str (:by tos))]
+                                     [r (str f " from " (name from))])]
+                         (when (seq steps)
+                           (str "\n  who may do what"
+                                (apply str (for [[r ss] (sort-by (comp str key) (group-by first steps))]
+                                             (str "\n    " r "  " (str/join ", " (map second ss)))))))))))
          (when (seq (:anns e))
            (str "\n\nfns"
                 (apply str
