@@ -166,7 +166,10 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
 - `(spec ns)` comes first; `(spec ns {:require :proved})` makes every law
   need a proof, not just passing tests. Prefer it for new specs.
 - `(ann f [A B -> R])`: the parameter count must match the fn, which has a
-  single arity. A private helper that recurses over a collection needs an
+  single arity. `(ann f [A B -> R] {:requires (fn [a b] test) :ensures
+  (fn [a b r] test)})` adds what the arguments must meet and what the
+  result meets given them; `:ensures` becomes the law `f:ensures`, and
+  both are checked on every call while laws run. A private helper that recurses over a collection needs an
   `ann` too, or writ cannot tell the collection is finite.
 - `(data Tree Leaf (Node Tree Nat Tree))`, or `(data Box [a] (Wrap a))`
   with type parameters.

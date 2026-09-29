@@ -270,6 +270,9 @@ A spec namespace requires `writ.spec` and uses these forms.
   with `defn-` if it is a helper. A private helper that recurses over a
   collection needs an `ann` too, because writ has to know the collection
   is finite to accept the recursion.
+- `(ann f [A -> R] {:requires (fn [a] ...) :ensures (fn [a r] ...)})`
+  says more than the types: what the arguments must meet, and what the
+  result meets given them. See [Signatures that say more](#signatures-that-say-more).
 - `(refine Name [x Base] pred)` is a type: the values of `Base` where
   `pred` holds. See [Refinements](#refinements).
 - `(graph name {...})` is the problem's states and the steps between them.
@@ -559,6 +562,33 @@ spec has `calls` forms:
 - `scan` walks the graph: a fn that calls one writ can't check is reported
   with "it uses `f`, which writ cannot check", so one effect deep in a
   call chain shows up at every caller above it.
+
+### Signatures that say more
+
+A type says what kind of value a fn returns, not how it relates to what
+it was given. An `ann` can say that too:
+
+```clojure
+(ann take-upto [(List Nat) Nat -> (List Nat)]
+  {:ensures (fn [xs n r] (<= (count r) n))})
+
+(ann clamp [Int Int Int -> Int]
+  {:requires (fn [lo hi x] (<= lo hi))
+   :ensures  (fn [lo hi x r] (<= lo r hi))})
+```
+
+The fns take the signed fn's arguments, in its order, with the spec's
+own names for them; `:ensures` takes the result last. Each `:ensures` is
+the law `clamp:ensures`: on arguments of the parameter types that meet
+`:requires`, the result meets it. It is tested, proved and cited like any
+law, so it is a contract the prover can lean on in the laws after it.
+While the laws run, a call whose arguments break `:requires` fails at the
+call, whoever makes it, and a result that breaks `:ensures` fails where
+it returns:
+
+```
+`clamp` requires (<= lo hi), but is called with [9 0 0]
+```
 
 ### Refinements
 
