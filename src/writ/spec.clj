@@ -48,6 +48,7 @@
             [writ.check :as ck]
             [writ.data :as dt]
             [writ.hash :as hash]
+            [writ.solve :as solve]
             [writ.kind :as kind]
             [writ.law :as lw]
             [writ.lower :as l]
@@ -947,6 +948,7 @@
     (if (head? p "exists")
       (let [[_ [x t] body] p] (recur body (conj bs [x t])))
       [bs p])))
+
 
 (def ^:private witness-trials 1000)
 
@@ -2729,10 +2731,16 @@
          (when (seq stuck)
            "\n  A lemma that proves such a goal from what it is given would close it."))))
 
+(defn- unqualify-form
+  "form with each namespace-qualified symbol shown by its name."
+  [form]
+  (walk/postwalk #(if (and (symbol? %) (namespace %)) (symbol (name %)) %) form))
+
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
   [{:keys [ok target spec static laws gaps unspecified rejected calls flows machines proof graphs graph-missing
            lemmas off-graph uses problems questions]
+    contras ::contradictions
     ambiguous ::ambiguous explain ::explain}]
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
        (when (and proof (pos? (:laws proof)))
@@ -2804,6 +2812,12 @@
                            (str ", holding the invariant of " (str/join " and " (map pr-str held)))))))
        (when-not (:ok static) (str "\n\n" (:error static)))
        (apply str (map #(str "\n\n" %) problems))
+       (apply str (for [{[a b] :laws at :at c :call} contras]
+                    (str "\n\nlaws `" a "` and `" b "` cannot both hold: at "
+                         (str/join ", " (for [[x v] at] (str x " = " (pr-str v))))
+                         ", no value of " (pr-str (unqualify-form c)) " meets both, so no code passes them"
+                         " together (the solver shows it, and its certificate is checked)."
+                         "\n  Fixing the code cannot help; the spec's owner must say which law is meant.")))
        (apply str (for [{:keys [id text blocking]} questions :when blocking]
                     (str "\n\nthe spec is not finished: open question `" id "` blocks the next piece of work"
                          "\n  " text
@@ -3393,6 +3407,111 @@
 
 ;; --- obligations and records ------------------------------------------------------
 
+;; --- laws that contradict ---------------------------------------------------------
+
+(defn- calls-of
+  "The distinct calls in form to fns in the set fs."
+  [form fs]
+  (set (filter #(and (seq? %) (contains? fs (first %))) (tree-seq coll? seq form))))
+
+(defn- has-term? [form t] (some #(= t %) (tree-seq coll? seq form)))
+
+(defn- ->formula
+  "form as a writ.solve formula (or term, with `term?`) over the variable
+  y standing for the call c: each part without c is evaluated by ev, so
+  what is left is linear arithmetic and logic around c.  nil when some
+  part is outside that."
+  [form c ev term?]
+  (letfn [(t [f]
+            (cond
+              (= f c) 'y
+              (not (has-term? f c)) (let [v (ev f)] (when (int? v) v))
+              (and (seq? f) (symbol? (first f)))
+              (let [[op & xs] f, ts (map t xs), all? (every? some? ts)]
+                (case (name (first f))
+                  "+" (when all? (into [:+] ts))
+                  "-" (when all? (if (next ts) (into [:-] ts) [:neg (first ts)]))
+                  "inc" (when all? [:+ (first ts) 1])
+                  "dec" (when all? [:- (first ts) 1])
+                  "*" (when (and all? (= 2 (count ts)))
+                        (let [[a b] ts]
+                          (cond (int? a) [:* a b] (int? b) [:* b a])))
+                  nil))
+              :else nil))
+          (p [f]
+            (cond
+              (not (has-term? f c)) (boolean (ev f))
+              (and (seq? f) (symbol? (first f)))
+              (let [op (name (first f)), xs (rest f)]
+                (case op
+                  ("and" "or") (let [ps (map p xs)] (when (every? some? ps) (into [(keyword op)] ps)))
+                  "not" (when-let [q (p (first xs))] [:not q])
+                  "=>" (let [[a b] (map p xs)] (when (and (some? a) (some? b)) [:=> a b]))
+                  ("=" "<" "<=" ">" ">=" "not=")
+                  (let [ts (map t xs)]
+                    (when (and (every? some? ts) (< 1 (count ts)))
+                      (if (= "not=" op) [:not (into [:=] ts)] (into [(keyword op)] ts))))
+                  nil))
+              :else nil))]
+    (if term? (t form) (p form))))
+
+(defn- contradictions
+  "Pairs of laws no code could satisfy together.  For a failing law and
+  another law about the same fn, each saying what one call of it returns,
+  the call is replaced by an unknown result at generated inputs, every
+  other part evaluated, and the solver asked whether any result meets
+  both.  A pair is reported only with the solver's certificate that none
+  does, checked, so it is never a guess from samples."
+  [laws results signed ev gen-of rets seed]
+  (let [status (into {} (map (juxt :law :status)) results)
+        shape (fn [{:keys [name prop]}]
+                (let [[bs body] (leading-foralls (desugar prop))
+                      cs (calls-of body signed)]
+                  (when (and (seq bs) (= 1 (count cs))
+                             (= 1 (count (set (map first cs)))))
+                    {:name name :binders bs :body body :call (first cs)})))
+        shapes (keep shape laws)
+        order (into {} (map-indexed (fn [i l] [(:name l) i])) laws)
+        pairs (for [a shapes :when (= :failed (status (:name a)))
+                    b shapes :when (and (not= (:name a) (:name b))
+                                        (= (first (:call a)) (first (:call b))))
+                    :let [bargs (rest (:call b)) bvars (set (map first (:binders b)))]
+                    :when (and (= (count bargs) (count (rest (:call a))))
+                               (every? bvars bargs) (apply distinct? bargs)
+                               (= bvars (set bargs)))]
+                [a b])
+        at-value (fn [form bs vals] (reduce (fn [f [[x] v]] (subst-var f x (list 'quote v)))
+                                            form (map vector bs vals)))
+        found (for [[a b] pairs
+                    :let [f (first (:call a))
+                          ret (get rets f)]
+                    :when (contains? '#{Int Nat} ret)
+                    i (range 30)
+                    :let [vals (mapv (fn [[_ t] j] (gen/generate (gen-of t) (min 30 (* 2 i)) (+ seed (* 97 i) j)))
+                                     (:binders a) (range))
+                          argv (try (mapv ev (rest (at-value (:call a) (:binders a) vals)))
+                                    (catch Throwable _ nil))]
+                    :when argv
+                    ;; one call, f of the argument values, stands in both laws
+                    :let [c (apply list f (map #(list 'quote %) argv))
+                          body-a (walk/prewalk-replace {(at-value (:call a) (:binders a) vals) c}
+                                                       (at-value (:body a) (:binders a) vals))
+                          body-b (at-value (:body b) (map vector (rest (:call b))) argv)
+                          safe-ev #(try (ev %) (catch Throwable _ ::none))
+                          fa (->formula body-a c safe-ev false)
+                          fb (->formula body-b c safe-ev false)]
+                    :when (and (some? fa) (some? fb))
+                    :let [form [:and fa fb (if (= 'Nat ret) [:>= 'y 0] true)]
+                          res (try (solve/check form {'y :int} {:budget 2000}) (catch Throwable _ nil))]
+                    :when (and (= :unsat (:result res))
+                               (try (solve/verify form {'y :int} (:certificate res)) (catch Throwable _ false)))]
+                {:laws (mapv :name (sort-by #(order (:name %)) [a b]))
+                 :at (zipmap (map first (:binders a)) vals)
+                 :failing (:name a)
+                 :call (:call a)})]
+    (vec (vals (reduce (fn [m c] (if (contains? m (:laws c)) m (assoc m (:laws c) c))) (sorted-map) found)))))
+
+
 (defn- names-in [form]
   (set (filter symbol? (tree-seq coll? seq form))))
 
@@ -3711,6 +3830,17 @@
                                      :when (and (:prop r) (= :proved (:status r)) (not (:lemma r)))]
                                  {:name (symbol (str spec-ns) (str (:law r)))
                                   :prop (erase-law (:prop r) refs spec-ns)}))
+             contras (when (some #(= :failed (:status %)) results)
+                       (let [signed (set (map #(symbol (name target) (name %)) (keys anns)))]
+                         (contradictions
+                           (for [r results :when (and (:prop r) (not (:lemma r)))]
+                             {:name (:law r) :prop (:prop r)})
+                           results signed
+                           #(binding [*ns* (the-ns spec-ns)] (eval %))
+                           #(type->gen % (:tenv ctx))
+                           (into {} (for [[f sig] anns]
+                                      [(symbol (name target) (name f)) (plain (:ret sig))]))
+                           (or seed 0))))
              ;; whether each law is about every input, read before :prop goes
              results (mapv #(cond-> (dissoc % :prop) (head? (:prop %) "forall") (assoc ::general true))
                            (remove :lemma results))
@@ -3774,6 +3904,8 @@
                            :lemmas lemma-results
                            :graph-missing graphless
                            :problems problems
+                           :contradictions (mapv #(dissoc % :call) contras)
+                           ::contradictions contras
                            :questions (vec (:questions e))
                            :graphs (mapv #(dissoc % ::unproved ::obligations ::steps ::held :runs-failed) graph-results)
                            :proof (proof-coverage results level)
