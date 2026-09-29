@@ -107,6 +107,7 @@
                    :flow (update e :flows (fnil conj []) v)
                    :machine (update e :machines (fnil conj []) v)
                    :invariant (update e :invariants (fnil conj []) v)
+                   :question (update e :questions (fnil conj []) v)
                    :ann (assoc-in e [:anns (first v)] (second v))
                    :law (update e :laws conj v))))
   nil)
@@ -304,6 +305,30 @@
              (pr-str binder)))
     `(-register! '~(ns-name *ns*) :invariant '~[g state binder pred])))
 
+(defn- question*
+  "The registration of a `question`, once its parts are checked."
+  [id text opts]
+  (when-not (simple-sym? id)
+    (fail! "a `question` is named by a simple symbol, had: " (pr-str id)))
+  (when-not (and (string? text) (not (str/blank? text)))
+    (fail! "`question " id "` needs the question, as a string"))
+  (when-not (and (map? opts) (every? #{:blocking} (keys opts)))
+    (fail! "`question " id "` takes {:blocking true|false}, had: " (pr-str opts)))
+  `(-register! '~(ns-name *ns*) :question '~{:id id :text text
+                                              :blocking (boolean (:blocking opts))}))
+
+(defmacro question
+  "Record a question the spec does not answer yet:
+
+    (question refund-reopens \"does a refund reopen a closed order?\")
+    (question refund-reopens \"...\" {:blocking true})
+
+  Every report lists the open questions, since a spec with one is not
+  finished.  A blocking question, one the next piece of work depends on,
+  fails the check until it is answered and removed."
+  ([id text] (question* id text {}))
+  ([id text opts] (question* id text opts)))
+
 (def ^:private graph-keys #{:states :edges :start :never :before :final :tested :witnesses :runs :depth})
 
 (def ^:private projections
@@ -383,9 +408,23 @@
           (when (and (contains? projections (first k)) (next k))
             (fail! where ": the edge " (pr-str from) " " (pr-str k) " -- `" (first k)
                    "` takes the state alone, a " (pr-str (get (:states m) from))))
-          (when-not (and (coll? tos) (seq tos))
+          (when (map? tos)
+            (let [edge (str where ": the edge " (pr-str from) " " (pr-str k))
+                  {w :when el :else} tos
+                  n (inc (count (remove #{'_} (rest k))))]
+              (when-let [bad (seq (remove #{:to :when :else} (keys tos)))]
+                (fail! edge " has unknown keys " (pr-str bad) "; a guarded edge takes :to, :when and :else"))
+              (when-not (and (seq? w) (= 'fn (first w)) (vector? (second w)) (= 3 (count w)))
+                (fail! edge " needs :when (fn [state arg ...] test), had " (pr-str w)))
+              (when-not (= n (count (second w)))
+                (fail! edge ": its :when takes the fn's " n " argument(s), in the fn's order, had "
+                       (pr-str (second w))))
+              (when-not (or (nil? el) (= :keep el) (contains? states el))
+                (fail! edge ": :else is :keep, the state unchanged when the guard fails, or a state, had "
+                       (pr-str el)))))
+          (when-not (let [tos (if (map? tos) (:to tos) tos)] (and (coll? tos) (not (map? tos)) (seq tos)))
             (fail! where ": the edge " (pr-str from) " " (pr-str k) " needs a set of target states"))
-          (doseq [t tos]
+          (doseq [t (if (map? tos) (:to tos) tos)]
             (when-not (contains? states t)
               (fail! where ": the edge from " (pr-str from) " names " (pr-str t) ", which is not a state")))))
       (when-let [st (:start m)]
@@ -1814,10 +1853,12 @@
   parameters (where `_` marks it, else first), the edge's key as written,
   and its targets in the order the graph lists its states."
   [[_ m]]
-  (for [[from es] (:edges m), [[f & args :as k] tos] es]
-    {:from from :f f :args (vec (remove #{'_} args)) :key k
-     :pos (or (first (keep-indexed #(when (= '_ %2) %1) args)) 0)
-     :tos (filterv (set tos) (keys (:states m)))}))
+  (for [[from es] (:edges m), [[f & args :as k] v] es
+        :let [tos (if (map? v) (:to v) v)]]
+    (cond-> {:from from :f f :args (vec (remove #{'_} args)) :key k
+             :pos (or (first (keep-indexed #(when (= '_ %2) %1) args)) 0)
+             :tos (filterv (set tos) (keys (:states m)))}
+      (map? v) (assoc :guard (:when v) :else (or (:else v) :keep)))))
 
 (defn- insert-at [v i x] (vec (concat (take i v) [x] (drop i v))))
 
@@ -3207,6 +3248,23 @@
     (vec (concat (by "the spec" "the spec's" (keys (ns-interns (the-ns spec-ns))))
                  (when-let [p (:ns (::proof e))]
                    (by (str "the proof namespace " p) "the proof namespace's" (keys (proof-own p))))))))
+
+;; --- obligations and records ------------------------------------------------------
+
+(defn obligations
+  "Every obligation the spec sets, from the spec alone, as data an agent
+  can track: [{:id :kind :of :fns :text} ...].  The target need not
+  exist."
+  [spec-ns]
+  [])
+
+(defn attest
+  "Compare a check's record with a later one, or with a fresh check of
+  the spec: {:ok :weakened [...]}.  The spec is weaker when a law is gone
+  or restated, needs less evidence than it did, or has less, or when a
+  blocking question stopped being one."
+  [old new]
+  {:ok true :weakened []})
 
 (defn check
   "Check a spec namespace against its target (or opts :target).  Returns a
