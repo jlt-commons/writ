@@ -1486,13 +1486,15 @@
         ;; each variable its own seed: with one seed, two variables of a
         ;; type get the same value every time, and a law relating them
         ;; never sees them differ
-        (every? (fn [i]
-                  (not= :fail (:result (holds ctx* body
-                                              (zipmap vars (map-indexed
-                                                             (fn [j g] (gen/generate g (mod i 30)
-                                                                                     (+ seed i (* 7919 j))))
-                                                             gens))))))
-                (range n))))))
+        (and (every? (fn [i]
+                       (not= :fail (:result (holds ctx* body
+                                                   (zipmap vars (map-indexed
+                                                                  (fn [j g] (gen/generate g (mod i 30)
+                                                                                          (+ seed i (* 7919 j))))
+                                                                  gens))))))
+                     (range n))
+             ;; the inputs the solver found to meet a hypothesis no sample meets
+             (every? #(not= :fail (:result (holds ctx* body %))) (::witness (meta prop))))))))
 
 (defn- adequacy
   "Swap each signed public fn for its impostors, one at a time, and run
@@ -2559,6 +2561,11 @@
 
 (def ^:private default-depth 20)
 
+(def ^:private guard-draws
+  "How many plain draws a run makes for a guarded step before it draws
+  from the state's own integers; it makes twice as many of those."
+  4)
+
 (defn- graph-runs
   "Walk :runs runs through the graph's real steps.  Each starts at the
   :start value and takes up to :depth steps (default 20): at each, an
@@ -2579,29 +2586,72 @@
           start-v (try (binding [*ns* (the-ns spec-ns)] (eval (qualify-form (second st))))
                        (catch Throwable _ ::none))
           pick (fn [k r] (gen/generate (gen/choose 0 (dec k)) 30 r))
-          call-edge (fn [v {:keys [f args pos guard]} r]
-                      (let [avs (map-indexed
-                                  (fn [j t] (if (fixed-arg? t)
-                                              (second t)
-                                              (list 'quote (gen/generate (type->gen t tenv)
-                                                                         30 (+ r j 1)))))
-                                  args)
-                            call-args (insert-at (vec avs) pos (list 'quote v))
-                            call (qualify-form (apply list f call-args))
-                            ev #(binding [*ns* (the-ns spec-ns)] (eval %))]
+          ;; a guard compares an argument with the state, most often: a
+          ;; payment with the order's total.  On a searching step a draw it
+          ;; refuses is tried again, then with the state's own integers and
+          ;; their neighbours, so a run gets past a guard a random value
+          ;; rarely meets.  Each step's refusal is counted, by edge
+          refusals (atom {})
+          draw (fn [v args r i]
+                 (let [pool (vec (distinct (mapcat (fn [n] [n (inc n) (dec n)])
+                                                   (filter integer? (tree-seq coll? seq v)))))]
+                   (vec (map-indexed
+                          (fn [j t]
+                            (if (fixed-arg? t)
+                              (second t)
+                              (list 'quote
+                                    (let [g (type->gen t tenv)
+                                          sd (+ r j 1 (* 104729 i))
+                                          x (when (and (>= i guard-draws) (seq pool)
+                                                       (contains? '#{Nat Int} (plain t)))
+                                              (gen/generate (gen/elements pool) 30 sd))]
+                                      (if (and (some? x) (conforms? t x tenv)) x (gen/generate g 30 sd))))))
+                          args))))
+          call-edge (fn [v {:keys [f args pos guard]} r search?]
+                      (let [ev #(binding [*ns* (the-ns spec-ns)] (eval %))
+                            call-args (fn [avs] (insert-at avs pos (list 'quote v)))
+                            passes? #(try (boolean (ev (qualify-form (guard-of guard (call-args %)))))
+                                          (catch Throwable _ false))
+                            ;; every other step takes its first draw, so a
+                            ;; run still meets the guard's refusals
+                            avs (if (and guard (or search? (odd? r)))
+                                  (let [tries (map #(draw v args r %) (range (* 3 guard-draws)))]
+                                    (or (first (filter passes? tries)) (first tries)))
+                                  (draw v args r 0))
+                            call (qualify-form (apply list f (call-args avs)))]
                         (try (cond-> {:v (ev call)}
-                               guard (assoc :passes (boolean (ev (qualify-form (guard-of guard call-args))))))
+                               guard (assoc :passes (passes? avs)))
                              (catch Throwable ex {:thrown (ex-message ex)}))))
           conforms (fn [s v] (try (conforms? (get (:states m) s) v tenv) (catch Throwable _ false)))
-          run (fn [i]
+          ;; how many steps each state is from s, by the graph's edges
+          preds (reduce (fn [m [from es]] (reduce #(update %1 %2 (fnil conj #{}) from) m (mapcat :tos es)))
+                        {} edges)
+          steps-to (memoize
+                     (fn [s]
+                       (loop [d {s 0}, frontier [s], k 1]
+                         (let [nxt (distinct (remove d (mapcat preds frontier)))]
+                           (if (empty? nxt)
+                             d
+                             (recur (into d (map #(vector % k) nxt)) nxt (inc k)))))))
+          ;; a run toward a state takes, at each step, an edge that brings it
+          ;; closer when there is one, and looks for arguments its guard takes
+          run (fn [i & [toward]]
                 (loop [state (first st), v start-v, path [(first st)], k 0]
-                  (let [es (get edges state)]
-                    (if (or (empty? es) (= k depth))
+                  (let [es (get edges state)
+                        es (if-let [d (some-> toward steps-to)]
+                             (or (seq (filter (fn [e] (some #(< (get d % ##Inf) (get d state ##Inf)) (:tos e))) es))
+                                 es)
+                             es)]
+                    (if (or (empty? es) (= k depth) (and toward (= state toward)))
                       {:path path}
                       (let [r (+ (or seed 0) (* 7919 i) (* 31 k))
                             {:keys [tos guard else] :as e} (nth es (pick (count es) r))
-                            {nv :v thrown :thrown passes :passes} (call-edge v e r)
+                            {nv :v thrown :thrown passes :passes} (call-edge v e r (boolean toward))
                             refused (and guard (not passes))
+                            _ (when guard
+                                (swap! refusals update [state (:f e)]
+                                       (fnil #(update % (if refused :refused :passed) inc)
+                                             {:refused 0 :passed 0})))
                             tos (if refused (if (= :keep else) [state] [else]) tos)
                             land (first (filter #(conforms % nv) tos))
                             fail (fn [why] {:path path :value v :reason why})]
@@ -2621,9 +2671,19 @@
                             (recur land nv (conj path land) (inc k)))))))))]
       (if (= ::none start-v)
         {:failures [] :visited #{}}
-        (let [rs (map run (range n))]
+        (let [rs (doall (map run (range n)))
+              ;; a final state no run happened to reach: runs toward it,
+              ;; until one gets there
+              missed (remove (set (mapcat :path rs)) (:final m))
+              toward (doall (mapcat (fn [f]
+                                      (let [ts (map #(run (+ n %) f) (range n))]
+                                        (concat (take-while #(not (some #{f} (:path %))) ts)
+                                                (take 1 (drop-while #(not (some #{f} (:path %))) ts)))))
+                                    missed))
+              rs (concat rs toward)]
           {:failures (vec (distinct (filter :reason rs)))
-           :visited (set (mapcat :path rs))})))))
+           :visited (set (mapcat :path rs))
+           :refusals @refusals})))))
 
 (defn- vacuous-invariants
   "Invariants the state's own type already says: the prover shows them
@@ -3821,6 +3881,32 @@
                               (when (:trace pr) (swap! cached assoc-in [:traces law-id] (:trace pr)))
                               (reset! fresh true)
                               pr))))
+            ;; an input that meets a law's hypotheses, from the solver: a
+            ;; counterexample to their negation, run to confirm it
+            hypothesis-witness
+            (fn [r]
+              (let [[bs body] (leading-foralls (:prop r))
+                    hyps (loop [p body, hs []]
+                           (if (head? p "=>") (recur (nth p 2) (conj hs (nth p 1))) hs))
+                    h (if (= 1 (count hyps)) (first hyps) (cons 'and hyps))
+                    vars (mapv first bs)
+                    ;; one found input, and then others apart from it: a
+                    ;; stand-in that agrees with the code at one input is
+                    ;; told apart at another
+                    found (fn [seen]
+                            (let [apart (for [w seen] (cons 'or (for [x vars] (list 'not= x (get w x)))))
+                                  h* (if (seq apart) (list* 'and h apart) h)
+                                  none (reduce (fn [p [x t]] (list 'forall [x t] p)) (list 'not h*) (reverse bs))
+                                  cex (:counterexample (attempt** {:law (:law r) :prop none} [] nil))]
+                              (when (and cex (every? #(contains? cex %) vars)
+                                         (every? (fn [[x t]] (conforms? t (get cex x) (:tenv ctx))) bs)
+                                         (= :pass (:result (try (holds (assoc ctx :vars vars) h* cex)
+                                                                (catch Throwable _ nil)))))
+                                (select-keys cex vars))))]
+                (when (seq hyps)
+                  (loop [seen []]
+                    (let [w (when (< (count seen) 3) (found seen))]
+                      (if w (recur (conj seen w)) (not-empty seen)))))))
             open? (fn [r] (and (:prop r) (contains? #{:tested :failed} (:status r))
                                (not (:proof r)) (not (:unproved-final r))))
             pass (fn [[rs lemmas]]
@@ -3850,11 +3936,27 @@
                                           (seq (:lemmas pr)) (assoc :lemmas (:lemmas pr))))
                               (conj lemmas {:name (:law r) :prop (:prop r)})]
 
-                             ;; a law whose hypothesis never held is true of
-                             ;; every input, and tested nothing: the failure
-                             ;; stands, and it is no refutation of the proof
+                             ;; a hypothesis no test met: where the solver
+                             ;; finds the law false, running it there says so
+                             (and (:no-hypothesis r) (not (:proved pr)) (refuted ctx r (:counterexample pr)))
+                             [(conj out (dissoc (refuted ctx r (:counterexample pr)) :no-hypothesis)) lemmas]
+
+                             ;; a law whose hypothesis never held would be
+                             ;; true of every input and test nothing; the
+                             ;; proof stands only when the solver finds an
+                             ;; input that meets the hypothesis
                              (and (:proved pr) (:no-hypothesis r))
-                             [(conj out r) lemmas]
+                             (if-let [w (hypothesis-witness r)]
+                               [(conj out (cond-> (-> r (dissoc :counterexample :detail :no-hypothesis)
+                                                      (assoc :status :proved
+                                                             :hypothesis-witness w
+                                                             :proof (str (:summary pr) ", and its hypothesis held at "
+                                                                         (str/join " and " (map pr-str w))
+                                                                         ", which the solver found: no generated input met it")))
+                                            (:cached pr) (assoc :cached true)
+                                            (seq (:lemmas pr)) (assoc :lemmas (:lemmas pr))))
+                                (conj lemmas {:name (:law r) :prop (:prop r)})]
+                               [(conj out r) lemmas])
 
                              (and (:proved pr) (not (thrown? r)))
                              [(conj out (assoc r :prover-bug true :proof (:summary pr))) lemmas]
@@ -4453,7 +4555,10 @@
                                 (sort (filter #(contains? publics %) (keys anns)))
                                 ;; a step's witness is found by search, so a stand-in
                                 ;; that misses it may only be unlucky: it pins nothing
-                                anns (concat (keep :prop (remove #(or (:lemma %) (:step-of %)) results))
+                                anns (concat (keep #(when-let [p (:prop %)]
+                                                      (cond-> p (:hypothesis-witness %)
+                                                        (vary-meta assoc ::witness (:hypothesis-witness %))))
+                                                   (remove #(or (:lemma %) (:step-of %)) results))
                                              (for [m (:machines e)]
                                                (qualify (machine-prop m e) #{} publics interns
                                                         target spec-ns)))
@@ -4513,10 +4618,18 @@
                                                                  :when (and (contains? reached f)
                                                                             (not (contains? (:visited walked) f)))]
                                                              {:seed run-seed
-                                                              :reason (str "no run of " (:runs (second g)) " reached "
-                                                                           (pr-str f) " in " (or (:depth (second g)) default-depth)
-                                                                           " steps; a run from the start should reach every"
-                                                                           " final state, so walk more runs, or longer ones (:depth)")}))))
+                                                              :reason (let [shut (sort (for [[[st fe] {:keys [refused passed]}] (:refusals walked)
+                                                                                             :when (and (pos? refused) (zero? passed))]
+                                                                                         (str "the guard of " fe " from " (pr-str st)
+                                                                                              " refused all " refused " of its steps, half of them"
+                                                                                              " searching " (* 3 guard-draws) " draws for arguments it takes")))]
+                                                                        (str "no run of " (:runs (second g)) " reached "
+                                                                             (pr-str f) " in " (or (:depth (second g)) default-depth)
+                                                                             " steps; a run from the start should reach every final state"
+                                                                             (if (seq shut)
+                                                                               (str ": " (str/join "; " shut)
+                                                                                    ". Check that the guard can hold from the states a run reaches")
+                                                                               ", so walk more runs, or longer ones (:depth)")))}))))
                                          obls (filter #(= (first g) (:graph %)) results)]
                                      (let [ok? (and (empty? errs) (empty? rules) (empty? run-errs))]
                                        (cond-> {:graph (first g) :states (count (:states (second g)))
