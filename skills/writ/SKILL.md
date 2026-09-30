@@ -53,12 +53,40 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
 5. Laws for what each step means. Record anything the problem statement
    leaves open as `(question id "...")`; add `{:blocking true}` when the
    next piece of work depends on the answer. Never invent the answer.
-6. Show the plan: `(spec/plan 'my.spec)` prints states, steps, signatures,
-   laws and wiring from the spec alone. When a person asked for the
+6. Ask what the problem statement leaves to chance (see
+   [What to ask](#what-to-ask)), then show the plan: `(spec/plan 'my.spec)`
+   prints states, steps, signatures, laws and wiring from the spec alone,
+   and ends with the questions its types raise. When a person asked for the
    feature, show it to them and have them confirm it before writing code.
 7. Then the implementation. If a law holds but isn't proved, write a
    lemma or hint in the proof namespace (see
    [The proof namespace](#the-proof-namespace)); never weaken the law.
+
+## What to ask
+
+Code decides every case one way or another; a spec should say which way
+someone chose. Before the plan is confirmed, go through these with the
+spec's owner, and turn each answer into a law, a state or a step, or a
+`(question ...)` when nobody knows yet. Never pick an answer yourself.
+
+- The core method: what the result is, stated so two people would compute
+  the same thing.
+- Units and precision: what a number counts, how exact it must be, how it
+  rounds.
+- Order and ties: which comes first when two are equal, and whether order
+  matters at all.
+- Thresholds: whether a boundary value is in or out (`<` or `<=`).
+- Empty and edge inputs: an empty collection or string, zero, a negative
+  number, nil, the largest value that can arrive.
+- Missing values: what an absent optional key or value means.
+- Surplus and shortfall: too much, too little, not enough to go round.
+- Scope: what the code is not responsible for, and who is.
+- The whole life: whether what happens can be undone, cancelled,
+  repeated, paused, or expire.
+
+`(spec/elicit 'my.spec)` lists the kinds its types raise, with the fns or
+graphs each is about; `plan` prints them last. Those are prompts, not
+failures: a law over every input may already answer one.
 
 ## The state graph
 

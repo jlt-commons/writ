@@ -2633,6 +2633,49 @@
     (seq gs) (str "\n    calls exactly: " (str/join ", " gs))
     :else "\n    calls nothing outside clojure.core"))
 
+(def ^:private elicit-asks
+  [[:empty "What should each give for an empty collection or string: nothing, a default, or a refusal?"]
+   [:zero-and-negative "What should each do at zero, and with a negative number where one can arrive?"]
+   [:absent "When an optional value is missing, what should each do: skip it, use a default, or refuse?"]
+   [:precision "How precise must each be, how does it round, and in what units?"]
+   [:whole-life (str "Can what happens here be undone, cancelled, repeated, paused, or expire?"
+                     " Each is a step the graph should have, or a question to record.")]])
+
+(defn- elicit*
+  "The decisions a spec's types raise, as [{:class :ask :fns|:graphs}]."
+  [e]
+  (let [refs (refines-of e)
+        base #(plain (erase % refs))
+        coll? #(or (= 'String %) (kind/index-type? %)
+                   (and (seq? %) (contains? '#{List Vec Set Map} (first %))))
+        opt? #(or (kind/opt-type? %) (and (kind/record-type? %) (some kind/opt-type? (vals %))))
+        float? #(contains? '#{Float Double Float! Double!} %)
+        fns-where (fn [pred ret?]
+                    (vec (sort (for [[f {:keys [params ret]}] (:anns e)
+                                     :when (some pred (map base (cond-> params ret? (conj ret))))]
+                                 f))))
+        by {:empty (fns-where coll? false)
+            :zero-and-negative (fns-where #(contains? '#{Int Nat} %) false)
+            :absent (fns-where opt? false)
+            :precision (fns-where float? true)}
+        graphs (vec (sort (map first (:graphs e))))]
+    (vec (for [[k ask] elicit-asks
+               :let [fs (get by k)]
+               :when (if (= :whole-life k) (seq graphs) (seq fs))]
+           (if (= :whole-life k)
+             {:class k :ask ask :graphs graphs}
+             {:class k :ask ask :fns fs})))))
+
+(defn elicit
+  "What to ask the spec's owner before the plan is confirmed: the
+  decisions its types raise, which the code will make one way or another
+  whether anyone chose it.  [{:class :ask :fns [f ...]}] per kind of
+  decision, and :graphs for what a run's whole life may hold.  Each answer
+  is a law, a state or a step, or a `question` until someone knows."
+  [spec-ns]
+  (require spec-ns)
+  (elicit* (or (get @registry spec-ns) (fail! "`" spec-ns "` is not a spec namespace"))))
+
 (defn plan
   "The spec as a plan a person can read and confirm, from the spec alone:
   each graph's states and steps, each signed fn with the laws that name
@@ -2713,7 +2756,11 @@
          (apply str (for [[mname m] (:machines e)]
                       (str "\n\nmachine `" mname "`: " (:step m) " steps it from " (pr-str (:start m))
                            (apply str (for [[st evs] (:transitions m), [ev to] evs]
-                                        (str "\n  " (pr-str st) " -" (pr-str ev) "-> " (pr-str to))))))))))
+                                        (str "\n  " (pr-str st) " -" (pr-str ev) "-> " (pr-str to)))))))
+         (when-let [asks (seq (elicit* e))]
+           (str "\n\nask the spec's owner, before the code decides"
+                (apply str (for [{:keys [ask fns graphs]} asks]
+                             (str "\n  " ask "\n    " (str/join ", " (or fns graphs))))))))))
 
 (defn- erase-data
   "A data form with refinements in its field types erased; the type's and

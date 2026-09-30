@@ -1484,6 +1484,29 @@ assumption the earlier record did not make, or made differently, as a
 weaker spec. Assume what the dependency documents, not what the proof
 happens to need.
 
+### What to ask
+
+A spec is only as good as the decisions it records, and the code decides
+every case whether anyone chose it or not. `(spec/elicit 'my.spec)` lists
+the decisions the spec's types raise, for the person confirming the plan
+to answer, and `plan` ends with them:
+
+```
+ask the spec's owner, before the code decides
+  What should each give for an empty collection or string: nothing, a default, or a refusal?
+    take-upto
+  What should each do at zero, and with a negative number where one can arrive?
+    clamp, clamp-digit, take-upto
+```
+
+Collections raise the empty case, integers zero and negatives, optional
+values what absent means, floats precision and rounding, and each graph
+what a run's whole life may hold: undoing, cancelling, repeating,
+expiring. They are prompts, not failures, since a law over every input
+may already answer one. Each answer is a law, a state or a step, or a
+`question` until someone knows; `skills/writ/SKILL.md` has the full list
+to go through.
+
 ### Open questions
 
 `(question id "text")` records a question the spec does not answer yet.
