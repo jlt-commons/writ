@@ -726,7 +726,13 @@
          (and (contains? v :bool) (boolean? (:bool v))) (:bool v)
          (and (contains? v :const) (contains? by-code (:const v))) (by-code (:const v))
          (:nil v) nil
-         (:vec v) (let [xs (mapv walk (:vec v))] (if (some #{::none} xs) ::none (apply list xs)))
+         ;; str, pr-str and = on a coll see a vector from a seq, so a
+         ;; value of unknown kind is no one value
+         (:vec v) (let [xs (mapv walk (:vec v))]
+                    (cond (some #{::none} xs) ::none
+                          (= :vector (:kind v)) xs
+                          (= :seq (:kind v)) (apply list xs)
+                          :else ::none))
          (and (:set v) (:elems (:set v)) (every? (comp true? first) (:elems (:set v))))
          (let [xs (mapv (comp walk second) (:elems (:set v)))] (if (some #{::none} xs) ::none (set xs)))
          :else ::none))
@@ -837,12 +843,13 @@
   (if-let [v (and (contains? pure-fns f)
                   ;; a throw in an argument is a throw of the call, as
                   ;; lift makes it for the fns it handles
-                  (not-any? #{:bottom} args)
-                  (let [xs (map #(concrete st %) args)]
+                  (if (some #{:bottom} args)
+                    :bottom
+                    (let [xs (map #(concrete st %) args)]
                     (when (not-any? #{::none} xs)
                       (try (let [r (apply @(resolve (symbol "clojure.core" (name f))) xs)]
                              (from-concrete st (if (seq? r) (doall r) r)))
-                           (catch Throwable _ nil)))))]
+                           (catch Throwable _ nil))))))]
     v
     (core* st f args)))
 

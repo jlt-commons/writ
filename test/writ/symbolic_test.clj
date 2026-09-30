@@ -177,3 +177,13 @@
         l (first (filter #(= 'true-picks-one (:law %)) (:laws r)))]
     (is (not (str/includes? (str (:unproved l)) "the prover failed")) (str (:unproved l)))
     (is (= :proved (:status l)) (str (:unproved l)))))
+
+(deftest a-core-fn-folded-on-literals-sees-the-value-it-is-given
+  (let [v12 [:call 'vector [:lit 1] [:lit 2]]
+        proves? (fn [t] (try (boolean (sym/prove {} [] t)) (catch Throwable _ false)))]
+    (is (not (proves? [:call '= [:call 'str v12] [:lit "(1 2)"]])) "(str [1 2]) is \"[1 2]\"")
+    (is (proves? [:call '= [:call 'str v12] [:lit "[1 2]"]]))
+    (is (proves? [:call '= [:call 'str [:call 'list [:lit 1] [:lit 2]]] [:lit "(1 2)"]]))))
+
+(deftest a-throw-in-a-folded-call-is-a-throw-of-the-call
+  (is (sym/prove {} [] [:call '= [:call 'str [:call 'nth [:call 'vector [:lit 1]] [:lit 5]]] [:lit "x"]])))
