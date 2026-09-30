@@ -1544,12 +1544,15 @@
         (let [by-code (into {} (map (fn [[c k]] [k c])) codes)
               ;; a constant the model picked that no literal of the code is:
               ;; a value of its own kind, apart from the others
+              ;; one per code, k and -k apart, and none a literal of
+              ;; the code would be
               decoded-code (fn [k ctype]
-                             (get by-code k (case ctype
-                                              :string (str "s" (abs k))
-                                              :symbol (symbol (str "s" (abs k)))
-                                              :char (char (+ 97 (mod (abs k) 26)))
-                                              (keyword (str "k" (abs k))))))
+                             (let [tag (str "writ%" (if (neg? k) "n" "") (abs k))]
+                               (get by-code k (case ctype
+                                                :string tag
+                                                :symbol (symbol tag)
+                                                :char (char (+ 0x4E00 (mod k 0x5000)))
+                                                (keyword tag)))))
               values (into {} (for [[v sv] env] [v (decode sv (:model r) decoded-code)]))]
           (when-not (some #{::none} (vals values))
             values))))))

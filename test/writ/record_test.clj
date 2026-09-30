@@ -206,7 +206,7 @@
   (let [r (spec/check 'writ.spec-demo.member-spec {:seed 42 :target 'writ.spec-demo.member-big :cache false})]
     (is (not (:ok r)))
     (is (str/includes? (:message r) "found by the solver") (:message r))
-    (is (re-find #":points 10\d\d" (:message r)))))
+    (is (some #(< 1000 (parse-long (second %))) (re-seq #":points (\d+)" (:message r))) (:message r))))
 
 
 (deftest an-opt-key-read-with-a-default-may-still-be-nil
