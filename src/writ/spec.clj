@@ -3413,6 +3413,10 @@
   [form]
   (walk/postwalk #(if (and (symbol? %) (namespace %)) (symbol (name %)) %) form))
 
+(def ^:private thin-tests
+  "Fewer trials than this meeting a law's hypothesis is a thin test."
+  20)
+
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
   [{:keys [ok target spec static laws gaps unspecified rejected calls flows machines proof graphs graph-missing
@@ -3430,6 +3434,12 @@
                 (str "; tested, not proved: " (str/join ", " (map :law ts))
                      (when-let [n (some->> (seq (keep :trials ts)) (apply min))]
                        (str " (each on at least " n " inputs)"))))))
+       ;; a test of a law whose hypothesis seldom holds says little
+       (apply str (for [{:keys [law held trials evidence]} laws
+                        :when (and (= :test evidence) held trials (< held thin-tests))]
+                    (str "\n  law `" law "` is thinly tested: its hypothesis held in " held " of "
+                         trials " trials. Build inputs that meet it: a refinement, or values"
+                         " picked from the ones the law is about")))
        (apply str (for [{:keys [id text blocking]} questions :when (not blocking)]
                     (str "\n  open question `" id "`: " text)))
        ;; what every proof here rests on
@@ -4555,30 +4565,39 @@
 (defn- more-trials
   "A law that is only tested runs again, a hundred trials at a time
   with the seeds after its own, until it has had :trials more or :ms
-  have passed.  A failure among them is the law's result, with the seed
-  that replays it."
+  have passed.  So does one whose hypothesis no trial met, where the
+  solver found no input either: a rare hypothesis is met in more trials.
+  A failure among them is the law's result, with the seed that replays
+  it.  :held counts the trials whose hypothesis held."
   [ctx r opts]
   (let [{extra :trials ms :ms} (merge more-trials-default
-                                     (when (map? (:more-trials opts)) (:more-trials opts)))]
-    (if (or (not= :tested (:status r)) (:lemma r) (not (:prop r)) (false? (:more-trials opts))
-            (not (pos? extra)))
+                                     (when (map? (:more-trials opts)) (:more-trials opts)))
+        starved? (and (= :failed (:status r)) (:no-hypothesis r))]
+    (if (or (not (or (= :tested (:status r)) starved?)) (:lemma r) (not (:prop r))
+            (false? (:more-trials opts)) (not (pos? extra)))
       r
       (let [t0 (System/currentTimeMillis)
-            base (or (:seed r) 0)]
-        (loop [k 1, ran (or (:trials r) 0)]
+            base (or (:seed r) 0)
+            first-run (or (:trials r) (:trials opts) 100)]
+        (loop [k 1, ran first-run, held (if starved? 0 (- first-run (or (:discarded r) 0)))]
           (if (or (> (* 100 k) extra) (> (- (System/currentTimeMillis) t0) ms))
-            (assoc r :trials ran)
+            (cond
+              (not starved?) (assoc r :trials ran :discarded (- ran held) :held held)
+              (pos? held) (-> r (dissoc :counterexample :detail :no-hypothesis)
+                              (assoc :status :tested :trials ran :discarded (- ran held) :held held))
+              :else r)
             (let [t (try (test-law ctx {:name (:law r) :prop (:prop r)}
                                    {:trials 100 :seed (+ base k) :max-size (or (:max-size opts) 50)})
                          ;; as the first run: a law that cannot be run fails with the reason
                          (catch Throwable ex
                            {:status :failed :counterexample {} :detail [] :seed (+ base k)
                             :error (or (ex-message ex) (str ex))}))]
-              (if (= :failed (:status t))
-                (merge (dissoc r :unproved :stuck :trials :discarded)
+              (if (and (= :failed (:status t)) (not (:no-hypothesis t)))
+                (merge (dissoc r :unproved :stuck :trials :discarded :no-hypothesis)
                        (select-keys t [:status :counterexample :original :trial :seed :detail :error])
                        {:after-trials ran})
-                (recur (inc k) (+ ran (or (:trials t) 100)))))))))))
+                (recur (inc k) (+ ran 100)
+                       (+ held (if (:no-hypothesis t) 0 (- (or (:trials t) 100) (or (:discarded t) 0)))))))))))))
 
 (defn- reachable-from
   "Every fn of graph g that f reaches through calls."
@@ -4706,15 +4725,15 @@
                                                                                  :when (and a (= :held st))]
                                                                              {:name a :prop p}))})
                                      target spec-ns (merge (:tenv imports) data-tenv) anns refs ctx)
+                         ;; a law the prover could not prove rests on its
+                         ;; tests alone, so it gets more of them
+                         ((fn [rs] (let [wrapped (wrap! e)]
+                                     (try (mapv #(more-trials ctx % opts) rs)
+                                          (finally (unwrap! wrapped))))))
                          (require-evidence
                            ;; a lemma is there to be cited, so it must be proved
                            (mapv #(if (:lemma %) (assoc-in % [:opts :require] :proved) %) laws)
                            level))
-             ;; a law the prover could not prove rests on its tests alone,
-             ;; so it gets more of them
-             results (let [wrapped (wrap! e)]
-                       (try (mapv #(more-trials ctx % opts) results)
-                            (finally (unwrap! wrapped))))
              unq (fn unq [f]
                    (cond (and (symbol? f) (contains? #{(name target) (name spec-ns)} (namespace f)))
                          (symbol (name f))

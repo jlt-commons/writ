@@ -109,3 +109,21 @@
 (deftest a-build-must-name-a-fn
   (is (thrown-with-msg? Exception #"\{:build f\}"
         (macroexpand-1 '(writ.spec/refine R [x Nat] (pos? x) {:build 3})))))
+
+;; --- a hypothesis a test seldom meets ---------------------------------------------
+
+(deftest a-rare-hypothesis-gets-more-trials-before-it-fails
+  (let [law 'a-seven-unit-span-overlaps-what-it-shares-a-unit-with
+        starved? #(:no-hypothesis (law-result (spec/check 'writ.spec-demo.span-rare-spec
+                                                          {:seed % :more-trials false :adequacy false})
+                                              law))
+        s (first (filter starved? (range 1 60)))
+        r (spec/check 'writ.spec-demo.span-rare-spec {:seed s :adequacy false})
+        l (law-result r law)]
+    (is (some? s) "some seed meets the hypothesis in none of the first hundred")
+    (is (= :tested (:status l)) (:message r))
+    (is (pos? (:held l)))))
+
+(deftest a-law-whose-hypothesis-seldom-held-is-called-thin
+  (let [r (spec/check 'writ.spec-demo.span-rare-spec {:seed 1 :adequacy false})]
+    (is (has? r "is thinly tested: its hypothesis held in"))))
