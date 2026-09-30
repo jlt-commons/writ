@@ -1543,7 +1543,7 @@
 
 (declare erase erase-data refines-of)
 
-(declare ns-names)
+(declare ns-names core-name?)
 
 (defn- static-check
   "Run writ's rules over the target's source with the spec's types, each
@@ -1583,10 +1583,13 @@
                   ;; by the qualified name an alias resolves to, and by a
                   ;; name the target refers
                   book/*extra-sigs* (let [sig-of #(unbang (erase (get (:assumes e) %) refs))
-                                          {:keys [refers]} (some-> (first nsf) ns-names)]
+                                          {:keys [refers] :as names} (some-> (first nsf) ns-names)]
                                       (merge (into {} (for [q (keys (:assumes e))] [q (sig-of q)]))
+                                             ;; a core fn by its plain name, where the
+                                             ;; code reads that name as core's
                                              (into {} (for [q (keys (:assumes e))
-                                                            :when (= "clojure.core" (namespace q))]
+                                                            :when (and (= "clojure.core" (namespace q))
+                                                                       (core-name? names (symbol (name q))))]
                                                         [(symbol (name q)) (sig-of q)]))
                                              (into {} (for [[r q] refers :when (contains? (:assumes e) q)]
                                                         [r (sig-of q)]))))]
@@ -1668,8 +1671,10 @@
 
 (defn- ns-names
   "The names an ns form brings in: {:aliases {alias lib} :refers {name
-  lib/name}}, from its :require clauses."
+  lib/name} :excludes #{name}}, from its :require clauses and the
+  clojure.core names its :refer-clojure :exclude leaves out."
   [ns-form]
+  (assoc
   (reduce (fn [acc [lib & opts]]
             (let [o (apply hash-map (take (* 2 (quot (count opts) 2)) opts))]
               (cond-> acc
@@ -1682,7 +1687,18 @@
                 :when (and (seq? clause) (= :require (first clause)))
                 spec (rest clause)
                 :when (or (vector? spec) (symbol? spec))]
-            (if (symbol? spec) [spec] (seq spec)))))
+            (if (symbol? spec) [spec] (seq spec))))
+  :excludes (set (for [clause (rest ns-form)
+                       :when (and (seq? clause) (= :refer-clojure (first clause)))
+                       :let [o (apply hash-map (take (* 2 (quot (count (rest clause)) 2)) (rest clause)))]
+                       x (:exclude o)]
+                   x))))
+
+(defn- core-name?
+  "Does a namespace with these names read the plain name nm as
+  clojure.core's?"
+  [{:keys [refers excludes]} nm]
+  (not (or (contains? refers nm) (contains? excludes nm))))
 
 (defn- callee
   "What a name in a body refers to in the call graph: the simple name of
@@ -3518,13 +3534,15 @@
 (defn- assumed-names
   "name -> qualified name for the assumed fns, as a namespace with these
   aliases and refers names them: alias-qualified, referred, or in full."
-  [aliases refers assumed]
+  [{:keys [aliases refers] :as names} assumed]
   (merge (into {} (for [q assumed] [q q]))
-         ;; a clojure.core fn the prover does not model, by its plain name;
-         ;; one it models keeps its model
+         ;; a clojure.core fn the prover does not model, by its plain name
+         ;; where the namespace reads it as core's; one it models keeps its
+         ;; model
          (into {} (for [q assumed
                         :when (and (= "clojure.core" (namespace q))
-                                   (not (contains? writ.prove.translate/core-fns (symbol (name q)))))]
+                                   (not (contains? writ.prove.translate/core-fns (symbol (name q))))
+                                   (core-name? names (symbol (name q))))]
                     [(symbol (name q)) q]))
          (into {} (for [[a lib] aliases, q assumed :when (= (str lib) (namespace q))]
                     [(symbol (str a) (name q)) q]))
@@ -3548,7 +3566,7 @@
               nsf (first (filter #(head? % "ns") forms))]
           (if (nil? nsf)
             (recur (rest todo) (conj seen n) out)
-            (let [{:keys [aliases refers]} (ns-names nsf)
+            (let [{:keys [aliases refers] :as names} (ns-names nsf)
                   libs (distinct (concat (vals aliases) (map (comp symbol namespace) (vals refers))))
                   project? (fn [lib] (not (re-find #"^(clojure|jolt)\." (str lib))))
                   deps (filter project? libs)
@@ -3560,7 +3578,7 @@
                                            f (defs-in lib)]
                                        [(symbol (str a) (str f)) (symbol (str lib) (str f))]))
                             (into {} (for [[r q] refers :when (project? (symbol (namespace q)))] [r q]))
-                            (assumed-names aliases refers assumed))]
+                            (assumed-names names assumed))]
               (recur (concat (rest todo) deps) (conj seen n) (conj out [n forms ref-map]))))))
       out))))
 
@@ -3661,14 +3679,14 @@
           libs+refers (delay
                         (let [libs (lib-pairs target (set (keys (:sigs assumed))))
                               spec-forms (book/read-forms (source-url spec-ns))
-                              {:keys [aliases refers]} (ns-names (first (filter #(head? % "ns") spec-forms)))]
+                              {:keys [aliases] :as names} (ns-names (first (filter #(head? % "ns") spec-forms)))]
                           [libs spec-forms
                            (merge
                              (into {} (for [[a lib] aliases
                                             [n fs] libs :when (= n lib)
                                             f fs :when (and (seq? f) (contains? '#{defn defn-} (first f)))]
                                         [(symbol (str a) (str (second f))) (symbol (str lib) (str (second f)))]))
-                             (assumed-names aliases refers (set (keys (:sigs assumed)))))]))
+                             (assumed-names names (set (keys (:sigs assumed)))))]))
           anns (into {} (map (fn [[k sig]] [k (erase sig refs)])) anns)
           assumed-sigs (into {} (for [[q sig] (:sigs assumed)
                                       :let [sig (erase sig refs)]]

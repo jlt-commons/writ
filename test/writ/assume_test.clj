@@ -87,3 +87,16 @@
     (is (:ok r) (:message r))
     (is (= :proved (:status (law-result r 'every-value-is-counted))) (str (:unproved (law-result r 'every-value-is-counted))))
     (is (has? r "citing the-counts-add-up"))))
+
+(deftest an-assumed-core-fn-does-not-take-a-name-the-code-refers-elsewhere
+  (testing "the code's replace is clojure.string's, so the assumed core one does not type it"
+    (let [r (spec/check 'writ.spec-demo.dashes-spec {:seed 42})]
+      (is (:ok (:static r)) (:message r))))
+  (testing "the prover reads a referred or excluded name as the code means it"
+    (let [names #'writ.spec/assumed-names]
+      (is (= 'clojure.core/frequencies
+             (get (names {:aliases {} :refers {}} #{'clojure.core/frequencies}) 'frequencies)))
+      (is (nil? (get (names {:aliases {} :refers {'replace 'clojure.string/replace}} #{'clojure.core/replace})
+                     'replace)))
+      (is (nil? (get (names {:aliases {} :refers {} :excludes #{'replace}} #{'clojure.core/replace})
+                     'replace))))))
