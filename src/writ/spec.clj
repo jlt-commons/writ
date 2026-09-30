@@ -2232,8 +2232,13 @@
   (vec (for [{:keys [from f args tos pos guard else changes by]} (graph-edges g)
              :let [ty #(get (:states m) %)
                    ref-of #(let [t (plain (ty %))] (when (symbol? t) (get refs t)))
-                   refined? (every? ref-of tos)]
-             :when (or refined? guard (seq changes))
+                   refined? (every? ref-of tos)
+                   ;; a landing in a state with invariants is checked even
+                   ;; when the state is a plain type, since edges out of it
+                   ;; assume them
+                   inv? #(seq (invariants-of invs gname %))
+                   landing? (or refined? (some inv? tos))]
+             :when (or landing? guard (seq changes))
              :let [v (or (:var (ref-of from)) 's)
                    avs (reduce (fn [acc [i t]]
                                  (conj acc (if (fixed-arg? t) (second t) (arg-var t i (set (conj acc v))))))
@@ -2245,7 +2250,7 @@
                    ;; each target's predicate, of the call itself: the law
                    ;; reads as the spec would write it, (ascending? (isort xs)),
                    ;; the shape the prover takes apart
-                   in (fn [t] (let [r (ref-of t)] (subst-var (:pred r) (:var r) call)))
+                   in (fn [t] (if-let [r (ref-of t)] (subst-var (:pred r) (:var r) call) true))
                    ;; a landing in t holds t's invariants: (and (Hot? ..) (even? ..))
                    in-held (fn [t]
                              (let [ps (for [[b pred] (invariants-of invs gname t)] (subst-var pred b call))]
@@ -2256,15 +2261,20 @@
                    ;; the invariants of the state the step leaves hold of it:
                    ;; a step keeps an invariant when it holds before it, and
                    ;; the start holds each, so every run holds them
+                   ;; a [state value] start is checked against them; a
+                   ;; start named by its state alone may be any value of it,
+                   ;; and a graph with no start any value of any state
+                   start (:start m)
+                   entered? (or (vector? start) (and (keyword? start) (not= from start)))
                    held (let [hs (for [[b pred] (invariants-of invs gname from)] (subst-var pred b v))]
-                          (when (seq hs) (if (next hs) (cons 'and hs) (first hs))))
+                          (when (and entered? (seq hs)) (if (next hs) (cons 'and hs) (first hs))))
                    pre (cond (and held test) (list 'and held test) held held :else test)
                    under (fn [p] (if pre (list '=> pre p) p))
                    edge (str gname ":" (name from) ":" f)
                    tested (get-in m [:tested from])
                    off-proof #(cond-> % tested (assoc :opts {:require :tested :because tested}))]
              law (concat
-                   (when refined?
+                   (when landing?
                      (cons (off-proof
                              {:name (symbol edge) :oid (str "edge." gname "." (name from) "." f)
                               :prop (list 'forall binders (under (lands tos)))
@@ -2276,7 +2286,7 @@
                                                    (str/join " and " (map #(str ":" (name %)) held-of)))))
                               :graph gname
                               :total true})
-                           (for [t tos]
+                           (for [t (when refined? tos)]
                              (cond-> {:name (symbol (str edge "->" (name t)))
                                       :oid (str "step." gname "." (name from) "." f "." (name t))
                                       :prop (list 'exists binders (if pre (list 'and pre (in t)) (in t)))
@@ -2298,7 +2308,7 @@
                          :graph gname})])
                    (when guard
                      (concat
-                       (when (or (= :keep else) (ref-of else))
+                       (when (or (= :keep else) (ref-of else) (inv? else))
                          [(off-proof
                             {:name (symbol (str edge ":refused"))
                              :oid (str "refused." gname "." (name from) "." f)

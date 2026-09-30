@@ -61,3 +61,13 @@
     (let [r (spec/check 'writ.spec-demo.climb-spec {:seed 42})]
       (is (:ok r) (:message r))
       (is (#{:proved :tested} (:status (law-result r 'climbing:up:climb)))))))
+
+(deftest an-invariant-is-assumed-only-where-a-run-must-hold-it
+  (testing "a start that may be any value of the state holds no invariant"
+    (let [r (spec/check 'writ.spec-demo.climb-anywhere-spec {:seed 42})]
+      (is (not (:ok r)))
+      (is (= :failed (:status (law-result r 'climbing:up:climb))) (:message r))))
+  (testing "a landing in a plain state is checked against its invariants"
+    (let [r (spec/check 'writ.spec-demo.parity-spec {:seed 42})]
+      (is (not (:ok r)))
+      (is (= :failed (:status (law-result r 'parity:n:bump))) (:message r)))))
