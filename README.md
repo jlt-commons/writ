@@ -752,6 +752,38 @@ that is an `and`, `:when.1`, `:when.2`, ... say each clause fails while
 the others hold. A clause that never fails on its own rules out nothing
 the others do not: `(<= 0 amt)` on a `Nat` amount is such a clause.
 
+**Actors.** Who may take a step is a guard on who is taking it. A graph
+names the argument that acts, by its type, and the key of it that holds
+its role; each edge says which roles may take it:
+
+```clojure
+(refine User [u {:id Nat, :role Role}] true)
+
+(graph vault
+  {:start  [:open [:Open 0]]
+   :actors {:type User :role :role}
+   :states {:open Open, :closed Closed}
+   :edges  {:open {[deposit User Nat] {:to #{:open} :by #{:owner :clerk}}
+                   [close User]       {:to #{:closed} :by #{:owner}}}}
+   :final  [:closed]})
+```
+
+`:by` is a guard, joined with the edge's own `:when` if it has one, so
+the laws of a guard come with it: a step by one of the roles lands where
+the edge says, and one by anyone else is refused and leaves the state as
+it was. A close a clerk can make fails `vault:open:close:refused`:
+
+```
+law `vault:open:close:refused` fails for
+  user = {:id 0, :role :clerk}
+  v    = [:Open 0]
+  taken by anyone but :owner, a close from open must leave it as it was
+  (close v user) => [:Closed 0]
+```
+
+`plan` prints, per role, the steps it may take. Without `:role` the
+acting value is the role itself.
+
 **Frames.** On a record state, an edge can say which keys its step may
 change. Every other key must come through as it was, whether the record
 names it or not:
