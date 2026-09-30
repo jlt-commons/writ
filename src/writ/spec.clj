@@ -3448,12 +3448,16 @@
 
 (defn- refuted
   "The law's failure at the counterexample the solver found, confirmed by
-  running the law there; nil when there is none, or running it holds."
+  running the law there; nil when there is none, running it holds, or it
+  is no value of the law's types.  The prover reads a refinement inside a
+  record as its base type, so its model may pick a value the refinement
+  rules out, a role no user has: a law says nothing there."
   [ctx r cex]
   (when cex
     (let [[bs body] (leading-foralls (:prop r))
           vars (mapv first bs)]
-      (when (every? #(contains? cex %) vars)
+      (when (and (every? #(contains? cex %) vars)
+                 (every? (fn [[x t]] (conforms? t (get cex x) (:tenv ctx))) bs))
         (let [res (try (holds (assoc ctx :vars vars) body cex)
                        (catch Throwable _ nil))]
           (when (= :fail (:result res))

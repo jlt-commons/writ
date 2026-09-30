@@ -188,3 +188,22 @@
   (is (types/compat? '(Map Keyword Nat) '{:a Nat, :b Nat} {}))
   (is (not (types/compat? '(Map Keyword Nat) '{:a Nat, :b String} {})))
   (is (not (types/compat? '(Map String Nat) '{:a Nat} {}))))
+
+;; --- symbolic evaluation of records -----------------------------------------------
+
+(deftest edges-on-records-are-proved-never-to-throw
+  (let [r (spec/check 'writ.spec-demo.member-spec {:seed 42 :cache false})]
+    (is (:ok r) (:message r))
+    (is (str/includes? (:message r) "law `membership:fresh:award` proved by symbolic evaluation, with the solver, and it never throws")
+        (:message r))))
+
+(deftest a-law-true-only-of-exact-maps-is-not-proved
+  (let [r (spec/check 'writ.spec-demo.exact-spec {:seed 42 :adequacy false :cache false})]
+    (is (= :tested (:status (law-result r 'an-award-has-its-keys-and-no-more))) (:message r))
+    (is (= :tested (:status (law-result r 'an-award-is-its-keys))) (:message r))))
+
+(deftest the-solver-finds-a-record-no-test-does
+  (let [r (spec/check 'writ.spec-demo.member-spec {:seed 42 :target 'writ.spec-demo.member-big :cache false})]
+    (is (not (:ok r)))
+    (is (str/includes? (:message r) "found by the solver") (:message r))
+    (is (re-find #":points 10\d\d" (:message r)))))

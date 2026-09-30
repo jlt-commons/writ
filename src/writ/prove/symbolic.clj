@@ -31,7 +31,11 @@
                        so a lookup, an assoc and equality need no search.
                        Keys may be symbolic.  Its entries have no order, as
                        a Clojure map's do not: keys and vals are seqs drawn
-                       from a set
+                       from a set.  :rest r marks a record's value, which
+                       may hold keys its record does not name, r standing
+                       for them: a lookup, an assoc or a dissoc of a key it
+                       does not name, anything that walks every entry, and
+                       equality with a map of another rest give up
     {:set {...}}       a set, or a seq drawn from one: :mem gives the
                        formula for 'x is in it'; :elems, when it is
                        finite, its elements as [guard v]; :elem a value
@@ -191,9 +195,11 @@
 (defn- merge-maps
   "Two maps with the same keys, merged under c entry by entry."
   [st c a b]
-  {:map (mapv (fn [[p k v] [q _ w]]
-                [(define! st :bool [:or [:and c p] [:and [:not c] q]]) k (merge-values st c v w)])
-              (:map a) (:map b))})
+  (when (not= (:rest a) (:rest b)) (give-up! "two maps, one holding keys its record does not name"))
+  (cond-> {:map (mapv (fn [[p k v] [q _ w]]
+                        [(define! st :bool [:or [:and c p] [:and [:not c] q]]) k (merge-values st c v w)])
+                      (:map a) (:map b))}
+    (:rest a) (assoc :rest (:rest a))))
 
 (defn- merge-same
   "Merge two values of one shape under formula c."
@@ -494,9 +500,23 @@
   [st k1 k2]
   (if (= k1 k2) true (truth (lift2 st (fn [p q] {:bool (equal st p q)}) k1 k2))))
 
+(defn- named!
+  "Give up on key k of a record's value when its record does not name it:
+  the keys it does not name may hold it."
+  [m k]
+  (when (and (:rest m) (not-any? #(= k (second %)) (:map m)))
+    (give-up! "a key a record does not name")))
+
+(defn- open!
+  "Give up on walking every entry of a record's value."
+  [m what]
+  (when (:rest m) (give-up! (str what " of a record, which may hold keys it does not name"))))
+
 (defn- map-equal
   "Two maps are equal when each has every entry the other has."
   [st a b]
+  (when (not= (:rest a) (:rest b))
+    (give-up! "comparing a record's value with a map that may not hold the same other keys"))
   (let [covers (fn [m n]
                  (reduce conj-f true
                          (for [[p k v] (:map m)]
@@ -510,6 +530,7 @@
 (defn- map-lookup
   "The value of key k in map m, or dflt."
   [st m k dflt]
+  (named! m k)
   (reduce (fn [acc [p k2 v]]
             (merge-values st (define! st :bool (conj-f p (same-key st k k2))) v acc))
           dflt (reverse (:map m))))
@@ -517,8 +538,9 @@
 (defn- map-without
   "m with the entry for k gone, when present-if holds."
   [st m k present-if]
-  {:map (vec (for [[p k2 v] (:map m)]
-               [(define! st :bool (conj-f p [:not (conj-f present-if (same-key st k k2))])) k2 v]))})
+  (named! m k)
+  (assoc m :map (vec (for [[p k2 v] (:map m)]
+                       [(define! st :bool (conj-f p [:not (conj-f present-if (same-key st k k2))])) k2 v]))))
 
 (defn- map-assoc
   "m with k -> v, when present-if holds: the old entry for k, if any, gone."
@@ -569,6 +591,19 @@
                       [[:= tag 7] {:opaque (fresh! st :int)}]]))
       (and (seq? ty) (= 'Tuple (first ty)))
       {:vec (mapv #(var-value st facts % tenv v) (rest ty))}
+      ;; a T or nil
+      (and (seq? ty) (= 'Opt (first ty)) (= 2 (count ty)))
+      (let [c (fresh! st :bool)]
+        (union-of st [[c {:nil true}] [[:not c] (var-value st facts (second ty) tenv v)]]))
+      ;; a record: an entry per key, an (Opt T) key's there only when its
+      ;; flag says so; and keys the record does not name, unknown
+      (and (map? ty) (seq ty) (every? keyword? (keys ty)))
+      {:map (vec (for [[k kt] (sort-by (comp str key) ty)
+                       :let [opt? (and (seq? kt) (= 'Opt (first kt)))]]
+                   [(if opt? (fresh! st :bool) true)
+                    {:const (code! st k) :ctype :keyword}
+                    (var-value st facts kt tenv v)]))
+       :rest (fresh! st :int)}
       ;; a vector of unknown length: opaque, but known to be a vector, so
       ;; (vector? v) is true of it and a law that only passes it along is
       ;; decided without its elements; reading them gives up, as for Any
@@ -879,7 +914,8 @@
                 a)
       contains? (lift2 st (fn [sv x]
                             (cond (:set sv) {:bool ((:mem (:set sv)) x)}
-                                  (:map sv) {:bool (into [:or false] (for [[p k _] (:map sv)] (conj-f p (same-key st x k))))}
+                                  (:map sv) (do (named! sv x)
+                                                {:bool (into [:or false] (for [[p k _] (:map sv)] (conj-f p (same-key st x k))))})
                                   (:nil sv) {:bool false}
                                   :else (give-up! "contains? on a value that is not a set or map")))
                        a b)
@@ -956,15 +992,18 @@
                         (lift2 st (fn [mm nn]
                                     (if (:nil nn)
                                       mm
-                                      (reduce (fn [acc [p k v]] (map-assoc st acc k v p))
-                                              (as-map mm) (:map (as-map nn)))))
+                                      (do (open! nn "merging in the entries")
+                                          (reduce (fn [acc [p k v]] (map-assoc st acc k v p))
+                                                  (as-map mm) (:map (as-map nn))))))
                                m n))
                       args))
       keys (lift st (fn [x] (let [m (as-map x)]
+                              (open! m "the keys")
                               (if (empty? (:map m)) {:nil true}
                                   (finite-set st (map (fn [[p k _]] [p k]) (:map m)) true))))
                  a)
       vals (lift st (fn [x] (let [m (as-map x)]
+                              (open! m "the vals")
                               (if (empty? (:map m)) {:nil true}
                                   (finite-set st (map (fn [[p _ v]] [p v]) (:map m)) false))))
                  a)
@@ -1096,7 +1135,8 @@
                    a)
       count (lift st (fn [x]
                        (cond
-                         (:map x) {:int (into [:+ 0] (map (fn [[p _ _]] [:ite p 1 0]) (:map x)))}
+                         (:map x) (do (open! x "the count")
+                                      {:int (into [:+ 0] (map (fn [[p _ _]] [:ite p 1 0]) (:map x)))})
                          (opaque? x) {:int (opaque-count st x)}
                          (:set x)
                          (let [{:keys [elems distinct]} (:set x)]
@@ -1459,9 +1499,16 @@
                    ::none)
       (contains? v :int) (int-at (:int v))
       (contains? v :bool) (let [b (:bool v)] (if (boolean? b) b (solve/eval-formula b model)))
-      (contains? v :const) (decoded-code (int-at (:const v)))
+      (contains? v :const) (decoded-code (int-at (:const v)) (:ctype v))
       (:nil v) nil
       (:vec v) (let [xs (mapv dec (:vec v))] (if (some #{::none} xs) ::none xs))
+      ;; a map: the entries present in the model; a record's keys it does
+      ;; not name are none, which is one value it may take
+      (contains? v :map)
+      (let [es (for [[p k x] (:map v)
+                     :when (if (boolean? p) p (solve/eval-formula p model))]
+                 [(dec k) (dec x)])]
+        (if (some #{::none} (flatten (seq es))) ::none (into {} es)))
       (:set v) (let [{:keys [pred elem]} (:set v)
                      {m :map d :default} (get model pred)]
                  (if (or (nil? pred) d)
@@ -1479,7 +1526,14 @@
                  (catch clojure.lang.ExceptionInfo _ nil))]
       (when (= :invalid (:result r))
         (let [by-code (into {} (map (fn [[c k]] [k c])) codes)
-              decoded-code (fn [k] (get by-code k (keyword (str "k" (abs k)))))
+              ;; a constant the model picked that no literal of the code is:
+              ;; a value of its own kind, apart from the others
+              decoded-code (fn [k ctype]
+                             (get by-code k (case ctype
+                                              :string (str "s" (abs k))
+                                              :symbol (symbol (str "s" (abs k)))
+                                              :char (char (+ 97 (mod (abs k) 26)))
+                                              (keyword (str "k" (abs k))))))
               values (into {} (for [[v sv] env] [v (decode sv (:model r) decoded-code)]))]
           (when-not (some #{::none} (vals values))
             values))))))
