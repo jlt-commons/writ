@@ -3088,7 +3088,26 @@
                 edges (vec (sort (filter ok-set (concat [(first ok) (peek ok)]
                                                         (get-in tenv [::spec-ints] [])))))]
             (gen/frequency [[3 spread] [1 (gen/elements edges)]]))))
-      (gen/such-that pred (type->gen base (assoc tenv ::bias (::bias-of-refine tenv))) (such-that-opts name)))))
+      (if (and (kind/index-type? base) (not (data-decl base tenv)))
+        ;; a refinement of an index is built a record at a time, each kept
+        ;; only when the index with it still meets the predicate, so a
+        ;; rule across the records -- no two bookings clash -- is met
+        ;; rather than filtered for.  A predicate that dropping a record
+        ;; can break is still filtered for, from what was built
+        (let [{k :key r :of u :unique} (kind/index-parts base)
+              ok? #(try (boolean (pred %)) (catch Throwable _ false))
+              built (gen/fmap (fn [rs]
+                                (reduce (fn [m x]
+                                          (let [m2 (assoc m (get x k) x)]
+                                            (if (or (contains? m (get x k))
+                                                    (some (fn [f] (some #(= (get x f) (get % f)) (vals m))) u)
+                                                    (not (ok? m2)))
+                                              m
+                                              m2)))
+                                        {} rs))
+                              (gen/vector (type->gen r tenv)))]
+          (gen/such-that ok? built (such-that-opts name)))
+        (gen/such-that pred (type->gen base (assoc tenv ::bias (::bias-of-refine tenv))) (such-that-opts name))))))
 
 (defn- type-env-of
   "The data types and refinements of a spec entry.  Refinements sit under
@@ -3302,7 +3321,9 @@
                      (- (:proved proof) (:general proof)) " on particular values)"))
               (when (= :proved (:require proof)) " (the spec requires proof)")
               (when-let [ts (seq (filter #(= :test (:evidence %)) laws))]
-                (str "; tested, not proved: " (str/join ", " (map :law ts))))))
+                (str "; tested, not proved: " (str/join ", " (map :law ts))
+                     (when-let [n (some->> (seq (keep :trials ts)) (apply min))]
+                       (str " (each on at least " n " inputs)"))))))
        (apply str (for [{:keys [id text blocking]} questions :when (not blocking)]
                     (str "\n  open question `" id "`: " text)))
        ;; what every proof here rests on
@@ -4418,6 +4439,37 @@
              (catch Throwable ex
                {:assumption name :status :failed :why (str "assumption `" name "`: " (or (ex-message ex) (str ex)))})))))))
 
+;; --- more trials for a law that is only tested --------------------------------------
+
+(def ^:private more-trials-default
+  "The trials a law the prover could not prove gets beyond its first
+  run, and the most time they may take, per law."
+  {:trials 900 :ms 20000})
+
+(defn- more-trials
+  "A law that is only tested runs again, a hundred trials at a time
+  with the seeds after its own, until it has had :trials more or :ms
+  have passed.  A failure among them is the law's result, with the seed
+  that replays it."
+  [ctx r opts]
+  (let [{extra :trials ms :ms} (merge more-trials-default
+                                     (when (map? (:more-trials opts)) (:more-trials opts)))]
+    (if (or (not= :tested (:status r)) (:lemma r) (not (:prop r)) (false? (:more-trials opts))
+            (not (pos? extra)))
+      r
+      (let [t0 (System/currentTimeMillis)
+            base (or (:seed r) 0)]
+        (loop [k 1, ran (or (:trials r) 0)]
+          (if (or (> (* 100 k) extra) (> (- (System/currentTimeMillis) t0) ms))
+            (assoc r :trials ran)
+            (let [t (test-law ctx {:name (:law r) :prop (:prop r)}
+                              {:trials 100 :seed (+ base k) :max-size (or (:max-size opts) 50)})]
+              (if (= :failed (:status t))
+                (merge (dissoc r :unproved :stuck :trials :discarded)
+                       (select-keys t [:status :counterexample :original :trial :seed :detail])
+                       {:after-trials ran})
+                (recur (inc k) (+ ran (or (:trials t) 100)))))))))))
+
 (defn- reachable-from
   "Every fn of graph g that f reaches through calls."
   [g f]
@@ -4539,6 +4591,11 @@
                            ;; a lemma is there to be cited, so it must be proved
                            (mapv #(if (:lemma %) (assoc-in % [:opts :require] :proved) %) laws)
                            level))
+             ;; a law the prover could not prove rests on its tests alone,
+             ;; so it gets more of them
+             results (let [wrapped (wrap! e)]
+                       (try (mapv #(more-trials ctx % opts) results)
+                            (finally (unwrap! wrapped))))
              unq (fn unq [f]
                    (cond (and (symbol? f) (contains? #{(name target) (name spec-ns)} (namespace f)))
                          (symbol (name f))
