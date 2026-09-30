@@ -207,3 +207,4 @@
     (is (not (:ok r)))
     (is (str/includes? (:message r) "found by the solver") (:message r))
     (is (re-find #":points 10\d\d" (:message r)))))
+

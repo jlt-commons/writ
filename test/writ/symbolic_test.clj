@@ -187,3 +187,7 @@
 
 (deftest a-throw-in-a-folded-call-is-a-throw-of-the-call
   (is (sym/prove {} [] [:call '= [:call 'str [:call 'nth [:call 'vector [:lit 1]] [:lit 5]]] [:lit "x"]])))
+
+(deftest nth-of-nil-is-nil
+  (is (sym/prove {} [] [:call 'nil? [:call 'nth [:nil] [:lit 3]]]))
+  (is (sym/prove {} [] [:call '= [:lit :d] [:call 'nth [:nil] [:lit 0] [:lit :d]]])))

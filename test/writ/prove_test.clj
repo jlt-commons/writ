@@ -714,3 +714,9 @@
            (norm {:types '{xs (Vec Int)}} [:call 'keep [:fn '[x] [:if p t/tnil v]] 'xs])))
     (testing "a kept value that may be nil is left alone"
       (is (= 'keep (second (norm {:types '{xs (Vec Int)}} [:call 'keep [:fn '[x] [:if p [:call 'get 'm 'x] t/tnil]] 'xs])))))))
+
+(deftest no-false-law-about-seqs-is-proved
+  (testing "a test of seq? that is no map destructure is read as written"
+    (is (not (:proved (prover/prove-law (:law (law-input 'writ.spec-demo.seqy-spec 'head-and-second-agree-on-nil)))))))
+  (testing "an nth of a list that may be nil may be nil"
+    (is (not (:proved (prover/prove-law (:law (law-input 'writ.spec-demo.seqy-spec 'always-picks-one))))))))

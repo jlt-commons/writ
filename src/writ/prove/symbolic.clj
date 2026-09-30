@@ -1169,11 +1169,15 @@
                       (let [k (int-of i)
                             xs (seq-of x)
                             past (if (= 3 n) c :bottom)]
-                        (if (integer? k)
+                        (cond
+                          ;; nth of nil is nil, or the default, at any index
+                          (:nil x) (if (= 3 n) c {:nil true})
+                          (integer? k)
                           (cond (< -1 k (count xs)) (nth xs k)
                                 (= 3 n) c
                                 :else (throws!))
                           ;; an unknown index: each position, under k = j
+                          :else
                           (do (when-not (= 3 n)
                                 (record-throw! st [:not (into [:or false] (for [j (range (count xs))] [:= k j]))]))
                               (reduce (fn [acc j] (merge-values st (define! st :bool [:= k j]) (nth xs j) acc))

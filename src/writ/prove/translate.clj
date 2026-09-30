@@ -154,17 +154,33 @@
       (contains? #{:call :app} (t/head t)) (into [(first t) (second t)] (map f) (drop 2 t))
       :else (with-meta (into [(first t)] (map f) (rest t)) (meta t)))))
 
+(defn- core-call?
+  "Is ast a call of clojure.core's f with arguments matching args, each
+  a node to be equal to or a predicate on the argument's node?"
+  [ast f & args]
+  (and (= :invoke (:op ast)) (= :ref (:op (:fn ast)))
+       (= f (symbol (name (:name (:fn ast)))))
+       (contains? #{nil "clojure.core"} (namespace (:name (:fn ast))))
+       (= (count args) (count (:args ast)))
+       (every? true? (map (fn [a x] (if (fn? a) (boolean (a x)) (= a x))) args (:args ast)))))
+
 (defn- destructured
-  "The value a map destructure takes apart: its expansion tests (seq? x)
-  and, when x is not a seq, is x itself.  x's AST node, or nil."
+  "The value a map destructure takes apart: its expansion tests (seq? x),
+  builds a map from x's pairs when it is one, and is x itself when it is
+  not.  x's AST node, or nil.  Only that expansion matches: another test
+  of seq? says something of its own."
   [ast]
-  (let [t (:test ast)]
-    (when (and (= :invoke (:op t)) (= :ref (:op (:fn t)))
-               (= 'seq? (symbol (name (:name (:fn t)))))
-               (contains? #{nil "clojure.core"} (namespace (:name (:fn t))))
-               (= 1 (count (:args t))) (= :ref (:op (first (:args t))))
-               (= (first (:args t)) (:else ast)))
-      (:else ast))))
+  (let [t (:test ast), x (first (:args t)), th (:then ast)]
+    (when (and (= :ref (:op x))
+               (core-call? t 'seq? x)
+               (= x (:else ast))
+               (= :if (:op th))
+               (core-call? (:test th) 'next x)
+               (= :if (:op (:then th)))
+               (core-call? (:test (:then th)) 'odd? #(core-call? % 'count x))
+               (= :if (:op (:else th)))
+               (core-call? (:test (:else th)) 'seq x))
+      x)))
 
 (defn term-of
   "The term for a lowered AST node.  env maps local names to terms."
