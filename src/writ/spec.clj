@@ -2763,9 +2763,16 @@
                    (and (seq? %) (contains? '#{List Vec Set Map} (first %))))
         opt? #(or (kind/opt-type? %) (and (kind/record-type? %) (some kind/opt-type? (vals %))))
         float? #(contains? '#{Float Double Float! Double!} %)
+        ;; a type and every type inside it: (List Int) raises the sign of
+        ;; its elements, a record the decisions of its keys
+        parts (fn parts [t]
+                (cons t (cond (kind/record-type? t) (mapcat parts (vals t))
+                              (kind/index-type? t) (parts (:of (kind/index-parts t)))
+                              (seq? t) (mapcat parts (rest t))
+                              :else nil)))
         fns-where (fn [pred ret?]
                     (vec (sort (for [[f {:keys [params ret]}] (:anns e)
-                                     :when (some pred (map base (cond-> params ret? (conj ret))))]
+                                     :when (some pred (mapcat (comp parts base) (cond-> params ret? (conj ret))))]
                                  f))))
         by {:empty (fns-where coll? false)
             :zero-and-negative (fns-where #(contains? '#{Int Nat} %) false)
