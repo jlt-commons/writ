@@ -729,6 +729,91 @@
     (cons (first p) (map desugar (rest p)))
     :else p))
 
+;; --- an integer between bounds ----------------------------------------------------
+
+(def ^:private binding-heads
+  '#{let let* fn fn* loop loop* for doseq letfn binding when-let if-let when-some if-some
+     as-> cond-> cond->> some-> some->> case condp})
+
+(defn- inline-helpers
+  "form with each call of a spec helper -- a defn of one expression that
+  binds no names of its own -- replaced by its body at the call's
+  arguments, to depth 4.  helpers: name -> [params body]."
+  [form helpers]
+  (let [plain? (fn [[_ body]] (not-any? #(and (seq? %) (contains? binding-heads (first %)))
+                                        (tree-seq coll? seq body)))
+        helpers (into {} (filter (comp plain? val)) helpers)]
+    (letfn [(inl [f depth]
+              (cond
+                (and (seq? f) (contains? helpers (first f)) (pos? depth)
+                     (= (count (first (get helpers (first f)))) (count (rest f))))
+                (let [[params body] (get helpers (first f))]
+                  (inl (walk/postwalk-replace (zipmap params (map #(inl % depth) (rest f))) body)
+                       (dec depth)))
+                (seq? f) (apply list (map #(inl % depth) f))
+                (vector? f) (mapv #(inl % depth) f)
+                :else f))]
+      (inl form 4))))
+
+(defn- bounds-of
+  "An atom of an integer t's range as a vector of [:lo L k] (L + k <= t),
+  [:up U k] (t + k <= U) and [:fact f] (a part without t); nil when t
+  appears some other way."
+  [a t]
+  (let [has-t? #(some #{t} (tree-seq coll? seq %))
+        pair (fn [op l r]
+               (let [k (if (= '< op) 1 0)]
+                 (cond
+                   (not (or (has-t? l) (has-t? r))) [[:fact (list op l r)]]
+                   (and (= t l) (not (has-t? r))) [[:up r k]]
+                   (and (= t r) (not (has-t? l))) [[:lo l k]])))]
+    (cond
+      (not (has-t? a)) [[:fact a]]
+      (not (and (seq? a) (symbol? (first a)))) nil
+      :else
+      (let [op (symbol (name (first a))), xs (vec (rest a))]
+        (case op
+          (< <=) (when (>= (count xs) 2)
+                   (let [ps (map #(pair op %1 %2) xs (rest xs))]
+                     (when (every? some? ps) (vec (apply concat ps)))))
+          (> >=) (bounds-of (apply list (if (= '> op) '< '<=) (rseq xs)) t)
+          = (when (= 2 (count xs))
+              (let [[l r] xs]
+                (cond (and (= t l) (not (has-t? r))) [[:lo r 0] [:up r 0]]
+                      (and (= t r) (not (has-t? l))) [[:lo l 0] [:up l 0]])))
+          nil)))))
+
+(defn- eliminate-exists
+  "Each (exists [t Nat] P), or over Int, whose body -- its spec helpers
+  inlined -- is a conjunction of bounds on t and facts without t, read as
+  the facts and each lower bound at most each upper one: over the
+  integers there is such a t exactly then.  The prover reads that, and a
+  test evaluates it exactly, where sampling t could miss the one value.
+  An exists of any other shape is left as it is."
+  [p helpers]
+  (cond
+    (head? p "exists")
+    (let [[q [t ty] body] p
+          body (eliminate-exists body helpers)
+          tn (when (symbol? ty) (symbol (name ty)))
+          flat (fn flat [f] (if (head? f "and") (mapcat flat (rest f)) [f]))
+          parts (when (contains? '#{Nat Int} tn)
+                  (map #(bounds-of % t) (flat (inline-helpers body helpers))))]
+      (if (or (nil? parts) (some nil? parts))
+        (list q [t ty] body)
+        (let [xs (apply concat parts)
+              facts (keep #(when (= :fact (first %)) (second %)) xs)
+              los (cond-> (filter #(= :lo (first %)) xs) (= 'Nat tn) (conj [:lo 0 0]))
+              ups (filter #(= :up (first %)) xs)
+              meets (for [[_ l k1] los, [_ u k2] ups
+                          :let [k (+ k1 k2)]]
+                      (list '<= (if (zero? k) l (list '+ l k)) u))
+              cs (distinct (concat facts meets))]
+          (case (count cs) 0 true 1 (first cs) (cons 'and cs)))))
+    (head? p "forall") (let [[q b body] p] (list q b (eliminate-exists body helpers)))
+    (or (head? p "and") (head? p "=>")) (cons (first p) (map #(eliminate-exists % helpers) (rest p)))
+    :else p))
+
 (defn- auto-proof
   "The proof term a law's shape dictates, for writ.law/prove: refl for an
   equality, pair for a conjunction, fn for a universal or implication (a
@@ -4529,6 +4614,15 @@
                                                        k)))
                                anns)
              ctx {:ev (evaluator spec-ns) :tenv (assoc tenv ::seeds (code-seeds target))}
+             ;; the spec's own one-expression fns, which an exists over
+             ;; an integer's bounds is read through
+             helpers (into {} (for [f (book/read-forms (source-url spec-ns))
+                                    :when (and (seq? f) (contains? '#{defn defn-} (first f)))
+                                    :let [{:keys [name params body]} (defn-parts f)]
+                                    :when (and (vector? params) (not-any? #{'&} params)
+                                               (every? symbol? params) (= 1 (count body))
+                                               (not (contains? publics name)))]
+                                [name [params (first body)]]))
              ;; only what this check wrapped is unwrapped after it, so a
              ;; caller's own instrument stays in place
              wrapped (wrap! e)
@@ -4537,7 +4631,7 @@
                           (catch Throwable ex (unwrap! wrapped) (throw ex)))
              results (try
                        (vec (for [{:keys [name prop explain graph total lemma step-of witness guard-law]} laws
-                                  :let [p (desugar prop)]]
+                                  :let [p (eliminate-exists (desugar prop) helpers)]]
                               (try
                                 (lw/check-prop-shape! p)
                                 (let [qp (qualify p #{} publics interns target spec-ns

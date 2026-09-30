@@ -76,3 +76,20 @@
         r (spec/check 'writ.spec-demo.slots-spec {:seed 2 :more-trials false})]
     (is (:ok r) (:message r))
     (is (< (- (System/currentTimeMillis) t0) 30000) "built, not filtered for")))
+
+;; --- a unit between bounds --------------------------------------------------------
+
+(deftest an-exists-over-bounds-is-proved
+  (let [r (spec/check 'writ.spec-demo.span-exists-spec {:seed 1})]
+    (is (:ok r) (:message r))
+    (is (= :proved (:status (law-result r 'overlap-means-a-shared-unit))))
+    (is (= :proved (:status (law-result r 'a-shared-unit-means-overlap))))))
+
+(deftest an-exists-over-bounds-is-refuted-by-the-solver
+  ;; one trial: the tests almost never meet it, and the solver always does
+  (doseq [seed [1 2 3 4 5]]
+    (let [r (spec/check 'writ.spec-demo.span-exists-spec
+                        {:seed seed :trials 1 :target 'writ.spec-demo.span-naive :more-trials false})
+          l (law-result r 'overlap-means-a-shared-unit)]
+      (is (= :failed (:status l)) (str "seed " seed))
+      (is (= :solver (:found-by l)) (str "seed " seed)))))
