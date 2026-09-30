@@ -4114,6 +4114,7 @@
   can track: [{:id :kind :of :fns :text} ...].  An id reads kind.subject:
   law.name, signature.f, edge.graph.state.f, step.graph.state.f.target,
   guard.graph.state.f (and .n for each clause), refused.graph.state.f,
+  frame.graph.state.f, ensures.f,
   invariant.graph.state, reach.graph, start.graph, final.graph,
   never.graph.a.b, before.graph.a.b, runs.graph, flow.f, calls.f,
   machine.m, question.q, assume.ns/f and assume.name.  :fns are the

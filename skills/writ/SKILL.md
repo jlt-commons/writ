@@ -3,8 +3,8 @@ name: writ
 description: >-
   Use when writing a writ spec -- the problem statement as a state graph
   and checkable laws about what code means and how it calls (writ.spec:
-  spec/graph/refine/invariant/question/ann/data/law/calls/flow/machine/plan/
-  obligations/attest) -- or its proof namespace
+  spec/graph/refine/invariant/question/ann/data/law/assume/calls/flow/
+  machine/plan/elicit/obligations/attest) -- or its proof namespace
   (proof-of/lemma/hint), or the plain Clojure implementation it
   constrains, or when reading a writ.spec report or any
   "Writ:" error (purity, termination, ordering, arity, types, tagged data,
@@ -143,10 +143,12 @@ failures: a law over every input may already answer one.
   run from the start gets there. A state reached from the start with no
   edges out must be listed in `:final`.
 - `(invariant g :state [v] pred)`: what every value of the state holds,
-  whichever edge it came by. Each edge landing there carries it, and a
-  `[state value]` start must satisfy it. Each edge out of the state may
-  assume it, so an invariant kept by induction is kept. One the
-  refinement already implies is vacuous and fails.
+  whichever edge it came by. Each edge landing there carries it, plain
+  states included, and a `[state value]` start must satisfy it. Each edge
+  out of the state may assume it, so an invariant kept by induction is
+  kept; with a keyword `:start`, edges out of the start state assume
+  nothing, since it may begin at any value. One the refinement already
+  implies is vacuous and fails.
 - A guarded edge: `{[withdraw Nat] {:to #{:open} :when (fn [a amt] (<= amt
   (second a))) :else :keep}}`. The `:when` fn takes the edge fn's own
   arguments, in the fn's order. The edge law and steps hold under the
@@ -157,8 +159,9 @@ failures: a law over every input may already answer one.
   folding the refusal into the targets.
 - Who may act: `:actors {:type User :role :role}` on the graph names the
   argument that acts and the key holding its role, and `:by #{:owner}` on
-  an edge the roles that may take it. It is a guard, so a step by anyone
-  else must be refused and keep the state; `plan` lists who may do what.
+  an edge the roles that may take it. It is a guard, joined after the
+  edge's own `:when`, so a step by anyone else must be refused and keep
+  the state; `plan` lists who may do what.
 - A frame, on a record state: `{[award Nat] {:to #{:active} :changes
   [:points]}}`. `g:s:f:frame` says the step changes only those keys and
   keeps every other one, named by the record or not, as it was. It can go
@@ -209,7 +212,8 @@ failures: a law over every input may already answer one.
   `(List T) (Vec T) (Set T) (Map K V) (Tuple T ...) (Opt T)`, `(-> A R)`,
   records such as `{:id Nat, :nick (Opt String)}`, `(Index :id Member
   :unique [:email])` (a map of records keyed by their :id, no two sharing
-  an email), and declared data.
+  an email, nil counting as one), and declared data. A fn type takes at
+  most eight arguments.
   `(List T)` is any seq: list, vector, lazy seq or nil. `(Opt T)` is a T
   or nil.
   A generated `String` is mostly letters and digits, sometimes printable
@@ -226,8 +230,9 @@ failures: a law over every input may already answer one.
   - `(=> P Q)`; a case where `P` does not hold is skipped
   - `(forall [x T, y U] P)`
   - `(exists [x T] P)`
-  - `(throws? e)`: evaluating `e` throws. A signature broken by the law
-    itself is rethrown, not counted.
+  - `(throws? e)`: evaluating `e` throws, lazy seqs in its value
+    realised. A signature broken by the law itself is rethrown, not
+    counted. Refer it from `writ.spec`.
   - any expression, which holds when it is truthy
 
   A free name refers first to the target's public fns, then to the spec's
@@ -263,9 +268,10 @@ library, another namespace), say what the spec takes as given:
 ```
 
 A signature types the calls statically and is checked where the fn
-returns while laws run. A law is tested against the real fns every check
-and cited by the prover like a lemma, without proof. An assumption may
-not call the target's fns. Every report lists what is assumed, and
+returns while laws run, every call, writ's own included. A law is tested
+against the real fns every check and cited by the prover like a lemma,
+without proof. An assumption may not call the target's fns, directly or
+through a spec helper. Every report lists what is assumed, and
 `attest` counts a new assumption as weakening the spec, so assume what the
 dependency documents, not whatever closes a proof.
 
@@ -275,7 +281,9 @@ dependency documents, not whatever closes a proof.
   does as a law instead.
 - A law left tested as "outside the prover: `frequencies`" can rest on an
   assumption about it: `(assume clojure.core/frequencies [...])` and a
-  law about it, which the prover then cites.
+  law about it, which the prover then cites. The signature types every
+  plain `frequencies` call in the code, unless the namespace excludes it
+  from core or refers another fn by that name.
 - ``assumes a signature for `ns/f`, which does not resolve`` - require
   the namespace in the spec and name the fn through its alias.
 
@@ -512,8 +520,11 @@ The code builds and reads records as plain maps: literals, `(:k m)`, `get`,
 `assoc`, `dissoc` and `{:keys [...]}` destructuring. The static check reads
 them by key: a literal must carry every required key with a value of its
 type, a read must name a key the record has, and an `(Opt T)` key read
-without a default may be nil, so it is not a `T`. The prover works through
-`get`, `assoc`, `dissoc` and `contains?` on literal keys.
+may be nil, so it is not a `T`, default or not: `(:nick m "")` is nil when
+the key holds nil; write `(or (:nick m) "")`. The prover works through
+`get`, `assoc`, `dissoc` and `contains?` on literal keys, and symbolic
+evaluation runs on records, so an edge over a record state is proved
+never to throw.
 
 ## Running the check
 
@@ -560,7 +571,8 @@ law runs until it is fixed. After that, each law has a `:status`:
 - `:evaluated`: a law with no quantifiers, run once.
 - `:tested`: passed test.check's trials. This is evidence, not proof.
   `:unproved` says why the prover did not prove it: a form outside its
-  model (`conj`, maps, `min`, strings), the proof checker rejecting the
+  model (`conj` onto a non-vector, `frequencies`, most string fns), the
+  proof checker rejecting the
   proof (a writ bug; report it), or no proof found. That is not a failure.
   A law written with modelled forms and the spec's own helpers is more
   likely to be proved.
@@ -722,8 +734,8 @@ confirm it, then without one.
 - ``:points is Nat, but the body gives String`` - that key's value has the
   wrong type.
 - ``returns String but its body has type (Opt String): it may be nil`` -
-  an optional key was read without a default. Give one, `(:nick m "")`, or
-  branch on it.
+  an optional key was read, and it may hold nil even with a default.
+  Write `(or (:nick m) "")`, or branch on it.
 
 ### Structural rules (plain and annotated code)
 
