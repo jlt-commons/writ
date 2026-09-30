@@ -320,7 +320,14 @@
     (fail! "`refine` is (refine Name [x BaseType] predicate), had: "
            (pr-str (list 'refine nm binder '...))))
   (let [[v base] binder
-        pred-name (symbol (str nm "?"))]
+        pred-name (symbol (str nm "?"))
+        ;; an Index's keys and unique fields are part of what a value of it
+        ;; is, so a landing in a refinement of one must keep them
+        pred (if (and (kind/index-type? base) (keyword? (second base)))
+               (let [{k :key u :unique} (kind/index-parts base)
+                     own (list 'writ.spec/indexed? k u v)]
+                 (if (true? pred) own (list 'and own pred)))
+               pred)]
     `(do (defn ~pred-name ~(str "Is `" v "` a " nm "?") [~v] ~pred)
          (-register! '~(ns-name *ns*) :refine '~{:name nm :var v :base base :pred pred
                                                  :pred-name pred-name}))))
@@ -682,6 +689,21 @@
            (= (count (:fields info)) (dec (count v)))
            (every? true? (map #(conforms? %1 %2 tenv) (:fields info) (rest v)))))))
 
+(defn unique-by?
+  "Do no two of xs share (f x)?  True of none or one."
+  [f xs]
+  (let [ks (map f xs)] (= (count ks) (count (distinct ks)))))
+
+(defn indexed?
+  "Is db a map of records, each kept under its field k, no two sharing a
+  field named in unique?  What an (Index :k R :unique [...]) says beyond
+  its records' own type; a refinement of an Index checks it in its
+  predicate, so a step that lands in one must keep it."
+  [k unique db]
+  (and (map? db)
+       (every? (fn [[i x]] (= i (get x k))) db)
+       (every? #(unique-by? % (vals db)) unique)))
+
 (defn- refinement [t tenv]
   (when (symbol? t) (get-in tenv [::refines (symbol (name t))])))
 
@@ -719,6 +741,12 @@
                        (conforms? kt (get v k) tenv)
                        (opt-type? kt)))
                    t))
+
+      (and (kind/index-type? t) (not (data-decl t tenv)))
+      (let [{k :key r :of u :unique} (kind/index-parts t)]
+        (and (map? v)
+             (every? (fn [[i x]] (and (conforms? r x tenv) (= i (get x k)))) v)
+             (every? #(unique-by? % (vals v)) u)))
 
       (seq? t)
       (let [[h & as] t]
@@ -785,8 +813,12 @@
 
 (def ^:private any-string
   "Mostly words, but now and then printable ASCII with tabs and newlines,
-  so code that trims, splits or escapes meets what it is there for."
+  so code that trims, splits or escapes meets what it is there for, and
+  now and then one of a few short strings, so two strings generated apart
+  are sometimes the same, as two small integers often are: an email
+  already taken, a name looked up."
   (gen/frequency [[3 gen/string-alphanumeric]
+                  [1 (gen/elements ["" "a" "b" "ab"])]
                   [1 (gen/fmap #(apply str %)
                                (gen/vector (gen/frequency [[8 gen/char-ascii]
                                                            [1 (gen/elements [\tab \newline])]])))]]))
@@ -855,6 +887,19 @@
                           (type->gen kt tenv))))]
         (gen/fmap (fn [vs] (into {} (remove #(= ::absent (second %))) (map vector ks vs)))
                   (apply gen/tuple (map key-gen ks))))
+
+      ;; an index: records, each kept under its key, and one that would
+      ;; share a key or a unique field with one before it left out
+      (and (kind/index-type? t) (not (data-decl t tenv)))
+      (let [{k :key r :of u :unique} (kind/index-parts t)]
+        (gen/fmap (fn [rs]
+                    (reduce (fn [m x]
+                              (if (or (contains? m (get x k))
+                                      (some (fn [f] (some #(= (get x f) (get % f)) (vals m))) u))
+                                m
+                                (assoc m (get x k) x)))
+                            {} rs))
+                  (gen/vector (type->gen r tenv))))
 
       (seq? t)
       (let [[h & as] t
@@ -2082,7 +2127,13 @@
                    held-of (filterv #(seq (invariants-of invs gname %)) tos)
                    lands (fn [ts] (if (next ts) (cons 'or (map in-held ts)) (in-held (first ts))))
                    test (when guard (guard-of guard call-args))
-                   under (fn [p] (if test (list '=> test p) p))
+                   ;; the invariants of the state the step leaves hold of it:
+                   ;; a step keeps an invariant when it holds before it, and
+                   ;; the start holds each, so every run holds them
+                   held (let [hs (for [[b pred] (invariants-of invs gname from)] (subst-var pred b v))]
+                          (when (seq hs) (if (next hs) (cons 'and hs) (first hs))))
+                   pre (cond (and held test) (list 'and held test) held held :else test)
+                   under (fn [p] (if pre (list '=> pre p) p))
                    edge (str gname ":" (name from) ":" f)
                    tested (get-in m [:tested from])
                    off-proof #(cond-> % tested (assoc :opts {:require :tested :because tested}))]
@@ -2102,7 +2153,7 @@
                            (for [t tos]
                              (cond-> {:name (symbol (str edge "->" (name t)))
                                       :oid (str "step." gname "." (name from) "." f "." (name t))
-                                      :prop (list 'exists binders (if test (list 'and test (in t)) (in t)))
+                                      :prop (list 'exists binders (if pre (list 'and pre (in t)) (in t)))
                                       :explain (str "the graph says a " f " can take " (name from) " to "
                                                     (name t) ", but no generated " (name from) " does")
                                       :step-of gname}
@@ -2126,7 +2177,7 @@
                             {:name (symbol (str edge ":refused"))
                              :oid (str "refused." gname "." (name from) "." f)
                              :prop (list 'forall binders
-                                         (list '=> (list 'not test)
+                                         (list '=> (if held (list 'and held (list 'not test)) (list 'not test))
                                                (if (= :keep else) (list '= call v) (in-held else))))
                              :explain (str "when its guard fails, a " f " from " (name from)
                                            (if (= :keep else)

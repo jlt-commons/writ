@@ -116,8 +116,9 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
   edges out must be listed in `:final`.
 - `(invariant g :state [v] pred)`: what every value of the state holds,
   whichever edge it came by. Each edge landing there carries it, and a
-  `[state value]` start must satisfy it. One the refinement already
-  implies is vacuous and fails.
+  `[state value]` start must satisfy it. Each edge out of the state may
+  assume it, so an invariant kept by induction is kept. One the
+  refinement already implies is vacuous and fails.
 - A guarded edge: `{[withdraw Nat] {:to #{:open} :when (fn [a amt] (<= amt
   (second a))) :else :keep}}`. The `:when` fn takes the edge fn's own
   arguments, in the fn's order. The edge law and steps hold under the
@@ -171,7 +172,9 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
   with type parameters.
 - Types: `Nat Int Bool String Char Keyword Symbol Float Double Unit Any`,
   `(List T) (Vec T) (Set T) (Map K V) (Tuple T ...) (Opt T)`, `(-> A R)`,
-  records such as `{:id Nat, :nick (Opt String)}`, and declared data.
+  records such as `{:id Nat, :nick (Opt String)}`, `(Index :id Member
+  :unique [:email])` (a map of records keyed by their :id, no two sharing
+  an email), and declared data.
   `(List T)` is any seq: list, vector, lazy seq or nil. `(Opt T)` is a T
   or nil.
   A generated `String` is mostly letters and digits, sometimes printable
