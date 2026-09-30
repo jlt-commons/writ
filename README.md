@@ -667,6 +667,23 @@ into shape. The prover takes the predicate as a hypothesis, and the
 static check sees the base type. `refine` also defines the predicate, as
 `Paddle?`, for laws to use.
 
+Other values are found by drawing from the base type and keeping those
+that meet the predicate, and a predicate a random value rarely meets
+starves: a receipt whose total is the sum of its items, a library whose
+members' loan counts match the copies they hold. `{:build f}` names a fn
+of the spec that makes any value of the base type one of the refinement,
+and its values are drawn through it:
+
+```clojure
+(defn settle [r] (assoc r :total (reduce + 0 (:items r))))
+
+(refine Receipt [r {:items (Vec Nat), :total Nat}] (= (:total r) (reduce + 0 (:items r)))
+  {:build settle})
+```
+
+The predicate still decides: a built value it rejects is a mistake in
+the builder, and the check says so.
+
 ### The state graph
 
 Every spec declares its graph, and it comes first. Its states are types;

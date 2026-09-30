@@ -93,3 +93,19 @@
           l (law-result r 'overlap-means-a-shared-unit)]
       (is (= :failed (:status l)) (str "seed " seed))
       (is (= :solver (:found-by l)) (str "seed " seed)))))
+
+;; --- a refinement built to fit ----------------------------------------------------
+
+(deftest a-refinement-with-a-build-is-generated-through-it
+  (let [r (spec/check 'writ.spec-demo.receipt-spec {:seed 1})]
+    (is (:ok r) (:message r))))
+
+(deftest a-refinement-a-random-value-rarely-meets-starves-without-one
+  (let [r (spec/check 'writ.spec-demo.receipt-unbuilt-spec {:seed 1})]
+    (is (not (:ok r)))
+    (is (has? r "could not generate a value of refinement `Receipt`"))
+    (is (has? r "{:build f}"))))
+
+(deftest a-build-must-name-a-fn
+  (is (thrown-with-msg? Exception #"\{:build f\}"
+        (macroexpand-1 '(writ.spec/refine R [x Nat] (pos? x) {:build 3})))))

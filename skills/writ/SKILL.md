@@ -111,7 +111,11 @@ failures: a law over every input may already answer one.
 - `(refine Name [x Base] pred)` is a type: values of Base where pred
   holds. Use it in `ann`, `forall`, states, other refinements. It defines
   `Name?`. Refine the parts (a Paddle, a Ball) rather than folding random
-  Ints into range inside laws.
+  Ints into range inside laws. A rule across a whole value that a random
+  one rarely meets (a total that is the sum of the items, counts that
+  match what they count) starves the generator: give the refinement
+  `{:build f}`, `(refine Receipt [r ...] pred {:build settle})`, where
+  `settle` is a spec fn that makes any base value one that meets pred.
 - Each edge's fn must fit by its `ann`: the state's param (first, or at
   `_`) = the state's base type, the others the arg types; the return type
   = the targets' base type.

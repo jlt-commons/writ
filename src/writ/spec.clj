@@ -349,11 +349,19 @@
   A refinement can go wherever a type goes: in `ann`, in `forall`, as a
   graph's state.  Its values are generated to satisfy the predicate, the
   prover takes the predicate as a hypothesis, and the static check sees
-  the base type.  It also defines the predicate as a fn, `Row?`."
-  [nm binder pred]
+  the base type.  It also defines the predicate as a fn, `Row?`.
+
+  A value a random one of the base type rarely meets -- a receipt whose
+  total is the sum of its items -- is built rather than filtered for:
+  (refine Receipt [r ...] pred {:build settle}) generates base values and
+  hands each to the spec's fn `settle`, which makes it one that meets pred."
+  [nm binder pred & [opts]]
   (when-not (and (simple-sym? nm) (vector? binder) (= 2 (count binder)) (simple-sym? (first binder)))
     (fail! "`refine` is (refine Name [x BaseType] predicate), had: "
            (pr-str (list 'refine nm binder '...))))
+  (when (and (some? opts) (not (and (map? opts) (= #{:build} (set (keys opts))) (simple-sym? (:build opts)))))
+    (fail! "`refine " nm "` takes one option, {:build f}: f names the spec's fn that makes a base"
+           " value one of the refinement, had: " (pr-str opts)))
   (let [[v base] binder
         pred-name (symbol (str nm "?"))
         ;; an Index's keys and unique fields are part of what a value of it
@@ -364,8 +372,9 @@
                  (if (true? pred) own (list 'and own pred)))
                pred)]
     `(do (defn ~pred-name ~(str "Is `" v "` a " nm "?") [~v] ~pred)
-         (-register! '~(ns-name *ns*) :refine '~{:name nm :var v :base base :pred pred
-                                                 :pred-name pred-name}))))
+         (-register! '~(ns-name *ns*) :refine '~(cond-> {:name nm :var v :base base :pred pred
+                                                         :pred-name pred-name}
+                                                  opts (assoc :build (:build opts)))))))
 
 (defmacro invariant
   "State what always holds of a graph state's values, wherever they come
@@ -3140,7 +3149,8 @@
    :ex-fn (fn [_] (ex-info (str "writ could not generate a value of refinement `" nm
                                 "`: its predicate rejected 5000 candidates. Refine its parts"
                                 " (a refined field, a narrower base type) so values are built"
-                                " to fit rather than filtered.")
+                                " to fit rather than filtered, or give it {:build f}, a fn of"
+                                " the spec that makes any value of its base one of it.")
                            {:writ/error true}))})
 
 (defn- refine-gen
@@ -3210,7 +3220,18 @@
                     tenv (assoc-in tenv [::refines name] (assoc r :pred pred))
                     bias (bias-of (literals (:pred r) spec-ns @bodies))]
                 (assoc-in tenv [::refines name :gen]
-                          (refine-gen r pred (assoc tenv ::bias-of-refine bias ::spec-ints @spec-ints)))))
+                          (if-let [b (:build r)]
+                            ;; built by the spec's own fn, then checked
+                            (let [build (some-> (ns-resolve (the-ns spec-ns) b) deref)]
+                              (when-not (fn? build)
+                                (fail! "refinement `" name "` is built by `" b "`, which is not a fn of the spec"))
+                              (gen/such-that #(try (boolean (pred %)) (catch Throwable _ false))
+                                             (gen/fmap build (type->gen (:base r) tenv))
+                                             {:max-tries 100
+                                              :ex-fn (fn [_] (ex-info (str "the :build of refinement `" name "`, `" b
+                                                                           "`, makes values its predicate rejects")
+                                                                      {:writ/error true}))}))
+                            (refine-gen r pred (assoc tenv ::bias-of-refine bias ::spec-ints @spec-ints))))))
             (tenv-of data)
             refines)))
 
@@ -4547,11 +4568,15 @@
         (loop [k 1, ran (or (:trials r) 0)]
           (if (or (> (* 100 k) extra) (> (- (System/currentTimeMillis) t0) ms))
             (assoc r :trials ran)
-            (let [t (test-law ctx {:name (:law r) :prop (:prop r)}
-                              {:trials 100 :seed (+ base k) :max-size (or (:max-size opts) 50)})]
+            (let [t (try (test-law ctx {:name (:law r) :prop (:prop r)}
+                                   {:trials 100 :seed (+ base k) :max-size (or (:max-size opts) 50)})
+                         ;; as the first run: a law that cannot be run fails with the reason
+                         (catch Throwable ex
+                           {:status :failed :counterexample {} :detail [] :seed (+ base k)
+                            :error (or (ex-message ex) (str ex))}))]
               (if (= :failed (:status t))
                 (merge (dissoc r :unproved :stuck :trials :discarded)
-                       (select-keys t [:status :counterexample :original :trial :seed :detail])
+                       (select-keys t [:status :counterexample :original :trial :seed :detail :error])
                        {:after-trials ran})
                 (recur (inc k) (+ ran (or (:trials t) 100)))))))))))
 
