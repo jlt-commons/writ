@@ -378,8 +378,11 @@ one):
 ```
 
 Generated values are built that way, keyed and with no field shared, not
-filtered for it. A refinement of an Index checks the same in its
-predicate, so the edge law `registry:db:register` says a registration
+filtered for it. A refinement of an Index is built the same way: a record
+is kept only when the index with it still meets the refinement's
+predicate, so a rule across the records, no two bookings of a room at
+once, costs nothing to generate. The refinement checks the key and
+unique fields in its predicate too, so the edge law `registry:db:register` says a registration
 lands in a `Db`: keyed by id, no email twice. A `register` that forgets
 to look at the emails fails it:
 
@@ -466,6 +469,31 @@ A proposition is built from:
   breaks a signature, is not counted: it is rethrown, and the law fails
   with it, since the law misuses the code rather than finding it throws.
 - any other expression, which holds when it is truthy
+
+A hypothesis no generated input meets, such as `(= a (* 3 (+ b 40)))` when
+a generated `Int` stays within 50 of 0, tests nothing. writ then asks the
+solver for inputs that meet it: where the law is false there, the report
+gives the solver's counterexample, confirmed by running the code; where
+the law is proved, the proof stands on up to three inputs the solver found
+for the hypothesis, and the stand-ins are judged at them too. Only when
+the solver finds none either does the law fail with "the hypothesis never
+held".
+
+An `exists` over a `Nat` or `Int` whose body is bounds on it, with the
+spec's own one-expression helpers read through, means the bounds meet:
+`(exists [t Nat] (and (<= s1 t) (< t e1) (<= s2 t) (< t e2)))` holds
+exactly when each lower bound is below each upper one: `(<= (+ s1 1) e1)`,
+`(<= (+ s1 1) e2)`, `(<= (+ s2 1) e1)`, `(<= (+ s2 1) e2)`. writ reads it
+that way, so a law of that shape is proved or refuted by the
+solver, where a nested `exists` of any other shape is only sampled:
+
+```clojure
+(defn holds? [s t] (and (<= (:start s) t) (< t (:end s))))
+
+(law overlap-means-a-shared-unit
+  (forall [a Span, b Span]
+    (=> (overlaps? a b) (exists [t Nat] (and (holds? a t) (holds? b t))))))
+```
 
 ```clojure
 (law reading-past-the-end-throws
@@ -826,10 +854,17 @@ guard. It needs a record state and names only the record's keys.
 
 **Runs.** `:runs N` walks N runs through the real fns from a `[state
 value]` start, up to `:depth` steps each (default 20). At each step it
-takes an edge chosen by the seed, with generated arguments. Each landing
+takes an edge chosen by the seed, with generated arguments. On every
+other guarded step it looks for arguments the guard takes, drawing the
+state's own integers and their neighbours too, since a guard like
+`(= amt (:total o))` compares an argument with the state; the other steps
+take their first draw, so refusals are walked as well. Each landing
 must be in a state the edge allows (for a refused step, the state it
 stays in or its `:else`) and hold that state's invariants, and every
-final state reached by the graph must be reached by some run. A run finds
+final state reached by the graph must be reached by some run. When the
+seeded runs miss a final state, runs are walked toward it, each step
+taking an edge that brings it closer. A final state still not reached is
+reported with the guard that refused every step, when one did. A run finds
 what sampling each state apart can miss, a value only a long climb from
 the start produces:
 
@@ -1054,7 +1089,10 @@ gets an entry in `:machines`; a failed one carries `:mismatches`, one
 Options: `:target` checks a different implementation against the same spec,
 `:trials` is the number of test.check runs per law (default 100), `:seed`
 replays a run (default random, reported per law), and `:max-size` is the
-largest generated size (default 50). `:adequacy false` skips the third
+largest generated size (default 50). A law the prover does not prove gets
+up to 900 more trials after its first 100, a hundred at a time with the
+seeds after its own, within 20 seconds; `:more-trials {:trials n :ms t}`
+changes that and `:more-trials false` turns it off. `:adequacy false` skips the third
 stage, for example while a spec is still being written, and
 `:prove false` skips the prover. `:require` sets the evidence every law
 needs, in place of the spec's own. `:proof` names the proof namespace
@@ -1099,8 +1137,12 @@ By default a spec accepts either, and the report says which each law got:
 
 ```
 writ.spec: my.sort-spec against my.sort: ok
-  6 of 7 laws proved; tested, not proved: smallest-first
+  6 of 7 laws proved; tested, not proved: smallest-first (each on at least 1000 inputs)
 ```
+
+A law that is only tested runs its first 100 trials and then up to 900
+more, since tests are all it rests on. A failure among the extra ones is
+reported with the seed that replays it in the first hundred.
 
 A spec can require proof. Then a law that is only tested fails:
 

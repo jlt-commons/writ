@@ -169,7 +169,12 @@ failures: a law over every input may already answer one.
 - `:runs N` (with `:depth D`, default 20) walks N seeded runs from a
   `[state value]` start through the real fns: every landing must be in an
   allowed state and hold its invariants, and every final state the graph
-  reaches must be reached by some run.
+  reaches must be reached by some run. A guarded step searches for
+  arguments its guard takes (the state's own integers among them), and a
+  final state the seeded runs miss gets runs walked toward it. "no run
+  reached :s ... the guard of f from :x refused all N of its steps" means
+  the guard cannot hold from the states a run reaches: check the guard
+  and the start value.
 
 ## A spec
 
@@ -227,9 +232,13 @@ failures: a law over every input may already answer one.
 - A law is built from:
   - `(= a b)`
   - `(and P ...)`
-  - `(=> P Q)`; a case where `P` does not hold is skipped
+  - `(=> P Q)`; a case where `P` does not hold is skipped. When no
+    generated input meets `P`, the solver looks for inputs that do: the
+    law is refuted there, or its proof stands on them
   - `(forall [x T, y U] P)`
-  - `(exists [x T] P)`
+  - `(exists [x T] P)`. Over `Nat` or `Int`, with a body of bounds on x
+    (helpers of one expression read through), it is read as the bounds
+    meeting, and proved or refuted; any other nested `exists` is sampled
   - `(throws? e)`: evaluating `e` throws, lazy seqs in its value
     realised. A signature broken by the law itself is rethrown, not
     counted. Refer it from `writ.spec`.
@@ -423,6 +432,15 @@ of the algorithm (that is the code).
 - **Measure with the spec's own helpers.** Never use the implementation's
   fns to judge its results. A law that checks the code with the code is
   circular.
+- **Write the model so the prover can read it.** A proved law holds for
+  every input; a tested one only for the inputs generated, and a bug on
+  one input in a hundred gets past the tests now and then. Say what a
+  model means with arithmetic, `and`/`or`, records and `exists` over
+  bounds rather than building sets or ranges: "two spans overlap when some
+  unit t is in both", `(exists [t Nat] (and (holds? a t) (holds? b t)))`,
+  is proved or refuted, where `(seq (set/intersection (units a) (units
+  b)))` is only tested. "tested, not proved" in a report is a prompt to
+  restate the law this way.
 
 writ rejects a spec that does not do this:
 
@@ -554,7 +572,9 @@ check, so the test runner checks the spec namespace with no wrapper
 (a runner that picks namespaces by name must match `-spec` too).
 `{:test {:seed 42}}` passes check options; `{:test false}` drops it.
 By hand: `(let [r (spec/check 'my.sort-spec)] (is (:ok r) (:message r)))`.
-Other options are `:trials`, the test.check runs per law (default 100),
+Other options are `:trials`, the test.check runs per law (default 100;
+a law the prover does not prove gets up to 900 more, within 20s,
+`:more-trials false` turns that off),
 `:max-size`, the largest generated size (default 50), and
 `:adequacy false`, which skips the gap check while a spec is being drafted.
 
@@ -671,7 +691,10 @@ confirm it, then without one.
 - ``law `x` fails for ...`` - the implementation is wrong for that input;
   see [Reading a report](#reading-a-report).
 - ``the hypothesis never held in N trials`` - no generated input satisfied
-  the `=>` premise, so the law tested nothing. Tell the spec's owner.
+  the `=>` premise, and the solver found none either, so the law tested
+  nothing. Tell the spec's owner: the premise may be unsatisfiable, or
+  its inputs need building to fit (a refinement, or values folded into
+  range in the law).
 - ``no witness among N generated values`` - the `exists` law found no
   value. Either the implementation is wrong, or the witness is too rare to
   generate.
