@@ -48,3 +48,9 @@
   (let [p (spec/plan 'writ.spec-demo.clip-spec)]
     (is (str/includes? p "requires: (<= lo hi)"))
     (is (str/includes? p "ensures: (<= lo r hi)"))))
+
+(deftest a-contract-s-names-are-its-own
+  (let [r (spec/check 'writ.spec-demo.tag-spec {:seed 42})]
+    (is (:ok r) (:message r))
+    (is (#{:proved :tested} (:status (first (filter #(= 'label:ensures (:law %)) (:laws r))))))
+    (is (#{:proved :tested} (:status (first (filter #(= 'add-item:ensures (:law %)) (:laws r))))))))

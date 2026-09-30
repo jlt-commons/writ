@@ -2213,10 +2213,14 @@
               :else f))]
     (walk form)))
 
-(defn- arg-var [t i taken]
+(defn- arg-var
+  "A law's name for argument i, of type t: the type's name in lower case,
+  unless that is taken or a clojure.core fn a law may call (`keyword`,
+  `int`)."
+  [t i taken]
   (let [base (if (symbol? t) (str/lower-case (name t)) (str "arg" i))
         v (symbol base)]
-    (if (contains? taken v) (symbol (str base i)) v)))
+    (if (or (contains? taken v) (contains? (ns-publics 'clojure.core) v)) (symbol (str base i)) v)))
 
 (defn- invariants-of
   "The predicates the spec's invariants give state `s` of graph `g`, each
@@ -2380,7 +2384,12 @@
   (vec (for [[f {:keys [requires ensures]}] (sort-by (comp str key) (:contracts e))
              :when ensures
              :let [{:keys [params]} (get (:anns e) f)
-                   avs (reduce (fn [acc [i t]] (conj acc (arg-var t i (set acc)))) [] (map-indexed vector params))
+                   ;; the contract's own names for the arguments, as it wrote them
+                   avs (let [own (vec (butlast (second ensures)))]
+                         (if (and (every? symbol? own) (apply distinct? nil own)
+                                  (not-any? #{'_ '&} own) (= (count own) (count params)))
+                           own
+                           (reduce (fn [acc [i t]] (conj acc (arg-var t i (set acc)))) [] (map-indexed vector params))))
                    call (apply list f avs)
                    post (guard-of ensures (conj avs call))
                    pre (when requires (guard-of requires avs))]]
@@ -3105,7 +3114,7 @@
                    ;; law: its names are the target's fns, then the spec's own
                    compile (fn [form]
                              (when form
-                               (let [q (qualify form #{} (set (keys (ns-publics (the-ns target))))
+                               (let [q (qualify form (set (second form)) (set (keys (ns-publics (the-ns target))))
                                                 (set (keys (ns-interns (the-ns (::ns e))))) target (::ns e))]
                                  {:test (nth form 2)
                                   :f (let [g (binding [*ns* (the-ns (::ns e))] (eval q))]
