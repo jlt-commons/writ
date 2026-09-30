@@ -100,3 +100,9 @@
                      'replace)))
       (is (nil? (get (names {:aliases {} :refers {} :excludes #{'replace}} #{'clojure.core/replace})
                      'replace))))))
+
+(deftest an-assumption-may-not-reach-the-target-through-a-helper
+  (let [r (spec/check 'writ.spec-demo.slug-indirect-spec {:seed 42})]
+    (is (not (:ok r)))
+    (is (has? r "assumption `cl-is-idempotent` calls `clean`, a fn of writ.spec-demo.slug") (:message r))
+    (is (has? r "cl -> writ.spec-demo.slug/clean") (:message r))))

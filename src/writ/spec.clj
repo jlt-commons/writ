@@ -4233,6 +4233,8 @@
                    {:question id :what :no-longer-blocking}))))]
     {:ok (empty? weakened) :weakened weakened}))
 
+(declare reachable-from)
+
 (defn- assumption-results
   "What each assumption came to, run while the assumed fns are wrapped:
   a signature needs its fn to resolve, outside the target; a law about
@@ -4241,6 +4243,8 @@
   and, when it failed, :why or a law's failure.  A law that held carries
   :prop, qualified, for the prover to cite."
   [e ctx publics interns target spec-ns {:keys [trials seed max-size]}]
+  (let [forms-of #(book/read-forms (source-url %))
+        graph (delay (try (wide-graph spec-ns (forms-of spec-ns) forms-of) (catch Throwable _ {})))]
   (vec (concat
          (for [[q sig] (sort-by (comp str key) (:assumes e))]
            (cond
@@ -4258,11 +4262,20 @@
              (let [p (desugar prop)
                    _ (lw/check-prop-shape! p)
                    qp (qualify p #{} publics interns target spec-ns)
-                   own (first (filter #(and (symbol? %) (= (namespace %) (str target)))
-                                      (tree-seq coll? seq qp)))]
-               (if own
+                   of-target? #(and (symbol? %) (= (namespace %) (str target)))
+                   syms (filter symbol? (tree-seq coll? seq qp))
+                   ;; directly, or through the spec's helpers and the
+                   ;; project fns they call
+                   path (or (some #(when (of-target? %) [%]) syms)
+                            (some (fn [h] (when (contains? @graph h)
+                                            (some #(reach-path @graph h %)
+                                                  (filter of-target? (reachable-from @graph h)))))
+                                  syms))]
+               (if path
                  {:assumption name :status :failed
-                  :why (str "assumption `" name "` calls `" (clojure.core/name own) "`, a fn of " target
+                  :why (str "assumption `" name "` calls `" (clojure.core/name (peek path)) "`, a fn of " target
+                            (when (next path)
+                              (str ", through " (str/join " -> " (cons (clojure.core/name (first path)) (rest path)))))
                             ": an assumption is about code writ does not check, and the target is"
                             " checked. Say what it does with a law")}
                  (let [r (test-law ctx {:name name :prop qp} {:trials trials :seed seed :max-size max-size})]
@@ -4270,7 +4283,15 @@
                      (assoc r :assumption name)
                      {:assumption name :status :held :prop qp :evidence (:status r)}))))
              (catch Throwable ex
-               {:assumption name :status :failed :why (str "assumption `" name "`: " (or (ex-message ex) (str ex)))}))))))
+               {:assumption name :status :failed :why (str "assumption `" name "`: " (or (ex-message ex) (str ex)))})))))))
+
+(defn- reachable-from
+  "Every fn of graph g that f reaches through calls."
+  [g f]
+  (loop [todo [f], seen #{}]
+    (if-let [x (first todo)]
+      (recur (into (vec (rest todo)) (remove seen (get g x))) (into seen (get g x)))
+      seen)))
 
 (defn check
   "Check a spec namespace against its target (or opts :target).  Returns a
