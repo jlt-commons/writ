@@ -40,7 +40,9 @@
   (is (thrown-with-msg? Exception #"keys each record by :uid, which the record does not have"
         (kind/check-type (list 'Index :uid member) {} #{})))
   (is (thrown-with-msg? Exception #":unique names :mail, which the record does not have"
-        (kind/check-type (list 'Index :id member :unique [:mail]) {} #{}))))
+        (kind/check-type (list 'Index :id member :unique [:mail]) {} #{})))
+  (is (thrown-with-msg? Exception #"\(Index :key Record :unique \[:field \.\.\.\]\)"
+        (kind/check-type (list 'Index :id member :unique :email) {} #{}))))
 
 (deftest unique-by-is-true-of-no-two-alike
   (is (spec/unique-by? :email []))
