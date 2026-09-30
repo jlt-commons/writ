@@ -183,7 +183,7 @@
   "A variable of the goal that stands for an unknown list of elements, one
   a case split could reveal."
   [opts n]
-  (first (filter #(map? (get-in opts [:types %])) (sort-by str (t/vars n)))))
+  (first (filter #(:writ/elems (get-in opts [:types %])) (sort-by str (t/vars n)))))
 
 (defn- by-list-cases
   "Prove g by splitting element-list variable v into empty and a head and
@@ -263,7 +263,7 @@
     (= 'Nat ty) gen/nat
     (= 'Int ty) gen/small-integer
     (= 'Bool ty) gen/boolean
-    (and (map? ty) (:elems ty)) (some-> (sample-gen (:elems ty)) gen/list)
+    (and (map? ty) (:writ/elems ty)) (some-> (sample-gen (:writ/elems ty)) gen/list)
     (and (seq? ty) (contains? '#{List Vec} (first ty))) (some-> (sample-gen (second ty)) gen/list)
     :else nil))
 
@@ -744,7 +744,7 @@
   "A case variable's type as a law writes it: a tail of elements is a
   list of them."
   [ty]
-  (if (and (map? ty) (:elems ty)) (list 'List (:elems ty)) ty))
+  (if (and (map? ty) (:writ/elems ty)) (list 'List (:writ/elems ty)) ty))
 
 (defn lemma-candidates
   "Lemmas that would close a stuck goal, to be tested and proved before

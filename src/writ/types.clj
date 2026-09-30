@@ -52,6 +52,7 @@
   (cond
     (symbol? t) (symbol (name t))
     (seq? t) (apply list (map plain-type t))
+    (map? t) (update-vals t plain-type)
     :else t))
 
 (defn- known?
@@ -59,6 +60,7 @@
   [t tenv]
   (cond
     (= data t) true
+    (kind/record-type? t) true
     (symbol? t) (or (contains? kind/base-types t) (contains? tenv t))
     (seq? t) (let [h (first t)]
                (and (symbol? h)
@@ -80,11 +82,31 @@
 (defn- show [t]
   (cond (= data t) "data"
         (= infinite t) "an infinite seq"
+        (kind/record-type? t) (str "{" (clojure.string/join ", " (for [[k v] (sort-by (comp str key) t)]
+                                                                 (str k " " (show v))))
+                                   "}")
         :else (pr-str t)))
+
+(declare compat?)
+
+(defn record-gaps
+  "Why a value of record type `act` cannot stand where record `exp` is
+  expected: the keys it leaves out, and the keys whose values do not fit,
+  as {:missing [k] :wrong [[k exp act]]}; nil when it can.  An (Opt T)
+  key may be left out."
+  [exp act tenv]
+  (let [missing (vec (for [[k t] (sort-by (comp str key) exp)
+                           :when (and (not (contains? act k)) (not (kind/opt-type? t)))]
+                       k))
+        wrong (vec (for [[k t] (sort-by (comp str key) exp)
+                         :when (and (contains? act k) (not (compat? t (get act k) tenv)))]
+                     [k t (get act k)]))]
+    (when (or (seq missing) (seq wrong)) {:missing missing :wrong wrong})))
 
 (defn compat?
   "May a value of type `act` stand where `exp` is expected?  Unknowns
-  pass; Nat widens to Int and any integer to a float."
+  pass; Nat widens to Int and any integer to a float.  A record fits one
+  that asks for no more keys; nil fits an (Opt T), and so does a T."
   [exp act tenv]
   (cond
     (or (nil? exp) (nil? act)) true
@@ -96,6 +118,14 @@
     (= exp act) true
     (not (known? exp tenv)) true
     (= 'Any exp) true
+    (kind/opt-type? exp) (or (= 'Unit act)
+                             (if (kind/opt-type? act)
+                               (compat? (second exp) (second act) tenv)
+                               (compat? (second exp) act tenv)))
+    (kind/record-type? exp) (and (kind/record-type? act) (nil? (record-gaps exp act tenv)))
+    ;; a record is a map of keywords to its keys' values
+    (and (seq? exp) (= 'Map (first exp)) (kind/record-type? act))
+    (and (compat? (second exp) 'Keyword tenv) (every? #(compat? (nth exp 2) % tenv) (vals act)))
     ;; Any is also what inference writes for a return it could not work
     ;; out (a local fn's), so as an actual it is unknown, and unknowns pass
     (= 'Any act) true
@@ -344,6 +374,65 @@
 
 (declare walk)
 
+;; --- records -------------------------------------------------------------------
+
+(defn- keys-shown [t] (clojure.string/join ", " (map str (sort-by str (keys t)))))
+
+(defn- why-not
+  "What keeps a value of type `act` from standing where `exp` is
+  expected, when both are records: the keys it leaves out and the keys
+  whose values do not fit.  When act is (Opt T) and T would do: that it
+  may be nil.  nil otherwise."
+  [exp act tenv]
+  (if (and (kind/opt-type? act) (not (kind/opt-type? exp)) (compat? exp (second act) tenv))
+    (str "it may be nil, as a key that may be absent is; say what to give when it is")
+  (when (and (kind/record-type? exp) (kind/record-type? act))
+    (when-let [{:keys [missing wrong]} (record-gaps exp act tenv)]
+      (clojure.string/join
+        "; " (concat (when (seq missing)
+                       [(str "the body leaves out " (clojure.string/join ", " (map str missing)))])
+                     (for [[k e a] wrong] (str k " is " (show e) ", but the body gives " (show a)))))))))
+
+(defn- record-read
+  "The type of reading key k of a value of record type t, which must
+  have k: an open map may hold more keys, but a read of one the type
+  does not name is most often a misspelt one.  With a default, an (Opt T)
+  key reads as T or the default."
+  [ctx t k arg default]
+  (let [src (if (= :ref (:op arg)) (str "`" (display (:name arg)) "`") "the value")]
+    (when-not (contains? t k)
+      (fail! "`" (:nm ctx) "`: " src " is a record with keys " (keys-shown t) ", and has no key " k
+             ". Read one of its keys, or add " k " to its type, as (Opt T) if it may be absent"))
+    (let [ft (get t k)]
+      (if (and default (kind/opt-type? ft))
+        (join (second ft) default (:tenv ctx))
+        ft))))
+
+(defn- record-update
+  "The type of an assoc or dissoc of literal keyword keys on a record:
+  the record with those keys set to their values' types, or gone."
+  [f t args ats]
+  (let [lit-kw? #(and (= :lit (:op %)) (keyword? (:val %)))]
+    (case f
+      assoc (when (and (odd? (count args)) (every? lit-kw? (take-nth 2 (rest args))))
+              (reduce (fn [r [k vt]] (assoc r (:val k) (or vt 'Any)))
+                      t (map vector (take-nth 2 (rest args)) (take-nth 2 (drop 2 ats)))))
+      dissoc (when (every? lit-kw? (rest args))
+               (let [r (apply dissoc t (map :val (rest args)))]
+                 (if (seq r) r data)))
+      nil)))
+
+(defn- destructured
+  "The value a map destructure takes apart: its expansion tests
+  (seq? x) and, when x is not a seq, is x itself.  The ref x, or nil."
+  [init]
+  (let [t (:test init)]
+    (when (and (= :if (:op init)) (= :invoke (:op t))
+               (= :ref (:op (:fn t))) (= 'seq? (symbol (name (:name (:fn t)))))
+               (= 1 (count (:args t))) (= :ref (:op (first (:args t))))
+               (= (first (:args t)) (:else init)))
+      (:name (:else init)))))
+
 (defn- built-type
   "The type of a literal [:Ctor field ...].  Its field count must match,
   and each field whose type is known must fit: a type parameter is
@@ -479,8 +568,12 @@
                (when (every? #(data? % tenv) ts) data)))
       :set (let [ts (mapv #(w env %) (:items ast))]
              (when (every? #(data? % tenv) ts) data))
-      :map (let [ts (mapv #(w env %) (concat (:keys ast) (:vals ast)))]
-             (when (every? #(data? % tenv) ts) data))
+      :map (let [ts (mapv #(w env %) (concat (:keys ast) (:vals ast)))
+                 ks (:keys ast)]
+             (if (and (seq ks) (every? #(and (= :lit (:op %)) (keyword? (:val %))) ks))
+               ;; keyword keys: a record, each key of its value's type
+               (zipmap (map :val ks) (map #(or % 'Any) (drop (count ks) ts)))
+               (when (every? #(data? % tenv) ts) data)))
       :do (do (doseq [s (:stmts ast)] (w env s)) (w env (:ret ast)))
       :if (let [[pt pe] (guard-bounds (:test ast))
                 pos (fn [e bs] (update e ::lb #(merge-with max % bs)))]
@@ -500,6 +593,8 @@
       (:let :loop)
       (let [env* (reduce (fn [e [b init]]
                            (let [it (w e init)
+                                 it (let [x (destructured init)]
+                                      (if (and x (kind/record-type? (get e x))) (get e x) it))
                                  bt (binder-type b tenv)]
                              (when (and bt it (not (compat? bt it tenv)))
                                (fail! "`" (display b) "` in `" nm "` is declared "
@@ -529,8 +624,16 @@
       :invoke
       (let [f (:fn ast)
             ats (mapv #(w env %) (:args ast))]
-        (if-not (and (map? f) (= :ref (:op f)))
+        (cond
+          ;; (:k m) and (:k m default): a record's key
+          (and (map? f) (= :lit (:op f)) (keyword? (:val f)) (<= 1 (count ats) 2)
+               (kind/record-type? (first ats)))
+          (record-read ctx (first ats) (:val f) (first (:args ast)) (second ats))
+
+          (not (and (map? f) (= :ref (:op f))))
           (do (w env f) nil)
+
+          :else
           (let [s (:name f)
                 local? (contains? env s)
                 lt (get env s)]
@@ -561,7 +664,8 @@
                 (doseq [[i pt at] (map vector (range) params ats)]
                   (when-not (compat? pt at tenv)
                     (fail! "`" (display s) "` expects " (show pt) " for argument "
-                           (inc i) " but is passed " (show at))))
+                           (inc i) " but is passed " (show at)
+                           (when-let [why (why-not pt at tenv)] (str ": " why)))))
                 ret)
 
               (and *tagged*
@@ -592,6 +696,19 @@
                    (tuple-element (symbol (name s)) (first ats) (:args ast)))
               (tuple-element (symbol (name s)) (first ats) (:args ast))
 
+              ;; a record read by get, or changed by assoc or dissoc, on
+              ;; literal keys
+              (and (or (nil? (namespace s)) (= "clojure.core" (namespace s)))
+                   (not (contains? (:shadow ctx) s))
+                   (kind/record-type? (first ats))
+                   (contains? '#{get assoc dissoc} (symbol (name s)))
+                   (or (not= 'get (symbol (name s)))
+                       (and (<= 2 (count ats) 3) (= :lit (:op (second (:args ast))))
+                            (keyword? (:val (second (:args ast)))))))
+              (if (= 'get (symbol (name s)))
+                (record-read ctx (first ats) (:val (second (:args ast))) (first (:args ast)) (nth ats 2 nil))
+                (record-update (symbol (name s)) (first ats) (:args ast) ats))
+
               (and (nil? (namespace s)) (not (contains? (:shadow ctx) s)))
               (core-ret s ats tenv)
 
@@ -621,4 +738,5 @@
     (let [rt (walk ctx env body-ast)
           ret (some-> ret plain-type)]
       (when (and ret (known? ret tenv) (not (compat? ret rt tenv)))
-        (fail! "`" nm "` returns " (show ret) " but its body has type " (show rt))))))
+        (fail! "`" nm "` returns " (show ret) " but its body has type " (show rt)
+               (when-let [why (why-not ret rt tenv)] (str ": " why)))))))

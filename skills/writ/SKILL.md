@@ -166,8 +166,10 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
 - `(data Tree Leaf (Node Tree Nat Tree))`, or `(data Box [a] (Wrap a))`
   with type parameters.
 - Types: `Nat Int Bool String Char Keyword Symbol Float Double Unit Any`,
-  `(List T) (Vec T) (Set T) (Map K V) (Tuple T ...)`, `(-> A R)`, and
-  declared data. `(List T)` is any seq: list, vector, lazy seq or nil.
+  `(List T) (Vec T) (Set T) (Map K V) (Tuple T ...) (Opt T)`, `(-> A R)`,
+  records such as `{:id Nat, :nick (Opt String)}`, and declared data.
+  `(List T)` is any seq: list, vector, lazy seq or nil. `(Opt T)` is a T
+  or nil.
   A generated `Int` stays within -50..50 and a `Nat` within 0..50 (the
   default `:max-size`), so a quantified law never reaches a value like
   `-127`. Anchor such values with a law that names them. A quarter of the
@@ -419,6 +421,26 @@ others. A clause destructures only its constructor's fields. A literal
 the tag with `case (first t)` only: `first`, `second` or `nth` of a data
 value anywhere else is rejected.
 
+### Records
+
+A map with keyword keys is a record type: `{:id Nat, :email String, :nick
+(Opt String)}` is a map with those keys, each value of its key's type. An
+`(Opt T)` key may be absent or nil; every other key must be there. Keys it
+does not name may be there too. Name a record with a refinement, and
+carve states out of it the same way:
+
+```clojure
+(refine Member [m {:id Nat, :email String, :points Nat, :nick (Opt String)}] true)
+(refine Fresh  [m Member] (zero? (:points m)))
+```
+
+The code builds and reads records as plain maps: literals, `(:k m)`, `get`,
+`assoc`, `dissoc` and `{:keys [...]}` destructuring. The static check reads
+them by key: a literal must carry every required key with a value of its
+type, a read must name a key the record has, and an `(Opt T)` key read
+without a default may be nil, so it is not a `T`. The prover works through
+`get`, `assoc`, `dissoc` and `contains?` on literal keys.
+
 ## Running the check
 
 ```clojure
@@ -615,6 +637,19 @@ confirm it, then without one.
   most the tag plus the fields.
 - ``has data type Tree; take it apart with `(case (first t) ...)` `` - read
   a data value only through a `case` on its tag.
+
+### Records
+
+- ``` `m` is a record with keys :email, :id, and has no key :point``` -
+  a misspelt key, or one the type should name. Add it to the record, as
+  `(Opt T)` if it may be absent.
+- ``returns {...} but its body has type {...}: the body leaves out :points``
+  - build the map with every key the record requires.
+- ``:points is Nat, but the body gives String`` - that key's value has the
+  wrong type.
+- ``returns String but its body has type (Opt String): it may be nil`` -
+  an optional key was read without a default. Give one, `(:nick m "")`, or
+  branch on it.
 
 ### Structural rules (plain and annotated code)
 

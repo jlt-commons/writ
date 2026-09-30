@@ -38,6 +38,7 @@
 
 (defn plain [ty] (cond (symbol? ty) (symbol (name ty))
                         (seq? ty) (apply list (map plain ty))
+                        (map? ty) (update-vals ty plain)
                         :else ty))
 
 (defn cases
@@ -54,7 +55,7 @@
           true (conj {:desc (str v " = ()") :value [:sq t/enil] :types {} :smaller []})
           true (conj {:desc (str v " = (" h " & " tl ")")
                       :value [:sq [:econs h tl]]
-                      :types {h el tl {:elems el}}
+                      :types {h el tl {:writ/elems el}}
                       :smaller (cond-> [[:sq tl] [:sq t/enil]]
                                  (= 'List (first ty)) (conj t/tnil))})))
 
@@ -425,9 +426,9 @@
   "The two shapes of an unknown list of elements v: empty, and a head and
   a tail, as [[value types] [value types]]."
   [opts v]
-  (let [el (:elems (get-in opts [:types v]))
+  (let [el (:writ/elems (get-in opts [:types v]))
         h (symbol (str v "h")) tl (symbol (str v "t"))]
-    [[t/enil {}] [[:econs h tl] {h el tl {:elems el}}]]))
+    [[t/enil {}] [[:econs h tl] {h el tl {:writ/elems el}}]]))
 
 (defn induction-case
   "[opts gi] for case c of induction on v: its variables typed, the law at

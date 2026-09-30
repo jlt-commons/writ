@@ -598,7 +598,10 @@
 (defn- plain [t]
   (cond (symbol? t) (symbol (name t))
         (seq? t) (apply list (map plain t))
+        (map? t) (update-vals t plain)
         :else t))
+
+(defn- opt-type? [t] (and (seq? t) (= 'Opt (first t))))
 
 (defn- subst [t m]
   (cond (symbol? t) (get m t t)
@@ -659,9 +662,20 @@
           (conforms-data? d args v tenv)
           true))
 
+      ;; a record: each key of its own type; an (Opt T) key may be absent,
+      ;; and keys it does not name may be there too
+      (map? t)
+      (and (map? v)
+           (every? (fn [[k kt]]
+                     (if (contains? v k)
+                       (conforms? kt (get v k) tenv)
+                       (opt-type? kt)))
+                   t))
+
       (seq? t)
       (let [[h & as] t]
         (case h
+          Opt (or (nil? v) (conforms? (first as) v tenv))
           List (and (or (nil? v) (sequential? v)) (every? #(conforms? (first as) % tenv) v))
           Vec (and (vector? v) (every? #(conforms? (first as) % tenv) v))
           Set (and (set? v) (every? #(conforms? (first as) % tenv) v))
@@ -681,7 +695,8 @@
 ;; failure shrinks through test.check's rose trees and a seed replays it.
 
 (defn- mentions? [t nm]
-  (boolean (some #{nm} (tree-seq seq? seq (if (seq? t) t (list t))))))
+  (boolean (some #{nm} (tree-seq #(or (seq? %) (map? %)) #(if (map? %) (vals %) (seq %))
+                                 (if (or (seq? t) (map? t)) t (list t))))))
 
 (declare type->gen)
 
@@ -771,10 +786,25 @@
           (data-gen d args t tenv)
           (fail! "cannot generate values of type `" t "`: declare it with `data`")))
 
+      ;; a record: a map with its keys, an (Opt T) key now absent, now nil,
+      ;; now set
+      (map? t)
+      (let [ks (vec (sort-by str (keys t)))
+            key-gen (fn [k]
+                      (let [kt (get t k)]
+                        (if (opt-type? kt)
+                          (gen/frequency [[1 (gen/return ::absent)]
+                                          [1 (gen/return nil)]
+                                          [3 (type->gen (second kt) tenv)]])
+                          (type->gen kt tenv))))]
+        (gen/fmap (fn [vs] (into {} (remove #(= ::absent (second %))) (map vector ks vs)))
+                  (apply gen/tuple (map key-gen ks))))
+
       (seq? t)
       (let [[h & as] t
             el #(type->gen (nth as %) tenv)]
         (case h
+          Opt (gen/frequency [[1 (gen/return nil)] [3 (el 0)]])
           ;; a (List T) is any seq Clojure hands around: a list, a vector,
           ;; a lazy seq or nil.  Shrinking prefers the list.
           List (let [g (el 0)]

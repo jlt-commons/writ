@@ -4,8 +4,10 @@
   Definitions and law terms are lowered by writ.lower (so cond, when,
   if-let, and, or and destructuring are already let and if), then read
   into terms.  Only the fragment the rewrite rules model is accepted:
-  anything else -- conj, maps, host calls, a target fn passed as a value
-  -- raises `outside`, and a law that needs it is left to testing.  A
+  anything else -- a core fn not in `core-fns`, conj onto a value not
+  known to be a vector, host calls, named or variadic local fns, a
+  computed value called as a fn -- raises `outside`, and a law that
+  needs it is left to testing.  A
   loop becomes a recursive definition of its own, over its bindings and
   the locals it closes over, and recur a call of it."
   (:require [writ.lower :as l]
@@ -152,6 +154,18 @@
       (contains? #{:call :app} (t/head t)) (into [(first t) (second t)] (map f) (drop 2 t))
       :else (with-meta (into [(first t)] (map f) (rest t)) (meta t)))))
 
+(defn- destructured
+  "The value a map destructure takes apart: its expansion tests (seq? x)
+  and, when x is not a seq, is x itself.  x's AST node, or nil."
+  [ast]
+  (let [t (:test ast)]
+    (when (and (= :invoke (:op t)) (= :ref (:op (:fn t)))
+               (= 'seq? (symbol (name (:name (:fn t)))))
+               (contains? #{nil "clojure.core"} (namespace (:name (:fn t))))
+               (= 1 (count (:args t))) (= :ref (:op (first (:args t))))
+               (= (first (:args t)) (:else ast)))
+      (:else ast))))
+
 (defn term-of
   "The term for a lowered AST node.  env maps local names to terms."
   [ctx env ast]
@@ -178,7 +192,13 @@
                            (into [:call 'hash-set] (map t/lit (t/sort-printed x)))
                            (t/value->term x))
                          (outside! (str "the name `" s "`")))))
-    :if [:if (term-of ctx env (:test ast)) (term-of ctx env (:then ast)) (term-of ctx env (:else ast))]
+    :if (if-let [x (destructured ast)]
+          ;; a map destructure: on a seq it builds a map from the seq's
+          ;; pairs, which the prover does not model, and anything else it
+          ;; takes as it is; on a map, seq? is false and only x is left
+          (let [xt (term-of ctx env x)]
+            [:if [:call 'seq? xt] [:call 'writ.prove.term/map-of-seq xt] xt])
+          [:if (term-of ctx env (:test ast)) (term-of ctx env (:then ast)) (term-of ctx env (:else ast))])
     :do (term-of ctx env (:ret ast))
     :let (let [env* (reduce (fn [e [b init]]
                               (when-not (symbol? b) (outside! (str "the binding form " (pr-str b))))
@@ -273,6 +293,15 @@
         (for [f forms
               :when (and (seq? f) (contains? '#{defn defn-} (first f)))
               :let [{:keys [name params body]} (defn-parts f)
+                    ;; a destructured parameter is a plain one taken apart
+                    ;; in a let, named by its position so the term is always
+                    ;; the same
+                    [params body] (if (and (vector? params) (not (some #{'&} params))
+                                           (not-every? symbol? params))
+                                    (let [ps (vec (map-indexed #(if (symbol? %2) %2 (symbol (str "p__" %1))) params))]
+                                      [ps (list (list* 'let (vec (mapcat (fn [p q] (when-not (= p q) [p q])) params ps))
+                                                       body))])
+                                    [params body])
                     q (symbol (str ns-sym) (str name))]]
           [q (try
                (when-not (and (vector? params) (every? symbol? params) (not (some #{'&} params)))
