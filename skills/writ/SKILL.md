@@ -268,7 +268,8 @@ library, another namespace), say what the spec takes as given:
 ```
 
 A signature types the calls statically and is checked where the fn
-returns while laws run, every call, writ's own included. A law is tested
+returns while laws run, on the code's calls and the laws', not writ's
+own or the dependency's calls to itself. A law is tested
 against the real fns every check and cited by the prover like a lemma,
 without proof. An assumption may not call the target's fns, directly or
 through a spec helper. Every report lists what is assumed, and

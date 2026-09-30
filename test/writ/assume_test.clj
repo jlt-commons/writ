@@ -106,3 +106,12 @@
     (is (not (:ok r)))
     (is (has? r "assumption `cl-is-idempotent` calls `clean`, a fn of writ.spec-demo.slug") (:message r))
     (is (has? r "cl -> writ.spec-demo.slug/clean") (:message r))))
+
+(deftest an-assumed-signature-types-the-code-and-the-laws-not-writ
+  (testing "writ's own calls to an assumed fn are not checked against it"
+    (let [r (spec/check 'writ.spec-demo.slug-unused-spec {:seed 42 :adequacy false})]
+      (is (:ok r) (:message r))))
+  (testing "a law's call is"
+    (let [r (spec/check 'writ.spec-demo.slug-law-misuse-spec {:seed 42})]
+      (is (not (:ok r)))
+      (is (has? r "`clojure.string/upper-case` argument 1") (:message r)))))
