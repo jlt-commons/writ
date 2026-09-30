@@ -38,3 +38,20 @@
   (is (str/includes? (str (expansion-error '(writ.spec/graph g {:actors {:type User :role :role}
                                                                  :states {:a A} :edges {:a {[f Nat] {:to #{:a} :by #{:x}}}}})))
                      "takes no User, so no one is there to act")))
+
+(deftest a-role-joins-the-edge-s-own-guard
+  (let [r (spec/check 'writ.spec-demo.till-spec {:seed 42})]
+    (is (:ok r) (:message r))
+    (testing "each clause of the edge's own guard is still a clause, and the role one more"
+      (doseq [l '[till:open:pay-in:when.1 till:open:pay-in:when.2 till:open:pay-in:when.3]]
+        (is (law-result r l) (str l))))
+    (is (str/includes? (spec/plan 'writ.spec-demo.till-spec) "(pos? amt)"))))
+
+(deftest the-edge-s-own-guard-is-checked-before-it-is-joined
+  (let [g (fn [w] (expansion-error (list 'writ.spec/graph 'g
+                                         {:actors {:type 'User :role :role}
+                                          :states {:a 'A}
+                                          :edges {:a {'[f User Nat] {:to #{:a} :by #{:x} :when w}}}})))]
+    (is (str/includes? (str (g '(fn [s amt] (pos? amt)))) "its :when takes the fn's 3 argument(s)"))
+    (is (str/includes? (str (g 'pos?)) "needs :when (fn [state arg ...] test)"))
+    (is (str/includes? (str (g '(fn [s u amt] (prn amt) (pos? amt)))) "needs :when (fn [state arg ...] test)"))))

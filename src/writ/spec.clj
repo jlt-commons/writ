@@ -414,6 +414,18 @@
 
 (def ^:private graph-keys #{:states :edges :start :never :before :final :tested :witnesses :runs :depth :actors})
 
+(declare guard-of)
+
+(defn- when-shape!
+  "An edge's :when must be (fn [state arg ...] test), taking the edge fn's
+  n arguments."
+  [edge w n]
+  (when-not (and (seq? w) (= 'fn (first w)) (vector? (second w)) (= 3 (count w)))
+    (fail! edge " needs :when (fn [state arg ...] test), had " (pr-str w)))
+  (when-not (= n (count (second w)))
+    (fail! edge ": its :when takes the fn's " n " argument(s), in the fn's order, had "
+           (pr-str (second w)))))
+
 (defn- by->when
   "A graph's edges with each :by, the roles that may take the step, made
   a guard: the step is taken when the acting argument -- the one of the
@@ -443,9 +455,13 @@
                                                 who (nth ps i)
                                                 test (list 'contains? by (if (:role actors) (list 'get who (:role actors)) who))
                                                 w (:when tos)
-                                                body (if w
-                                                       (list 'and (list* 'let (vec (interleave (second w) ps)) [(nth w 2)]) test)
-                                                       test)]
+                                                _ (when (contains? tos :when) (when-shape! edge w (count order)))
+                                                ;; the edge's own test, in the joined fn's
+                                                ;; names, its clauses kept as clauses
+                                                own (when w (guard-of w ps))
+                                                body (cond (nil? w) test
+                                                           (and (seq? own) (= 'and (first own))) (concat own [test])
+                                                           :else (list 'and own test))]
                                             (cond-> (assoc tos :when (list 'fn ps body))
                                               w (assoc :own-when w))))]))]))))
 
@@ -546,17 +562,13 @@
             (let [edge (str where ": the edge " (pr-str from) " " (pr-str k))
                   {w :when el :else ch :changes} tos
                   n (inc (count (remove #{'_} (rest k))))]
-              (when-let [bad (seq (remove #{:to :when :else :changes :by} (keys tos)))]
+              (when-let [bad (seq (remove #{:to :when :else :changes :by :own-when} (keys tos)))]
                 (fail! edge " has unknown keys " (pr-str bad) "; an edge map takes :to, :when, :else, :changes and :by"))
               (when (contains? tos :changes)
                 (when-not (and (vector? ch) (seq ch) (every? keyword? ch))
                   (fail! edge ": :changes is a vector of the keys the step may change, had " (pr-str ch))))
               (when (or (contains? tos :when) (not (contains? tos :changes)))
-                (when-not (and (seq? w) (= 'fn (first w)) (vector? (second w)) (= 3 (count w)))
-                  (fail! edge " needs :when (fn [state arg ...] test), had " (pr-str w)))
-                (when-not (= n (count (second w)))
-                  (fail! edge ": its :when takes the fn's " n " argument(s), in the fn's order, had "
-                         (pr-str (second w)))))
+                (when-shape! edge w n))
               (when (and el (not (contains? tos :when)))
                 (fail! edge ": :else says what a refused step does, so it needs :when"))
               (when-not (or (nil? el) (= :keep el) (contains? states el))
@@ -2245,7 +2257,7 @@
   test that is an `and`, one per clause says it fails while the others
   hold, so each clause rules out something of its own."
   [[gname m :as g] refs invs]
-  (vec (for [{:keys [from f args tos pos guard else changes by]} (graph-edges g)
+  (vec (for [{:keys [from f args tos pos guard else changes by own-when]} (graph-edges g)
              :let [ty #(get (:states m) %)
                    ref-of #(let [t (plain (ty %))] (when (symbol? t) (get refs t)))
                    refined? (every? ref-of tos)
@@ -2333,9 +2345,7 @@
                                                (if (= :keep else) (list '= call v) (in-held else))))
                              :explain (str (if by
                                              (str "taken by anyone but " (str/join " or " (sort-by str by))
-                                                  (when-let [w (:own-when (first (filter #(and (= from (:from %)) (= f (:f %)))
-                                                                                          (graph-edges g))))]
-                                                    ", or when its guard fails")
+                                                  (when own-when ", or when its guard fails")
                                                   ",")
                                              "when its guard fails,")
                                            " a " f " from " (name from)
