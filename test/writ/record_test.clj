@@ -206,4 +206,17 @@
   (let [r (spec/check 'writ.spec-demo.member-spec {:seed 42 :target 'writ.spec-demo.member-big :cache false})]
     (is (not (:ok r)))
     (is (str/includes? (:message r) "found by the solver") (:message r))
-    (is (re-find #":points 10\d\d" (:message r)))))
+    (is (some #(< 1000 (parse-long (second %))) (re-seq #":points (\d+)" (:message r))) (:message r))))
+
+
+(deftest an-opt-key-read-with-a-default-may-still-be-nil
+  (let [m (static-error 'writ.spec-demo.member-default)]
+    (is (str/includes? m "`nickname` returns String but its body has type (Opt String)") m)))
+
+(deftest a-value-the-check-cannot-type-may-stand-for-a-record
+  (let [r (spec/check 'writ.spec-demo.member-spec {:seed 42 :target 'writ.spec-demo.member-local})]
+    (is (:ok (:static r)) (:message r))))
+
+(deftest a-record-with-every-key-dissociated-is-no-record
+  (let [m (static-error 'writ.spec-demo.member-strip)]
+    (is (str/includes? m "`join`") m)))

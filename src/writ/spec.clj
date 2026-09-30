@@ -414,6 +414,18 @@
 
 (def ^:private graph-keys #{:states :edges :start :never :before :final :tested :witnesses :runs :depth :actors})
 
+(declare guard-of)
+
+(defn- when-shape!
+  "An edge's :when must be (fn [state arg ...] test), taking the edge fn's
+  n arguments."
+  [edge w n]
+  (when-not (and (seq? w) (= 'fn (first w)) (vector? (second w)) (= 3 (count w)))
+    (fail! edge " needs :when (fn [state arg ...] test), had " (pr-str w)))
+  (when-not (= n (count (second w)))
+    (fail! edge ": its :when takes the fn's " n " argument(s), in the fn's order, had "
+           (pr-str (second w)))))
+
 (defn- by->when
   "A graph's edges with each :by, the roles that may take the step, made
   a guard: the step is taken when the acting argument -- the one of the
@@ -443,9 +455,13 @@
                                                 who (nth ps i)
                                                 test (list 'contains? by (if (:role actors) (list 'get who (:role actors)) who))
                                                 w (:when tos)
-                                                body (if w
-                                                       (list 'and (list* 'let (vec (interleave (second w) ps)) [(nth w 2)]) test)
-                                                       test)]
+                                                _ (when (contains? tos :when) (when-shape! edge w (count order)))
+                                                ;; the edge's own test, in the joined fn's
+                                                ;; names, its clauses kept as clauses
+                                                own (when w (guard-of w ps))
+                                                body (cond (nil? w) test
+                                                           (and (seq? own) (= 'and (first own))) (concat own [test])
+                                                           :else (list 'and own test))]
                                             (cond-> (assoc tos :when (list 'fn ps body))
                                               w (assoc :own-when w))))]))]))))
 
@@ -546,17 +562,13 @@
             (let [edge (str where ": the edge " (pr-str from) " " (pr-str k))
                   {w :when el :else ch :changes} tos
                   n (inc (count (remove #{'_} (rest k))))]
-              (when-let [bad (seq (remove #{:to :when :else :changes :by} (keys tos)))]
+              (when-let [bad (seq (remove #{:to :when :else :changes :by :own-when} (keys tos)))]
                 (fail! edge " has unknown keys " (pr-str bad) "; an edge map takes :to, :when, :else, :changes and :by"))
               (when (contains? tos :changes)
                 (when-not (and (vector? ch) (seq ch) (every? keyword? ch))
                   (fail! edge ": :changes is a vector of the keys the step may change, had " (pr-str ch))))
               (when (or (contains? tos :when) (not (contains? tos :changes)))
-                (when-not (and (seq? w) (= 'fn (first w)) (vector? (second w)) (= 3 (count w)))
-                  (fail! edge " needs :when (fn [state arg ...] test), had " (pr-str w)))
-                (when-not (= n (count (second w)))
-                  (fail! edge ": its :when takes the fn's " n " argument(s), in the fn's order, had "
-                         (pr-str (second w)))))
+                (when-shape! edge w n))
               (when (and el (not (contains? tos :when)))
                 (fail! edge ": :else says what a refused step does, so it needs :when"))
               (when-not (or (nil? el) (= :keep el) (contains? states el))
@@ -659,8 +671,9 @@
   pterm/same)
 
 (defmacro throws?
-  "In a law: does evaluating expr throw?  A lazy seq it returns is
-  realised first, since that is where its elements are computed.  An
+  "In a law: does evaluating expr throw?  A lazy seq it returns, and any
+  inside what it returns, is realised first, since that is where its
+  elements are computed.  An
   error writ raises -- an argument or a result that breaks a signature --
   is rethrown, not counted: it says the law misuses the code, not that
   the code throws.
@@ -668,7 +681,7 @@
     (law past-the-end-throws
       (forall [v (Vec Nat), i Nat] (= (throws? (at v i)) (>= i (count v)))))"
   [expr]
-  `(try (let [v# ~expr] (when (seq? v#) (dorun v#)) false)
+  `(try (let [v# ~expr] (walk/postwalk identity v#) false)
         (catch Throwable e#
           (if (:writ/error (ex-data e#)) (throw e#) true))))
 
@@ -927,9 +940,17 @@
   (invoke [this a b] (.applyTo this (list a b)))
   (invoke [this a b c] (.applyTo this (list a b c)))
   (invoke [this a b c d] (.applyTo this (list a b c d)))
+  (invoke [this a b c d e] (.applyTo this (list a b c d e)))
+  (invoke [this a b c d e f] (.applyTo this (list a b c d e f)))
+  (invoke [this a b c d e f g] (.applyTo this (list a b c d e f g)))
+  (invoke [this a b c d e f g h] (.applyTo this (list a b c d e f g h)))
   (applyTo [_ args]
     (let [k (if (= 1 (count args)) (first args) (vec args))
-          r (gen/generate results 20 (hash [seed k]))]
+          ;; a fn's hash is its identity, which a replay does not share,
+          ;; so a fn among the arguments counts as any fn: the answer is
+          ;; still the same for the same arguments
+          stable (walk/postwalk #(if (and (ifn? %) (not (coll? %)) (not (keyword? %)) (not (symbol? %))) ::fn %) k)
+          r (gen/generate results 20 (hash [seed stable]))]
       (swap! calls assoc k r)
       r)))
 
@@ -1543,7 +1564,7 @@
 
 (declare erase erase-data refines-of)
 
-(declare ns-names)
+(declare ns-names core-name?)
 
 (defn- static-check
   "Run writ's rules over the target's source with the spec's types, each
@@ -1583,8 +1604,14 @@
                   ;; by the qualified name an alias resolves to, and by a
                   ;; name the target refers
                   book/*extra-sigs* (let [sig-of #(unbang (erase (get (:assumes e) %) refs))
-                                          {:keys [refers]} (some-> (first nsf) ns-names)]
+                                          {:keys [refers] :as names} (some-> (first nsf) ns-names)]
                                       (merge (into {} (for [q (keys (:assumes e))] [q (sig-of q)]))
+                                             ;; a core fn by its plain name, where the
+                                             ;; code reads that name as core's
+                                             (into {} (for [q (keys (:assumes e))
+                                                            :when (and (= "clojure.core" (namespace q))
+                                                                       (core-name? names (symbol (name q))))]
+                                                        [(symbol (name q)) (sig-of q)]))
                                              (into {} (for [[r q] refers :when (contains? (:assumes e) q)]
                                                         [r (sig-of q)]))))]
           (book/check-book (vec (concat nsf data others))))
@@ -1665,8 +1692,10 @@
 
 (defn- ns-names
   "The names an ns form brings in: {:aliases {alias lib} :refers {name
-  lib/name}}, from its :require clauses."
+  lib/name} :excludes #{name}}, from its :require clauses and the
+  clojure.core names its :refer-clojure :exclude leaves out."
   [ns-form]
+  (assoc
   (reduce (fn [acc [lib & opts]]
             (let [o (apply hash-map (take (* 2 (quot (count opts) 2)) opts))]
               (cond-> acc
@@ -1679,7 +1708,18 @@
                 :when (and (seq? clause) (= :require (first clause)))
                 spec (rest clause)
                 :when (or (vector? spec) (symbol? spec))]
-            (if (symbol? spec) [spec] (seq spec)))))
+            (if (symbol? spec) [spec] (seq spec))))
+  :excludes (set (for [clause (rest ns-form)
+                       :when (and (seq? clause) (= :refer-clojure (first clause)))
+                       :let [o (apply hash-map (take (* 2 (quot (count (rest clause)) 2)) (rest clause)))]
+                       x (:exclude o)]
+                   x))))
+
+(defn- core-name?
+  "Does a namespace with these names read the plain name nm as
+  clojure.core's?"
+  [{:keys [refers excludes]} nm]
+  (not (or (contains? refers nm) (contains? excludes nm))))
 
 (defn- callee
   "What a name in a body refers to in the call graph: the simple name of
@@ -2182,10 +2222,14 @@
               :else f))]
     (walk form)))
 
-(defn- arg-var [t i taken]
+(defn- arg-var
+  "A law's name for argument i, of type t: the type's name in lower case,
+  unless that is taken or a clojure.core fn a law may call (`keyword`,
+  `int`)."
+  [t i taken]
   (let [base (if (symbol? t) (str/lower-case (name t)) (str "arg" i))
         v (symbol base)]
-    (if (contains? taken v) (symbol (str base i)) v)))
+    (if (or (contains? taken v) (contains? (ns-publics 'clojure.core) v)) (symbol (str base i)) v)))
 
 (defn- invariants-of
   "The predicates the spec's invariants give state `s` of graph `g`, each
@@ -2226,11 +2270,16 @@
   test that is an `and`, one per clause says it fails while the others
   hold, so each clause rules out something of its own."
   [[gname m :as g] refs invs]
-  (vec (for [{:keys [from f args tos pos guard else changes by]} (graph-edges g)
+  (vec (for [{:keys [from f args tos pos guard else changes by own-when]} (graph-edges g)
              :let [ty #(get (:states m) %)
                    ref-of #(let [t (plain (ty %))] (when (symbol? t) (get refs t)))
-                   refined? (every? ref-of tos)]
-             :when (or refined? guard (seq changes))
+                   refined? (every? ref-of tos)
+                   ;; a landing in a state with invariants is checked even
+                   ;; when the state is a plain type, since edges out of it
+                   ;; assume them
+                   inv? #(seq (invariants-of invs gname %))
+                   landing? (or refined? (some inv? tos))]
+             :when (or landing? guard (seq changes))
              :let [v (or (:var (ref-of from)) 's)
                    avs (reduce (fn [acc [i t]]
                                  (conj acc (if (fixed-arg? t) (second t) (arg-var t i (set (conj acc v))))))
@@ -2242,7 +2291,7 @@
                    ;; each target's predicate, of the call itself: the law
                    ;; reads as the spec would write it, (ascending? (isort xs)),
                    ;; the shape the prover takes apart
-                   in (fn [t] (let [r (ref-of t)] (subst-var (:pred r) (:var r) call)))
+                   in (fn [t] (if-let [r (ref-of t)] (subst-var (:pred r) (:var r) call) true))
                    ;; a landing in t holds t's invariants: (and (Hot? ..) (even? ..))
                    in-held (fn [t]
                              (let [ps (for [[b pred] (invariants-of invs gname t)] (subst-var pred b call))]
@@ -2253,15 +2302,20 @@
                    ;; the invariants of the state the step leaves hold of it:
                    ;; a step keeps an invariant when it holds before it, and
                    ;; the start holds each, so every run holds them
+                   ;; a [state value] start is checked against them; a
+                   ;; start named by its state alone may be any value of it,
+                   ;; and a graph with no start any value of any state
+                   start (:start m)
+                   entered? (or (vector? start) (and (keyword? start) (not= from start)))
                    held (let [hs (for [[b pred] (invariants-of invs gname from)] (subst-var pred b v))]
-                          (when (seq hs) (if (next hs) (cons 'and hs) (first hs))))
+                          (when (and entered? (seq hs)) (if (next hs) (cons 'and hs) (first hs))))
                    pre (cond (and held test) (list 'and held test) held held :else test)
                    under (fn [p] (if pre (list '=> pre p) p))
                    edge (str gname ":" (name from) ":" f)
                    tested (get-in m [:tested from])
                    off-proof #(cond-> % tested (assoc :opts {:require :tested :because tested}))]
              law (concat
-                   (when refined?
+                   (when landing?
                      (cons (off-proof
                              {:name (symbol edge) :oid (str "edge." gname "." (name from) "." f)
                               :prop (list 'forall binders (under (lands tos)))
@@ -2273,7 +2327,7 @@
                                                    (str/join " and " (map #(str ":" (name %)) held-of)))))
                               :graph gname
                               :total true})
-                           (for [t tos]
+                           (for [t (when refined? tos)]
                              (cond-> {:name (symbol (str edge "->" (name t)))
                                       :oid (str "step." gname "." (name from) "." f "." (name t))
                                       :prop (list 'exists binders (if pre (list 'and pre (in t)) (in t)))
@@ -2295,7 +2349,7 @@
                          :graph gname})])
                    (when guard
                      (concat
-                       (when (or (= :keep else) (ref-of else))
+                       (when (or (= :keep else) (ref-of else) (inv? else))
                          [(off-proof
                             {:name (symbol (str edge ":refused"))
                              :oid (str "refused." gname "." (name from) "." f)
@@ -2304,9 +2358,7 @@
                                                (if (= :keep else) (list '= call v) (in-held else))))
                              :explain (str (if by
                                              (str "taken by anyone but " (str/join " or " (sort-by str by))
-                                                  (when-let [w (:own-when (first (filter #(and (= from (:from %)) (= f (:f %)))
-                                                                                          (graph-edges g))))]
-                                                    ", or when its guard fails")
+                                                  (when own-when ", or when its guard fails")
                                                   ",")
                                              "when its guard fails,")
                                            " a " f " from " (name from)
@@ -2341,7 +2393,12 @@
   (vec (for [[f {:keys [requires ensures]}] (sort-by (comp str key) (:contracts e))
              :when ensures
              :let [{:keys [params]} (get (:anns e) f)
-                   avs (reduce (fn [acc [i t]] (conj acc (arg-var t i (set acc)))) [] (map-indexed vector params))
+                   ;; the contract's own names for the arguments, as it wrote them
+                   avs (let [own (vec (butlast (second ensures)))]
+                         (if (and (every? symbol? own) (apply distinct? nil own)
+                                  (not-any? #{'_ '&} own) (= (count own) (count params)))
+                           own
+                           (reduce (fn [acc [i t]] (conj acc (arg-var t i (set acc)))) [] (map-indexed vector params))))
                    call (apply list f avs)
                    post (guard-of ensures (conj avs call))
                    pre (when requires (guard-of requires avs))]]
@@ -2706,9 +2763,16 @@
                    (and (seq? %) (contains? '#{List Vec Set Map} (first %))))
         opt? #(or (kind/opt-type? %) (and (kind/record-type? %) (some kind/opt-type? (vals %))))
         float? #(contains? '#{Float Double Float! Double!} %)
+        ;; a type and every type inside it: (List Int) raises the sign of
+        ;; its elements, a record the decisions of its keys
+        parts (fn parts [t]
+                (cons t (cond (kind/record-type? t) (mapcat parts (vals t))
+                              (kind/index-type? t) (parts (:of (kind/index-parts t)))
+                              (seq? t) (mapcat parts (rest t))
+                              :else nil)))
         fns-where (fn [pred ret?]
                     (vec (sort (for [[f {:keys [params ret]}] (:anns e)
-                                     :when (some pred (map base (cond-> params ret? (conj ret))))]
+                                     :when (some pred (mapcat (comp parts base) (cond-> params ret? (conj ret))))]
                                  f))))
         by {:empty (fns-where coll? false)
             :zero-and-negative (fns-where #(contains? '#{Int Nat} %) false)
@@ -2996,12 +3060,16 @@
 
 (defn- checked
   ([nm f sig tenv argn] (checked nm f sig tenv argn nil))
-  ([nm f sig tenv argn {:keys [requires ensures]}]
+  ([nm f sig tenv argn {:keys [requires ensures assumed]}]
    (fn [& args]
      (doseq [[i t a] (map vector (range) (:params sig) args)]
        (when-not (conforms? t a tenv)
          (fail! "`" nm "` argument " (inc i) " (" (nth argn i (str "arg" i)) ") expects "
-                (pr-str t) ", got " (pr-str a))))
+                (pr-str t) ", got " (pr-str a)
+                ;; the fn is wrapped wherever it is called, writ included
+                (when assumed
+                  (str "; the spec assumes this signature of every call, the target's, the laws' and"
+                       " writ's own, so assume what the fn documents")))))
      (when (and requires (not ((:f requires) args)))
        (fail! "`" nm "` requires " (pr-str (:test requires)) ", but is called with " (pr-str (vec args))))
      (let [r (apply f args)]
@@ -3066,7 +3134,7 @@
                    ;; law: its names are the target's fns, then the spec's own
                    compile (fn [form]
                              (when form
-                               (let [q (qualify form #{} (set (keys (ns-publics (the-ns target))))
+                               (let [q (qualify form (set (second form)) (set (keys (ns-publics (the-ns target))))
                                                 (set (keys (ns-interns (the-ns (::ns e))))) target (::ns e))]
                                  {:test (nth form 2)
                                   :f (let [g (binding [*ns* (the-ns (::ns e))] (eval q))]
@@ -3082,7 +3150,8 @@
                  :when (and (var? v) (fn? @v) (not (contains? @originals v)))]
              (let [f @v]
                (swap! originals assoc v f)
-               (alter-var-root v (constantly (checked q f sig tenv (arg-names v (count (:params sig))))))
+               (alter-var-root v (constantly (checked q f sig tenv (arg-names v (count (:params sig)))
+                                                      {:assumed true})))
                v))))))
 
 (defn- unwrap! [vars]
@@ -3505,8 +3574,16 @@
 (defn- assumed-names
   "name -> qualified name for the assumed fns, as a namespace with these
   aliases and refers names them: alias-qualified, referred, or in full."
-  [aliases refers assumed]
+  [{:keys [aliases refers] :as names} assumed]
   (merge (into {} (for [q assumed] [q q]))
+         ;; a clojure.core fn the prover does not model, by its plain name
+         ;; where the namespace reads it as core's; one it models keeps its
+         ;; model
+         (into {} (for [q assumed
+                        :when (and (= "clojure.core" (namespace q))
+                                   (not (contains? writ.prove.translate/core-fns (symbol (name q))))
+                                   (core-name? names (symbol (name q))))]
+                    [(symbol (name q)) q]))
          (into {} (for [[a lib] aliases, q assumed :when (= (str lib) (namespace q))]
                     [(symbol (str a) (name q)) q]))
          (into {} (for [[r q] refers :when (contains? assumed q)] [r q]))))
@@ -3529,7 +3606,7 @@
               nsf (first (filter #(head? % "ns") forms))]
           (if (nil? nsf)
             (recur (rest todo) (conj seen n) out)
-            (let [{:keys [aliases refers]} (ns-names nsf)
+            (let [{:keys [aliases refers] :as names} (ns-names nsf)
                   libs (distinct (concat (vals aliases) (map (comp symbol namespace) (vals refers))))
                   project? (fn [lib] (not (re-find #"^(clojure|jolt)\." (str lib))))
                   deps (filter project? libs)
@@ -3541,7 +3618,7 @@
                                            f (defs-in lib)]
                                        [(symbol (str a) (str f)) (symbol (str lib) (str f))]))
                             (into {} (for [[r q] refers :when (project? (symbol (namespace q)))] [r q]))
-                            (assumed-names aliases refers assumed))]
+                            (assumed-names names assumed))]
               (recur (concat (rest todo) deps) (conj seen n) (conj out [n forms ref-map]))))))
       out))))
 
@@ -3642,14 +3719,14 @@
           libs+refers (delay
                         (let [libs (lib-pairs target (set (keys (:sigs assumed))))
                               spec-forms (book/read-forms (source-url spec-ns))
-                              {:keys [aliases refers]} (ns-names (first (filter #(head? % "ns") spec-forms)))]
+                              {:keys [aliases] :as names} (ns-names (first (filter #(head? % "ns") spec-forms)))]
                           [libs spec-forms
                            (merge
                              (into {} (for [[a lib] aliases
                                             [n fs] libs :when (= n lib)
                                             f fs :when (and (seq? f) (contains? '#{defn defn-} (first f)))]
                                         [(symbol (str a) (str (second f))) (symbol (str lib) (str (second f)))]))
-                             (assumed-names aliases refers (set (keys (:sigs assumed)))))]))
+                             (assumed-names names (set (keys (:sigs assumed)))))]))
           anns (into {} (map (fn [[k sig]] [k (erase sig refs)])) anns)
           assumed-sigs (into {} (for [[q sig] (:sigs assumed)
                                       :let [sig (erase sig refs)]]
@@ -4037,6 +4114,7 @@
   can track: [{:id :kind :of :fns :text} ...].  An id reads kind.subject:
   law.name, signature.f, edge.graph.state.f, step.graph.state.f.target,
   guard.graph.state.f (and .n for each clause), refused.graph.state.f,
+  frame.graph.state.f, ensures.f,
   invariant.graph.state, reach.graph, start.graph, final.graph,
   never.graph.a.b, before.graph.a.b, runs.graph, flow.f, calls.f,
   machine.m, question.q, assume.ns/f and assume.name.  :fns are the
@@ -4177,6 +4255,8 @@
                    {:question id :what :no-longer-blocking}))))]
     {:ok (empty? weakened) :weakened weakened}))
 
+(declare reachable-from)
+
 (defn- assumption-results
   "What each assumption came to, run while the assumed fns are wrapped:
   a signature needs its fn to resolve, outside the target; a law about
@@ -4185,6 +4265,8 @@
   and, when it failed, :why or a law's failure.  A law that held carries
   :prop, qualified, for the prover to cite."
   [e ctx publics interns target spec-ns {:keys [trials seed max-size]}]
+  (let [forms-of #(book/read-forms (source-url %))
+        graph (delay (try (wide-graph spec-ns (forms-of spec-ns) forms-of) (catch Throwable _ {})))]
   (vec (concat
          (for [[q sig] (sort-by (comp str key) (:assumes e))]
            (cond
@@ -4202,11 +4284,20 @@
              (let [p (desugar prop)
                    _ (lw/check-prop-shape! p)
                    qp (qualify p #{} publics interns target spec-ns)
-                   own (first (filter #(and (symbol? %) (= (namespace %) (str target)))
-                                      (tree-seq coll? seq qp)))]
-               (if own
+                   of-target? #(and (symbol? %) (= (namespace %) (str target)))
+                   syms (filter symbol? (tree-seq coll? seq qp))
+                   ;; directly, or through the spec's helpers and the
+                   ;; project fns they call
+                   path (or (some #(when (of-target? %) [%]) syms)
+                            (some (fn [h] (when (contains? @graph h)
+                                            (some #(reach-path @graph h %)
+                                                  (filter of-target? (reachable-from @graph h)))))
+                                  syms))]
+               (if path
                  {:assumption name :status :failed
-                  :why (str "assumption `" name "` calls `" (clojure.core/name own) "`, a fn of " target
+                  :why (str "assumption `" name "` calls `" (clojure.core/name (peek path)) "`, a fn of " target
+                            (when (next path)
+                              (str ", through " (str/join " -> " (cons (clojure.core/name (first path)) (rest path)))))
                             ": an assumption is about code writ does not check, and the target is"
                             " checked. Say what it does with a law")}
                  (let [r (test-law ctx {:name name :prop qp} {:trials trials :seed seed :max-size max-size})]
@@ -4214,7 +4305,15 @@
                      (assoc r :assumption name)
                      {:assumption name :status :held :prop qp :evidence (:status r)}))))
              (catch Throwable ex
-               {:assumption name :status :failed :why (str "assumption `" name "`: " (or (ex-message ex) (str ex)))}))))))
+               {:assumption name :status :failed :why (str "assumption `" name "`: " (or (ex-message ex) (str ex)))})))))))
+
+(defn- reachable-from
+  "Every fn of graph g that f reaches through calls."
+  [g f]
+  (loop [todo [f], seen #{}]
+    (if-let [x (first todo)]
+      (recur (into (vec (rest todo)) (remove seen (get g x))) (into seen (get g x)))
+      seen)))
 
 (defn check
   "Check a spec namespace against its target (or opts :target).  Returns a

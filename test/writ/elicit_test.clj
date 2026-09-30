@@ -29,3 +29,8 @@
   (let [p (spec/plan 'writ.spec-demo.clip-spec)]
     (is (str/includes? p "ask the spec's owner"))
     (is (str/includes? p "take-upto"))))
+
+(deftest a-type-inside-another-raises-its-decisions
+  (let [asks (spec/elicit 'writ.spec-demo.member-spec)]
+    (is (some #{'nickname} (:fns (of-class asks :zero-and-negative)))
+        "a member's points are a Nat")))

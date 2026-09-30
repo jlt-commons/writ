@@ -303,7 +303,7 @@ Built in: `Nat Int Bool String Char Keyword Symbol Float Double Unit Any`,
 `(List T)`, `(Vec T)`, `(Set T)`, `(Map K V)`, `(Tuple T ...)`, `(Opt T)`
 (a `T` or nil), records (see [Records](#records)), `(Index :key Record)`
 (see [Collections of records](#collections-of-records)), and function types
-`(-> A B R)`. Declared types come from `data`.
+`(-> A B R)`, of up to eight arguments. Declared types come from `data`.
 
 `Float`, `Double` and `Any` hold no NaN; `Float!`, `Double!` and `Any!`
 are the same with NaN among their values, and their generators produce
@@ -361,7 +361,8 @@ writ checks this statically:
 A problem with many entities keeps them together, and its rules are about
 all of them at once: no two members share an email. `(Index :id Member)`
 is a map of `Member`s, each kept under its own `:id`, and `:unique
-[:email]` says no two share an email:
+[:email]` says no two share an email (two with no email, nil, share
+one):
 
 ```clojure
 (refine Member [m {:id Nat, :email String}] true)
@@ -392,7 +393,8 @@ law `registry:db:register` fails for
 A rule across the records that the type cannot say goes in an invariant
 or the refinement's predicate; `writ.spec/unique-by?` says no two of a
 collection share a value of a fn. Such a rule is usually kept by
-induction, and each edge assumes the invariants of the state it leaves.
+induction, and each edge may assume the invariants of the state it
+leaves; see the invariants under [The state graph](#the-state-graph).
 
 ### Records
 
@@ -433,8 +435,10 @@ check follows the keys:
   ```
   `award`: `m` is a record with keys :email, :id, :nick, :points, and has no key :point. Read one of its keys, or add :point to its type, as (Opt T) if it may be absent
   ```
-- An `(Opt T)` key read without a default is `(Opt T)`, not `T`, so
-  returning it where a `T` is due fails with "it may be nil".
+- An `(Opt T)` key read is `(Opt T)`, not `T`, so returning it where a
+  `T` is due fails with "it may be nil". A default does not change that:
+  `(:nick m "")` is nil when `:nick` is there and nil. Write
+  `(or (:nick m) "")`.
 - `assoc` and `dissoc` on literal keys give the record with that key set
   or gone, so dissoc'ing a required key and returning the map fails too.
 
@@ -457,8 +461,8 @@ A proposition is built from:
 - `(=> P Q)`, where cases in which `P` does not hold are skipped
 - `(forall [x T, y U] P)`
 - `(exists [x T] P)`
-- `(throws? e)`, true when evaluating `e` throws (a lazy seq it returns
-  is realised first). An error writ raises, an argument or result that
+- `(throws? e)`, true when evaluating `e` throws (lazy seqs in what it
+  returns are realised first). Refer it from `writ.spec` with the rest. An error writ raises, an argument or result that
   breaks a signature, is not counted: it is rethrown, and the law fails
   with it, since the law misuses the code rather than finding it throws.
 - any other expression, which holds when it is truthy
@@ -719,12 +723,15 @@ graph `spin` breaks its own rules
 
 **Invariants.** `(invariant g state [v] pred)` says what always holds of
 a state's values, whichever edge they came in by. Every edge that may
-land in the state carries the predicate in its law, so a landing in
-`:hot` must be a `Hot` and hold it too, and a `[state value]` start must
-satisfy it. Every edge out of the state may assume it: a step keeps an
-invariant when it holds before the step, so one that holds only by
-induction, such as an even count that climbs by two, is kept, and with
-the start holding it every run does. An invariant the state's own refinement already implies is
+land in the state carries the predicate in its law, a plain state
+included, so a landing in `:hot` must be a `Hot` and hold it too, and a
+`[state value]` start must satisfy it. Every edge out of the state may
+assume it: a step keeps an invariant when it holds before the step, so
+one that holds only by induction, such as an even count that climbs by
+two, is kept, and with the start holding it every run does. A start
+named by its state alone, `:start :hot`, may be any value of it, so
+edges out of the start state then assume nothing; give the start a
+value to have them. An invariant the state's own refinement already implies is
 vacuous and fails, as a vacuous law does: say what a landing must keep
 that the type does not.
 
@@ -773,7 +780,8 @@ its role; each edge says which roles may take it:
    :final  [:closed]})
 ```
 
-`:by` is a guard, joined with the edge's own `:when` if it has one, so
+`:by` is a guard, joined with the edge's own `:when` if it has one (the
+own guard's clauses come first, and the role test is the last clause), so
 the laws of a guard come with it: a step by one of the roles lands where
 the edge says, and one by anyone else is refused and leaves the state as
 it was. A close a clerk can make fails `vault:open:close:refused`:
@@ -1342,7 +1350,21 @@ A law quantified over fns is proved with the fn left unknown: the
 prover never needs to know what it answers.
 
 Anything else leaves the law tested, with `:unproved` saying why, for
-example "outside the prover: `frequencies`".
+example "outside the prover: `frequencies`". What the spec needs of such
+a fn can be assumed, and the prover cites it; see
+[Assumptions](#assumptions). A clojure.core fn it does not model is
+assumed by its full name and read wherever the code calls it by its
+plain name, unless the namespace excludes it from `clojure.core` or
+refers another fn by that name. Its signature types every such call:
+
+```clojure
+(assume clojure.core/frequencies [(List Nat) -> (Map Nat Nat)])
+(assume the-counts-add-up
+  (forall [xs (List Nat)] (= (apply + (vals (frequencies xs))) (count xs))))
+```
+
+An assumption about a fn the prover does model is tested like any other,
+but the model is what the prover reads.
 
 ### Symbolic evaluation and the solver
 
@@ -1392,7 +1414,8 @@ law `the-left-paddle-stops-the-ball` fails for
 ```
 
 Symbolic evaluation covers the non-recursive code: arithmetic, `if`,
-`case`, `let`, destructuring, vectors of known length, data values, sets
+`case`, `let`, destructuring, vectors of known length, data values,
+records, sets
 built from literals and sets of unknown size filtered, mapped by a
 translation, or tested for membership, and calls of pure core fns on
 literal data. Recursion is left to rewriting and induction.
@@ -1493,7 +1516,8 @@ fn is wrapped like a signed one, so a signature it does not keep fails
 where it returns. The prover takes its result to be of its return type.
 
 An assumed law is about such fns and never the target's: one that calls
-a fn of the target fails, since the target is what the spec checks. It
+a fn of the target fails, directly or through a spec helper or project
+fn, since the target is what the spec checks. It
 is tested against the real fns on every check, and a counterexample fails
 the check:
 
@@ -1537,7 +1561,8 @@ ask the spec's owner, before the code decides
 ```
 
 Collections raise the empty case, integers zero and negatives, optional
-values what absent means, floats precision and rounding, and each graph
+values what absent means, floats precision and rounding, wherever they
+sit in a type, so `(List Int)` asks about negative elements too, and each graph
 what a run's whole life may hold: undoing, cancelling, repeating,
 expiring. They are prompts, not failures, since a law over every input
 may already answer one. Each answer is a law, a state or a step, or a
@@ -1555,10 +1580,11 @@ is written into the spec and the question removed.
 ### Obligations and records
 
 `(spec/obligations 'my.spec)` lists everything the spec obliges, from the
-spec alone, as data an agent can keep track of: each law, signature, edge,
-step, guard and refusal, invariant, graph rule, run, flow, call set,
-machine and question, with an id (`law.permutation`,
+spec alone, as data an agent can keep track of: each law, signature,
+`:ensures`, edge, step, guard and refusal, frame, invariant, graph rule,
+run, flow, call set, machine, assumption and question, with an id (`law.permutation`,
 `edge.account.open.withdraw`, `guard.account.open.withdraw.2`,
+`frame.membership.fresh.award`, `ensures.clamp`,
 `invariant.gauge.hot`, `final.account`), its kind and the signed fns it
 names. A check's report has `:obligations`, each id with its status:
 `:met`, `:failed`, `:unproved`, or `:open`/`:blocking` for a question.

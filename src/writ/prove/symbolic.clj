@@ -720,11 +720,19 @@
   (let [by-code (into {} (map (fn [[c k]] [k c])) (:codes @st))]
     ((fn walk [v]
        (cond
+         ;; a throw, or anything else that is no value's description
+         (not (map? v)) ::none
          (and (contains? v :int) (integer? (:int v))) (:int v)
          (and (contains? v :bool) (boolean? (:bool v))) (:bool v)
          (and (contains? v :const) (contains? by-code (:const v))) (by-code (:const v))
          (:nil v) nil
-         (:vec v) (let [xs (mapv walk (:vec v))] (if (some #{::none} xs) ::none (apply list xs)))
+         ;; str, pr-str and = on a coll see a vector from a seq, so a
+         ;; value of unknown kind is no one value
+         (:vec v) (let [xs (mapv walk (:vec v))]
+                    (cond (some #{::none} xs) ::none
+                          (= :vector (:kind v)) xs
+                          (= :seq (:kind v)) (apply list xs)
+                          :else ::none))
          (and (:set v) (:elems (:set v)) (every? (comp true? first) (:elems (:set v))))
          (let [xs (mapv (comp walk second) (:elems (:set v)))] (if (some #{::none} xs) ::none (set xs)))
          :else ::none))
@@ -833,11 +841,15 @@
   "A clojure.core fn applied to values."
   [st f args]
   (if-let [v (and (contains? pure-fns f)
-                  (let [xs (map #(concrete st %) args)]
+                  ;; a throw in an argument is a throw of the call, as
+                  ;; lift makes it for the fns it handles
+                  (if (some #{:bottom} args)
+                    :bottom
+                    (let [xs (map #(concrete st %) args)]
                     (when (not-any? #{::none} xs)
                       (try (let [r (apply @(resolve (symbol "clojure.core" (name f))) xs)]
                              (from-concrete st (if (seq? r) (doall r) r)))
-                           (catch Throwable _ nil)))))]
+                           (catch Throwable _ nil))))))]
     v
     (core* st f args)))
 
@@ -1157,11 +1169,15 @@
                       (let [k (int-of i)
                             xs (seq-of x)
                             past (if (= 3 n) c :bottom)]
-                        (if (integer? k)
+                        (cond
+                          ;; nth of nil is nil, or the default, at any index
+                          (:nil x) (if (= 3 n) c {:nil true})
+                          (integer? k)
                           (cond (< -1 k (count xs)) (nth xs k)
                                 (= 3 n) c
                                 :else (throws!))
                           ;; an unknown index: each position, under k = j
+                          :else
                           (do (when-not (= 3 n)
                                 (record-throw! st [:not (into [:or false] (for [j (range (count xs))] [:= k j]))]))
                               (reduce (fn [acc j] (merge-values st (define! st :bool [:= k j]) (nth xs j) acc))
@@ -1528,12 +1544,15 @@
         (let [by-code (into {} (map (fn [[c k]] [k c])) codes)
               ;; a constant the model picked that no literal of the code is:
               ;; a value of its own kind, apart from the others
+              ;; one per code, k and -k apart, and none a literal of
+              ;; the code would be
               decoded-code (fn [k ctype]
-                             (get by-code k (case ctype
-                                              :string (str "s" (abs k))
-                                              :symbol (symbol (str "s" (abs k)))
-                                              :char (char (+ 97 (mod (abs k) 26)))
-                                              (keyword (str "k" (abs k))))))
+                             (let [tag (str "writ%" (if (neg? k) "n" "") (abs k))]
+                               (get by-code k (case ctype
+                                                :string tag
+                                                :symbol (symbol tag)
+                                                :char (char (+ 0x4E00 (mod k 0x5000)))
+                                                (keyword tag)))))
               values (into {} (for [[v sv] env] [v (decode sv (:model r) decoded-code)]))]
           (when-not (some #{::none} (vals values))
             values))))))

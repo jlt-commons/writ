@@ -40,7 +40,9 @@
   (is (thrown-with-msg? Exception #"keys each record by :uid, which the record does not have"
         (kind/check-type (list 'Index :uid member) {} #{})))
   (is (thrown-with-msg? Exception #":unique names :mail, which the record does not have"
-        (kind/check-type (list 'Index :id member :unique [:mail]) {} #{}))))
+        (kind/check-type (list 'Index :id member :unique [:mail]) {} #{})))
+  (is (thrown-with-msg? Exception #"\(Index :key Record :unique \[:field \.\.\.\]\)"
+        (kind/check-type (list 'Index :id member :unique :email) {} #{}))))
 
 (deftest unique-by-is-true-of-no-two-alike
   (is (spec/unique-by? :email []))
@@ -61,3 +63,13 @@
     (let [r (spec/check 'writ.spec-demo.climb-spec {:seed 42})]
       (is (:ok r) (:message r))
       (is (#{:proved :tested} (:status (law-result r 'climbing:up:climb)))))))
+
+(deftest an-invariant-is-assumed-only-where-a-run-must-hold-it
+  (testing "a start that may be any value of the state holds no invariant"
+    (let [r (spec/check 'writ.spec-demo.climb-anywhere-spec {:seed 42})]
+      (is (not (:ok r)))
+      (is (= :failed (:status (law-result r 'climbing:up:climb))) (:message r))))
+  (testing "a landing in a plain state is checked against its invariants"
+    (let [r (spec/check 'writ.spec-demo.parity-spec {:seed 42})]
+      (is (not (:ok r)))
+      (is (= :failed (:status (law-result r 'parity:n:bump))) (:message r)))))

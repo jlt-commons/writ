@@ -118,6 +118,13 @@
     (= exp act) true
     (not (known? exp tenv)) true
     (= 'Any exp) true
+    ;; Any is also what inference writes for a return it could not work
+    ;; out (a local fn's), so as an actual it is unknown, and unknowns pass
+    (= 'Any act) true
+    ;; a record with every key dissociated: a map of no keys
+    (= {} act) (or (and (kind/record-type? exp) (nil? (record-gaps exp act tenv)))
+                   (and (seq? exp) (= 'Map (first exp)))
+                   (and (kind/opt-type? exp) (compat? (second exp) act tenv)))
     (kind/opt-type? exp) (or (= 'Unit act)
                              (if (kind/opt-type? act)
                                (compat? (second exp) (second act) tenv)
@@ -126,9 +133,6 @@
     ;; a record is a map of keywords to its keys' values
     (and (seq? exp) (= 'Map (first exp)) (kind/record-type? act))
     (and (compat? (second exp) 'Keyword tenv) (every? #(compat? (nth exp 2) % tenv) (vals act)))
-    ;; Any is also what inference writes for a return it could not work
-    ;; out (a local fn's), so as an actual it is unknown, and unknowns pass
-    (= 'Any act) true
     (and (= 'Int exp) (= 'Nat act)) true
     ;; a String is a finite seq of chars
     (and (= '(List Char) exp) (= 'String act)) true
@@ -396,17 +400,18 @@
 (defn- record-read
   "The type of reading key k of a value of record type t, which must
   have k: an open map may hold more keys, but a read of one the type
-  does not name is most often a misspelt one.  With a default, an (Opt T)
-  key reads as T or the default."
+  does not name is most often a misspelt one.  An (Opt T) key reads as
+  (Opt T) with a default too: the default is for an absent key, and the
+  key may be there, holding nil."
   [ctx t k arg default]
   (let [src (if (= :ref (:op arg)) (str "`" (display (:name arg)) "`") "the value")]
     (when-not (contains? t k)
       (fail! "`" (:nm ctx) "`: " src " is a record with keys " (keys-shown t) ", and has no key " k
              ". Read one of its keys, or add " k " to its type, as (Opt T) if it may be absent"))
     (let [ft (get t k)]
-      (if (and default (kind/opt-type? ft))
-        (join (second ft) default (:tenv ctx))
-        ft))))
+      (cond (nil? default) ft
+            (and (kind/opt-type? ft) (compat? (second ft) default (:tenv ctx))) ft
+            :else (join ft default (:tenv ctx))))))
 
 (defn- record-update
   "The type of an assoc or dissoc of literal keyword keys on a record:
@@ -418,8 +423,7 @@
               (reduce (fn [r [k vt]] (assoc r (:val k) (or vt 'Any)))
                       t (map vector (take-nth 2 (rest args)) (take-nth 2 (drop 2 ats)))))
       dissoc (when (every? lit-kw? (rest args))
-               (let [r (apply dissoc t (map :val (rest args)))]
-                 (if (seq r) r data)))
+               (apply dissoc t (map :val (rest args))))
       nil)))
 
 (defn- destructured

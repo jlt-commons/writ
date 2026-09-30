@@ -371,7 +371,8 @@
   (let [info (ns-info forms)
         forms (mapv (fn [f] (if (ns-form? f) f (d/annotate-fns (normalize-names f info))))
                     forms)
-        shadow (book-names forms)
+        ;; a name the ns form refers is that namespace's, not clojure.core's
+        shadow (into (book-names forms) (ns-refers forms))
         arities (book-arities forms)
         sigs (merge *extra-sigs* (book-sigs forms))
         refers (ns-refers forms)

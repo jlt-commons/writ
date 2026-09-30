@@ -268,12 +268,13 @@
 
 (defn- term-type
   "The type of term t when its form says it: a variable's own, a list of
-  a tail's elements, an element nth takes from a list (nth throws, rather
-  than give anything else), a part of a Tuple, whose length is fixed, and
-  a record's value at one of its keys.  nil otherwise; never from a fn's
+  a tail's elements, an element nth takes from a vector or a tail (nth
+  throws, rather than give anything else; a (List T) may be nil, and nth
+  of nil is nil), a part of a Tuple, whose length is fixed, and a
+  record's value at one of its keys.  nil otherwise; never from a fn's
   signature."
   [ctx t]
-  (let [list-el (fn [ty] (cond (and (seq? ty) (contains? '#{List Vec} (first ty))) (second ty)
+  (let [list-el (fn [ty] (cond (and (seq? ty) (= 'Vec (first ty))) (second ty)
                                (and (map? ty) (:writ/elems ty)) (:writ/elems ty)
                                :else nil))]
     (cond

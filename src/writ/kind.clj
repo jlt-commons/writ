@@ -38,7 +38,7 @@
   "{:key :of :unique} of an (Index :key Record :unique [:field ...])."
   [ty]
   (let [[_ k r & opts] ty]
-    {:key k :of r :unique (vec (:unique (apply hash-map opts)))}))
+    {:key k :of r :unique (let [u (:unique (apply hash-map opts))] (if (vector? u) u []))}))
 
 (declare check-type record-type?)
 
@@ -47,7 +47,8 @@
         shape (str "an Index is (Index :key Record), or (Index :key Record :unique [:field ...]), had "
                    (pr-str ty))]
     (when-not (and (keyword? k) (some? r) (even? (count opts))
-                   (every? #{:unique} (take-nth 2 opts)))
+                   (every? #{:unique} (take-nth 2 opts))
+                   (every? vector? (take-nth 2 (rest opts))))
       (fail! shape))
     (check-type r tenv allowed)
     (let [{:keys [unique]} (index-parts ty)]
