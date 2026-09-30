@@ -671,8 +671,9 @@
   pterm/same)
 
 (defmacro throws?
-  "In a law: does evaluating expr throw?  A lazy seq it returns is
-  realised first, since that is where its elements are computed.  An
+  "In a law: does evaluating expr throw?  A lazy seq it returns, and any
+  inside what it returns, is realised first, since that is where its
+  elements are computed.  An
   error writ raises -- an argument or a result that breaks a signature --
   is rethrown, not counted: it says the law misuses the code, not that
   the code throws.
@@ -680,7 +681,7 @@
     (law past-the-end-throws
       (forall [v (Vec Nat), i Nat] (= (throws? (at v i)) (>= i (count v)))))"
   [expr]
-  `(try (let [v# ~expr] (when (seq? v#) (dorun v#)) false)
+  `(try (let [v# ~expr] (walk/postwalk identity v#) false)
         (catch Throwable e#
           (if (:writ/error (ex-data e#)) (throw e#) true))))
 

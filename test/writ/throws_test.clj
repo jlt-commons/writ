@@ -47,3 +47,8 @@
   (let [g (#'spec/fn-gen gen/nat)
         a (gen/generate g 10 7), b (gen/generate g 10 7)]
     (is (= (a inc) (b dec)) "a fn argument answers as any fn does, run to run")))
+
+(deftest a-throw-inside-a-nested-lazy-seq-is-a-throw
+  (is (spec/throws? [(map #(/ 1 %) [1 0])]))
+  (is (spec/throws? {:k (map #(/ 1 %) [0])}))
+  (is (not (spec/throws? [(map inc [1 2])]))))
