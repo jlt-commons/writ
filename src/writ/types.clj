@@ -663,7 +663,7 @@
               (let [{:keys [params ret]} (get sigs s)]
                 (doseq [[i pt at] (map vector (range) params ats)]
                   (when-not (compat? pt at tenv)
-                    (fail! "`" (display s) "` expects " (show pt) " for argument "
+                    (fail! "`" (if (namespace s) s (display s)) "` expects " (show pt) " for argument "
                            (inc i) " but is passed " (show at)
                            (when-let [why (why-not pt at tenv)] (str ": " why)))))
                 ret)

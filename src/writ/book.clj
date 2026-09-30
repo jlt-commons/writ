@@ -360,6 +360,12 @@
   it, since the code a spec covers is plain Clojure and not a book."
   "is not supported in a book; a book checks def, defn, data, law and proof forms only")
 
+(def ^:dynamic *extra-sigs*
+  "Signatures of fns outside the book, by qualified name: what a spec
+  assumes of code writ does not check.  Calls to them are typed as the
+  book's own are."
+  {})
+
 (defn check-book
   [forms]
   (let [info (ns-info forms)
@@ -367,7 +373,7 @@
                     forms)
         shadow (book-names forms)
         arities (book-arities forms)
-        sigs (book-sigs forms)
+        sigs (merge *extra-sigs* (book-sigs forms))
         refers (ns-refers forms)
         decls (mapv dt/parse (filter dt/data-form? forms))
         _ (when-let [d (first-dup (mapv :name decls))]

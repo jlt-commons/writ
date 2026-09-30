@@ -886,6 +886,35 @@
           rules
           (recur rules proved tried left))))))
 
+(defn contract-rules
+  "The contracts of fns whose signatures are taken as given, not proved:
+  a spec's assumptions about code writ does not check.  On arguments of
+  its parameter types, each returns a value of its return type, as the
+  lemma rules prove-contracts makes: an Int is (integer? call), a Nat
+  that and (<= 0 call), and any other type with a recognizer the
+  recognizer of the call."
+  [tenv sigs]
+  (let [recs (sc/recognizers tenv (types-of [] [] sigs))]
+    (vec (for [[f {:keys [params ret]}] (sort-by key sigs)
+               :let [ret (plain ret)
+                     c (get-in recs [:checks ret])
+                     ps (mapv #(symbol (str "?c%" %)) (range (count params)))
+                     pat (into [:app f] ps)
+                     rule (fn [nm check]
+                            {:name (symbol (str (name f) nm))
+                             :vars (set ps)
+                             :types (zipmap ps (map plain params))
+                             :lhs (t/subst check {'%x pat})
+                             :rhs [:lit true]})]
+               r (cond
+                   (contains? '#{Int Nat} ret)
+                   (cond-> [(rule "%contract" [:call 'integer? '%x])]
+                     (= 'Nat ret) (conj (rule "%nonneg%contract" [:call '<= [:lit 0] '%x])))
+                   (and (vector? c) (contains? #{:app :call} (head c)))
+                   [(rule "%contract" c)]
+                   :else [])]
+           r))))
+
 (defn definitions
   "Translate the defns of the target and the spec: [defs own].  pairs is
   [[ns-sym forms] ...] or [[ns-sym forms refers] ...]; each ns reads its

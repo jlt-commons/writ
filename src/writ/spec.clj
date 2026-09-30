@@ -72,17 +72,22 @@
 
 (defn- simple-sym? [x] (and (symbol? x) (nil? (namespace x))))
 
+(defn- parse-sig
+  "`[A B -> R]` into {:params [A B] :ret R}; where names the form."
+  [where sig]
+  (when-not (vector? sig)
+    (fail! where " needs a signature vector like [A B -> R]"))
+  (let [[ps [arrow & rs]] (split-with #(not= '-> %) sig)]
+    (when-not (and (= '-> arrow) (= 1 (count rs)))
+      (fail! where " must end in `-> ReturnType`, had: " (pr-str sig)))
+    {:params (vec ps) :ret (first rs)}))
+
 (defn parse-ann
   "`[A B -> R]` into {:params [A B] :ret R}."
   [nm sig]
   (when-not (simple-sym? nm)
     (fail! "`ann` needs a simple fn name, had: `" (pr-str nm) "`"))
-  (when-not (vector? sig)
-    (fail! "`ann " nm "` needs a signature vector like [A B -> R]"))
-  (let [[ps [arrow & rs]] (split-with #(not= '-> %) sig)]
-    (when-not (and (= '-> arrow) (= 1 (count rs)))
-      (fail! "`ann " nm "` must end in `-> ReturnType`, had: " (pr-str sig)))
-    {:params (vec ps) :ret (first rs)}))
+  (parse-sig (str "`ann " nm "`") sig))
 
 (def proofs
   "proof ns name -> {:proves spec-ns :lemmas [lemma] :hints {law hint}}"
@@ -110,6 +115,8 @@
                    :machine (update e :machines (fnil conj []) v)
                    :invariant (update e :invariants (fnil conj []) v)
                    :question (update e :questions (fnil conj []) v)
+                   :assume-fn (assoc-in e [:assumes (first v)] (second v))
+                   :assume-law (update e :assumptions (fnil conj []) v)
                    :ann (assoc-in e [:anns (first v)] (second v))
                    :law (update e :laws conj v))))
   nil)
@@ -241,6 +248,38 @@
         (fail! where ": `:result` can only end a chain, had " (pr-str c))))
     `(-register! '~(ns-name *ns*) :flow
                  '~[(resolve-callee f) params (mapv (fn [c] (mapv #(if (symbol? %) (resolve-callee %) %) c)) chains)])))
+
+(defmacro assume
+  "Take as given what code writ does not check does: a library, another
+  namespace, an effect shell.
+
+    (assume str/trim [String -> String])
+    (assume trim-is-idempotent
+      (forall [s String] (= (str/trim (str/trim s)) (str/trim s))))
+
+  A qualified fn and a signature: calls to it are typed by the signature
+  in the static check, it is wrapped while the laws run so a value of
+  the wrong type fails where it returns, and the prover takes its result
+  to be of that type.  A name and a proposition: a law about such fns,
+  never the target's, tested against the real fns on every check and
+  cited by the prover as given.  An assumption counts toward no law and
+  judges no stand-in, and every report names it: it is what the spec's
+  proofs rest on."
+  [nm x]
+  (cond
+    (and (symbol? nm) (namespace nm) (vector? x))
+    `(-register! '~(ns-name *ns*) :assume-fn '~[(resolve-callee nm) (parse-sig (str "`assume " nm "`") x)])
+
+    (and (simple-sym? nm) (vector? x))
+    (fail! "`assume` names a fn by its qualified name, as str/trim, had `" nm
+           "`; a simple name goes with a law: (assume name (forall ...))")
+
+    (and (simple-sym? nm) (some? x))
+    `(-register! '~(ns-name *ns*) :assume-law '~{:name nm :prop x})
+
+    :else
+    (fail! "`assume` takes (assume ns/f [A -> R]) or (assume name proposition), had: "
+           (pr-str (list 'assume nm x)))))
 
 (defmacro machine
   "State that a target fn steps a state machine by a transition table:
@@ -735,6 +774,14 @@
                  (let [pick (if (and (<= size 1) (seq base)) base ctors)]
                    (gen/one-of (mapv #(ctor-gen % size) pick)))))))
 
+(def ^:private any-string
+  "Mostly words, but now and then printable ASCII with tabs and newlines,
+  so code that trims, splits or escapes meets what it is there for."
+  (gen/frequency [[3 gen/string-alphanumeric]
+                  [1 (gen/fmap #(apply str %)
+                               (gen/vector (gen/frequency [[8 gen/char-ascii]
+                                                           [1 (gen/elements [\tab \newline])]])))]]))
+
 (def ^:private finite-double
   (gen/double* {:NaN? false :infinite? false}))
 
@@ -770,7 +817,7 @@
         Int gen/small-integer
         Bool gen/boolean
         Char gen/char-alpha
-        String gen/string-alphanumeric
+        String any-string
         Keyword gen/keyword
         Symbol gen/symbol
         (Float Double) finite-double
@@ -1320,6 +1367,8 @@
 
 (declare erase erase-data refines-of)
 
+(declare ns-names)
+
 (defn- static-check
   "Run writ's rules over the target's source with the spec's types, each
   refinement read as its base type.  Returns {:ok true :defns {name
@@ -1354,7 +1403,14 @@
         (binding [ck/*affine* false
                   ck/*descend-all* true
                   ty/*tagged* true
-                  book/*forms-accepted* spec-forms-accepted]
+                  book/*forms-accepted* spec-forms-accepted
+                  ;; by the qualified name an alias resolves to, and by a
+                  ;; name the target refers
+                  book/*extra-sigs* (let [sig-of #(unbang (erase (get (:assumes e) %) refs))
+                                          {:keys [refers]} (some-> (first nsf) ns-names)]
+                                      (merge (into {} (for [q (keys (:assumes e))] [q (sig-of q)]))
+                                             (into {} (for [[r q] refers :when (contains? (:assumes e) q)]
+                                                        [r (sig-of q)]))))]
           (book/check-book (vec (concat nsf data others))))
         {:ok true :defns defns}))
     (catch Throwable e
@@ -2469,6 +2525,12 @@
                                                  (str "\n    flow: "
                                                       (str/join " -> " (map #(if (= :result %) "result" (str %)) c)))))
                                     (when-let [gs (get calls f)] (calls-str gs))))))))
+         (when (or (seq (:assumes e)) (seq (:assumptions e)))
+           (str "\n\nassumes, of code writ does not check"
+                (apply str (for [[q sig] (sort-by (comp str key) (:assumes e))]
+                             (str "\n  " q "  " (sig-str sig))))
+                (apply str (for [{:keys [name prop]} (:assumptions e)]
+                             (str "\n  " name ": " (pr-str prop))))))
          (when (seq (:questions e))
            (str "\n\nopen questions"
                 (apply str (for [{:keys [id text blocking]} (:questions e)]
@@ -2689,17 +2751,31 @@
        (require (:target e))
        (assoc e ::proof (proof-entry spec-ns proof))))))
 
+(defn- assumed-var
+  "The var of an assumed fn, its namespace loaded, or nil."
+  [q]
+  (try (requiring-resolve q) (catch Throwable _ nil)))
+
 (defn- wrap!
-  "Wrap the signed fns not already wrapped; returns the vars it wrapped."
-  [{:keys [target anns] :as e}]
+  "Wrap the signed fns not already wrapped, and the fns the spec assumes
+  signatures for; returns the vars it wrapped."
+  [{:keys [target anns assumes] :as e}]
   (let [tenv (type-env-of e (::ns e))]
-    (vec (for [[nm sig] anns
-               :let [v (ns-resolve (the-ns target) nm)]
-               :when (and v (not (contains? @originals v)))]
-           (let [f @v]
-             (swap! originals assoc v f)
-             (alter-var-root v (constantly (checked nm f sig tenv (arg-names v (count (:params sig))))))
-             v)))))
+    (vec (concat
+           (for [[nm sig] anns
+                 :let [v (ns-resolve (the-ns target) nm)]
+                 :when (and v (not (contains? @originals v)))]
+             (let [f @v]
+               (swap! originals assoc v f)
+               (alter-var-root v (constantly (checked nm f sig tenv (arg-names v (count (:params sig))))))
+               v))
+           (for [[q sig] assumes
+                 :let [v (assumed-var q)]
+                 :when (and (var? v) (fn? @v) (not (contains? @originals v)))]
+             (let [f @v]
+               (swap! originals assoc v f)
+               (alter-var-root v (constantly (checked q f sig tenv (arg-names v (count (:params sig))))))
+               v))))))
 
 (defn- unwrap! [vars]
   (doseq [v vars :when (contains? @originals v)]
@@ -2770,7 +2846,7 @@
   "The report as text for an agent or a person: what failed and why."
   [{:keys [ok target spec static laws gaps unspecified rejected calls flows machines proof graphs graph-missing
            lemmas off-graph uses problems questions]
-    contras ::contradictions
+    contras ::contradictions assumed ::assumed
     ambiguous ::ambiguous explain ::explain}]
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
        (when (and proof (pos? (:laws proof)))
@@ -2783,6 +2859,11 @@
                 (str "; tested, not proved: " (str/join ", " (map :law ts))))))
        (apply str (for [{:keys [id text blocking]} questions :when (not blocking)]
                     (str "\n  open question `" id "`: " text)))
+       ;; what every proof here rests on
+       (when (seq assumed)
+         (str "\n  assumes, tested but not proved: "
+              (str/join ", " (for [{f :fn sig :sig a :assumption} assumed]
+                               (if f (str f " " (sig-str sig)) (str a))))))
        (apply str (for [{d :spec n :imported sk :skipped} uses]
                     (str "\n  uses " d ": " n (if (= 1 n) " proved law" " proved laws") " to cite"
                          (apply str (for [[l why] sk]
@@ -2841,6 +2922,14 @@
                          (when (seq held)
                            (str ", holding the invariant of " (str/join " and " (map pr-str held)))))))
        (when-not (:ok static) (str "\n\n" (:error static)))
+       (apply str (for [{a :assumption why :why st :status :as r} assumed :when (= :failed st)]
+                    (str "\n\n"
+                         (or why
+                             (str/replace-first (format-failure (assoc r :law a))
+                                                (str "law `" a "` fails")
+                                                (str "assumption `" a "` does not hold of the code it is about")))
+                         (when-not why
+                           "\n  An assumption is a claim about code the spec does not check; fix the claim."))))
        (apply str (map #(str "\n\n" %) problems))
        (apply str (for [{[a b] :laws at :at c :call} contras]
                     (str "\n\nlaws `" a "` and `" b "` cannot both hold: at "
@@ -3101,13 +3190,25 @@
                     [bs p])))]
     (= (canon p) (canon q))))
 
+(defn- assumed-names
+  "name -> qualified name for the assumed fns, as a namespace with these
+  aliases and refers names them: alias-qualified, referred, or in full."
+  [aliases refers assumed]
+  (merge (into {} (for [q assumed] [q q]))
+         (into {} (for [[a lib] aliases, q assumed :when (= (str lib) (namespace q))]
+                    [(symbol (str a) (name q)) q]))
+         (into {} (for [[r q] refers :when (contains? assumed q)] [r q]))))
+
 (defn- lib-pairs
   "The target and the project namespaces it requires, transitively, as
   prover pairs [ns forms refers]: refers maps each alias-qualified or
   referred name a namespace uses to the fn it names.  A required namespace
   whose source is not on the classpath -- clojure.core's, jolt's, a
-  library's jar -- is left out, and a call into it stays outside."
-  [target]
+  library's jar -- is left out, and a call into it stays outside, unless
+  the spec assumes it: an assumed fn, named any way a namespace may name
+  it, is a call the prover keeps, with no definition to unfold."
+  ([target] (lib-pairs target #{}))
+  ([target assumed]
   (loop [todo [target], seen #{}, out []]
     (if-let [n (first todo)]
       (if (contains? seen n)
@@ -3127,9 +3228,10 @@
                             (into {} (for [[a lib] aliases :when (project? lib)
                                            f (defs-in lib)]
                                        [(symbol (str a) (str f)) (symbol (str lib) (str f))]))
-                            (into {} (for [[r q] refers :when (project? (symbol (namespace q)))] [r q])))]
+                            (into {} (for [[r q] refers :when (project? (symbol (namespace q)))] [r q]))
+                            (assumed-names aliases refers assumed))]
               (recur (concat (rest todo) deps) (conj seen n) (conj out [n forms ref-map]))))))
-      out)))
+      out))))
 
 (defn- hint-candidates
   "Hints to try on a law over variables vs, cheapest first: induction on
@@ -3224,18 +3326,25 @@
     (let [proof-ns (::proof-ns opts)
           ;; the target's dependencies, which a spec helper or a law may call
           ;; through the spec's own aliases
+          assumed (::assumed opts)
           libs+refers (delay
-                        (let [libs (lib-pairs target)
+                        (let [libs (lib-pairs target (set (keys (:sigs assumed))))
                               spec-forms (book/read-forms (source-url spec-ns))
-                              {:keys [aliases]} (ns-names (first (filter #(head? % "ns") spec-forms)))]
+                              {:keys [aliases refers]} (ns-names (first (filter #(head? % "ns") spec-forms)))]
                           [libs spec-forms
-                           (into {} (for [[a lib] aliases
-                                          [n fs] libs :when (= n lib)
-                                          f fs :when (and (seq? f) (contains? '#{defn defn-} (first f)))]
-                                      [(symbol (str a) (str (second f))) (symbol (str lib) (str (second f)))]))]))
+                           (merge
+                             (into {} (for [[a lib] aliases
+                                            [n fs] libs :when (= n lib)
+                                            f fs :when (and (seq? f) (contains? '#{defn defn-} (first f)))]
+                                        [(symbol (str a) (str (second f))) (symbol (str lib) (str (second f)))]))
+                             (assumed-names aliases refers (set (keys (:sigs assumed)))))]))
           anns (into {} (map (fn [[k sig]] [k (erase sig refs)])) anns)
-          sigs (into {} (for [[nm sig] anns]
-                          [(symbol (str target) (str nm)) {:params (mapv plain (:params sig)) :ret (plain (:ret sig))}]))
+          assumed-sigs (into {} (for [[q sig] (:sigs assumed)
+                                      :let [sig (erase sig refs)]]
+                                  [q {:params (mapv plain (:params sig)) :ret (plain (:ret sig))}]))
+          sigs (into assumed-sigs
+                     (for [[nm sig] anns]
+                       [(symbol (str target) (str nm)) {:params (mapv plain (:params sig)) :ret (plain (:ret sig))}]))
           defs (delay (prover/definitions
                         (cond-> (let [[libs spec-forms spec-refers] @libs+refers]
                                   (conj libs [spec-ns (mapv refine->defn spec-forms) spec-refers]))
@@ -3253,9 +3362,11 @@
           ;; laws' lemmas are instantiated only at terms of their types
           cache-dir (when-not (= false (:cache opts)) (or (:cache-dir opts) ".writ-cache"))
           contracts (delay (let [[ds] @defs]
-                             (cached-contracts cache-dir target
-                                               [@writ-version (book/read-forms (source-url target)) sigs tenv]
-                                               #(prover/prove-contracts {:defs ds :tenv tenv :sigs sigs}))))
+                             (into (cached-contracts cache-dir target
+                                                     [@writ-version (book/read-forms (source-url target)) sigs tenv]
+                                                     #(prover/prove-contracts {:defs ds :tenv tenv :sigs sigs}))
+                                   ;; an assumed signature is taken at its word
+                                   (prover/contract-rules tenv assumed-sigs))))
           ;; a proof found before, from the same law, lemmas and the code it
           ;; reaches, by the same writ, is the same proof
           cached (atom (if cache-dir (load-proofs cache-dir [spec-ns target] @writ-version) {:laws {} :traces {}}))
@@ -3281,9 +3392,7 @@
                                                 ;; a lemma's types erased as the law's are, so a
                                                 ;; refinement in both is the same base type
                                                 :lemmas (mapv #(update % :prop erase-law refs spec-ns) lemmas)
-                                                :rets (into {} (for [[nm sig] anns]
-                                                                 [(symbol (str target) (str nm))
-                                                                  (plain (:ret sig))]))}))
+                                                :rets (into {} (for [[f sig] sigs] [f (:ret sig)]))}))
                            (catch Throwable e
                              {:proved false :reason (str "the prover failed: " (ex-message e))})))
             ;; that a step never throws is proved only by running it
@@ -3367,7 +3476,7 @@
                      [[] lemmas]
                      rs))]
         ;; the proved laws of the specs this one uses come first
-        (loop [[rs lemmas] (pass [results (vec (::imports opts))])]
+        (loop [[rs lemmas] (pass [results (into (vec (::imports opts)) (:lemmas assumed))])]
           (let [[rs2 lemmas2] (pass [rs lemmas])]
             (if (= (count lemmas2) (count lemmas))
               (do (when (and cache-dir @fresh) (save-proofs! cache-dir [spec-ns target] @writ-version @cached))
@@ -3603,7 +3712,11 @@
              {:id (str "machine." mname) :kind :machine :of mname :fns #{(:step m)}
               :text (str (:step m) " steps by the table")})
            (for [{:keys [id text blocking]} (:questions e)]
-             {:id (str "question." id) :kind :question :of id :fns #{} :text text :blocking blocking})))))
+             {:id (str "question." id) :kind :question :of id :fns #{} :text text :blocking blocking})
+           (for [[q sig] (sort-by (comp str key) (:assumes e))]
+             {:id (str "assume." q) :kind :assumption :of q :fns #{} :text (sig-str sig)})
+           (for [{:keys [name prop]} (:assumptions e)]
+             {:id (str "assume." name) :kind :assumption :of name :fns #{} :text (pr-str prop)})))))
 
 (defn obligations
   "Every obligation the spec sets, from the spec alone, as data an agent
@@ -3612,7 +3725,8 @@
   guard.graph.state.f (and .n for each clause), refused.graph.state.f,
   invariant.graph.state, reach.graph, start.graph, final.graph,
   never.graph.a.b, before.graph.a.b, runs.graph, flow.f, calls.f,
-  machine.m, question.q.  :fns are the signed fns it names.  The target
+  machine.m, question.q, assume.ns/f and assume.name.  :fns are the
+  signed fns it names.  The target
   need not exist."
   [spec-ns]
   (require spec-ns)
@@ -3622,11 +3736,12 @@
   "What a check's report says of each obligation: :met, :failed,
   :unproved (it needs proof, and is only tested) or, for a question,
   :open or :blocking."
-  [os {:keys [laws static graphs flows calls machines]}]
+  [os {:keys [laws static graphs flows calls machines assumptions]}]
   (let [by-law (into {} (map (juxt :law :status)) laws)
         graph-ok (into {} (map (juxt :graph #(= :ok (:status %)))) graphs)
         ok-of (fn [rs k] (into {} (map (juxt k #(= :ok (:status %)))) rs))
         flow-ok (ok-of flows :fn) call-ok (ok-of calls :fn) machine-ok (ok-of machines :machine)
+        held (into {} (map (juxt #(or (:fn %) (:assumption %)) #(= :held (:status %)))) assumptions)
         met #(if % :met :failed)]
     (vec (for [{:keys [id kind of law blocking]} os]
            (cond-> {:id id
@@ -3636,6 +3751,7 @@
                                     :unproved :unproved
                                     :failed)
                               (= :question kind) (if blocking :blocking :open)
+                              (= :assumption kind) (met (get held of))
                               (= :signature kind) (met (:ok static))
                               (= :flow kind) (met (get flow-ok of))
                               (= :calls kind) (met (get call-ok of))
@@ -3664,6 +3780,12 @@
                     evidence (assoc :evidence evidence)
                     because (assoc :because because))))
      :questions (mapv #(select-keys % [:id :text :blocking]) (:questions r))
+     ;; what the proofs rest on, as written
+     :assumptions (let [props (into {} (map (juxt :name :prop)) (:assumptions e))]
+                    (vec (for [a (:assumptions r)]
+                           (if (:fn a)
+                             {:fn (:fn a) :sig (:sig a)}
+                             {:assumption (:assumption a) :prop (get props (:assumption a))}))))
      :obligations (:obligations r)}))
 
 (declare check)
@@ -3689,8 +3811,9 @@
   written differently (:restated), needs less evidence than it did
   (:require-lowered) or has less (:evidence-dropped), when another
   obligation is gone, when a blocking question stopped being one
-  (:no-longer-blocking), or when what passed then fails now
-  (:claimed-pass).  Changing the code is not weakening the spec; a
+  (:no-longer-blocking), when it assumes something it did not, or assumes
+  it differently (an :assumption or :fn :added or :restated), or when
+  what passed then fails now (:claimed-pass).  Changing the code is not weakening the spec; a
   restated law the spec's owner agreed to is accepted by taking a new
   record."
   [old new]
@@ -3720,13 +3843,64 @@
                        :when (and (not (contains? ids id)) (not (contains? law-ids id))
                                   ;; a law's own obligation is reported as the law
                                   (not law)
-                                  (not (str/starts-with? id "question.")))]
+                                  (not (str/starts-with? id "question."))
+                                  ;; assuming less is no weakening
+                                  (not (str/starts-with? id "assume.")))]
                    {:obligation id :what :removed}))
+               ;; every proof rests on what the spec assumes: more of it, or
+               ;; other of it, is a weaker spec
+               (let [key-of #(or (:fn %) (:assumption %))
+                     before (into {} (map (juxt key-of identity)) (:assumptions old))]
+                 (for [a (:assumptions new)
+                       :let [k (key-of a) o (get before k)]
+                       :when (not= o a)]
+                   (cond-> {:what (if o :restated :added)}
+                     (:fn a) (assoc :fn k)
+                     (:assumption a) (assoc :assumption k))))
                (let [now-blocking (into {} (map (juxt :id :blocking)) (:questions new))]
                  (for [{:keys [id blocking]} (:questions old)
                        :when (and blocking (false? (get now-blocking id)))]
                    {:question id :what :no-longer-blocking}))))]
     {:ok (empty? weakened) :weakened weakened}))
+
+(defn- assumption-results
+  "What each assumption came to, run while the assumed fns are wrapped:
+  a signature needs its fn to resolve, outside the target; a law about
+  them must not call the target, and is tested against the real fns.
+  Each {:fn q :sig} or {:assumption name}, with :status :held or :failed
+  and, when it failed, :why or a law's failure.  A law that held carries
+  :prop, qualified, for the prover to cite."
+  [e ctx publics interns target spec-ns {:keys [trials seed max-size]}]
+  (vec (concat
+         (for [[q sig] (sort-by (comp str key) (:assumes e))]
+           (cond
+             (= (namespace q) (str target))
+             {:fn q :sig sig :status :failed
+              :why (str "the spec assumes a signature for `" q "`, the target's own fn: give it one with"
+                        " `ann`, and say what it does with laws, which are checked")}
+             (nil? (assumed-var q))
+             {:fn q :sig sig :status :failed
+              :why (str "the spec assumes a signature for `" q "`, which does not resolve: require"
+                        " its namespace in the spec, and name it through an alias")}
+             :else {:fn q :sig sig :status :held}))
+         (for [{:keys [name prop]} (:assumptions e)]
+           (try
+             (let [p (desugar prop)
+                   _ (lw/check-prop-shape! p)
+                   qp (qualify p #{} publics interns target spec-ns)
+                   own (first (filter #(and (symbol? %) (= (namespace %) (str target)))
+                                      (tree-seq coll? seq qp)))]
+               (if own
+                 {:assumption name :status :failed
+                  :why (str "assumption `" name "` calls `" (clojure.core/name own) "`, a fn of " target
+                            ": an assumption is about code writ does not check, and the target is"
+                            " checked. Say what it does with a law")}
+                 (let [r (test-law ctx {:name name :prop qp} {:trials trials :seed seed :max-size max-size})]
+                   (if (= :failed (:status r))
+                     (assoc r :assumption name)
+                     {:assumption name :status :held :prop qp :evidence (:status r)}))))
+             (catch Throwable ex
+               {:assumption name :status :failed :why (str "assumption `" name "`: " (or (ex-message ex) (str ex)))}))))))
 
 (defn check
   "Check a spec namespace against its target (or opts :target).  Returns a
@@ -3780,6 +3954,9 @@
              ;; only what this check wrapped is unwrapped after it, so a
              ;; caller's own instrument stays in place
              wrapped (wrap! e)
+             assumed (try (assumption-results e ctx publics interns target spec-ns
+                                              {:trials trials :seed seed :max-size max-size})
+                          (catch Throwable ex (unwrap! wrapped) (throw ex)))
              results (try
                        (vec (for [{:keys [name prop explain graph total lemma step-of witness guard-law]} laws
                                   :let [p (desugar prop)]]
@@ -3823,7 +4000,14 @@
              results (mapv #(cond-> % (contains? lemma-names (:law %)) (assoc :lemma true)) results)
              imports (imports-of spec-ns e opts)
              results (-> (prove-laws results (assoc opts ::hints (:hints proof-e) ::proof-ns (:ns proof-e)
-                                                   ::imports (:lemmas imports))
+                                                   ::imports (:lemmas imports)
+                                                   ;; what held is given to the prover
+                                                   ::assumed {:sigs (into {} (for [{f :fn sig :sig st :status} assumed
+                                                                                   :when (and f (= :held st))]
+                                                                               [f sig]))
+                                                              :lemmas (vec (for [{a :assumption p :prop st :status} assumed
+                                                                                 :when (and a (= :held st))]
+                                                                             {:name a :prop p}))})
                                      target spec-ns (merge (:tenv imports) data-tenv) anns refs ctx)
                          (require-evidence
                            ;; a lemma is there to be cited, so it must be proved
@@ -3941,6 +4125,8 @@
                            :contradictions (mapv #(dissoc % :call) contras)
                            ::contradictions contras
                            :questions (vec (:questions e))
+                           :assumptions (mapv #(dissoc % :prop :counterexample :detail :original :trial :law) assumed)
+                           ::assumed assumed
                            :graphs (mapv #(dissoc % ::unproved ::obligations ::steps ::held :runs-failed) graph-results)
                            :proof (proof-coverage results level)
                            :machines (mapv #(dissoc % :shown :step) machine-results)
@@ -3956,6 +4142,7 @@
                                     (every? #(= :ok (:status %)) graph-results)
                                     (empty? problems)
                                     (not-any? :blocking (:questions e))
+                                    (every? #(= :held (:status %)) assumed)
                                     (not graphless)))
                  r (assoc r :obligations (obligation-status (obligations* e) r))
                  r (assoc r ::record (record-of e spec-ns laws r level))]
