@@ -194,13 +194,16 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
   - `(=> P Q)`; a case where `P` does not hold is skipped
   - `(forall [x T, y U] P)`
   - `(exists [x T] P)`
+  - `(throws? e)`: evaluating `e` throws. A signature broken by the law
+    itself is rethrown, not counted.
   - any expression, which holds when it is truthy
 
   A free name refers first to the target's public fns, then to the spec's
   helpers, then to clojure.core. A spec helper may not share a name with
   a target public fn: the check fails and says to rename the helper.
-  Laws cannot quantify over fn types, because no generator exists for
-  them.
+  A law may quantify over fn types: `(forall [p (-> Nat Bool)] ...)`
+  draws pure fns, each answering the same arguments the same way, and a
+  counterexample prints one as the calls it answered.
 - `(calls f [g str/join])`: `f`'s direct calls are exactly this set.
   Multi-arity fns and macros are read too: a macro calls what it calls as
   it expands and what its expansion names. Name another namespace's fns

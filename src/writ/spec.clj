@@ -610,6 +610,20 @@
   hold no NaN."
   pterm/same)
 
+(defmacro throws?
+  "In a law: does evaluating expr throw?  A lazy seq it returns is
+  realised first, since that is where its elements are computed.  An
+  error writ raises -- an argument or a result that breaks a signature --
+  is rethrown, not counted: it says the law misuses the code, not that
+  the code throws.
+
+    (law past-the-end-throws
+      (forall [v (Vec Nat), i Nat] (= (throws? (at v i)) (>= i (count v)))))"
+  [expr]
+  `(try (let [v# ~expr] (when (seq? v#) (dorun v#)) false)
+        (catch Throwable e#
+          (if (:writ/error (ex-data e#)) (throw e#) true))))
+
 (defmacro law
   "State a law about the target's behaviour.
 
@@ -858,6 +872,31 @@
                                (gen/vector (gen/frequency [[8 gen/char-ascii]
                                                            [1 (gen/elements [\tab \newline])]])))]]))
 
+(deftype GenFn [seed results calls]
+  clojure.lang.IFn
+  (invoke [this] (.applyTo this nil))
+  (invoke [this a] (.applyTo this (list a)))
+  (invoke [this a b] (.applyTo this (list a b)))
+  (invoke [this a b c] (.applyTo this (list a b c)))
+  (invoke [this a b c d] (.applyTo this (list a b c d)))
+  (applyTo [_ args]
+    (let [k (if (= 1 (count args)) (first args) (vec args))
+          r (gen/generate results 20 (hash [seed k]))]
+      (swap! calls assoc k r)
+      r)))
+
+(defmethod print-method GenFn [g ^java.io.Writer w]
+  (.write w (str "(fn {" (str/join ", " (for [[k v] (sort-by (comp pr-str key) @(.-calls g))]
+                                          (str (pr-str k) " " (pr-str v))))
+                 "})")))
+
+(defn- fn-gen
+  "Pure fns returning values of result generator g: each answers the same
+  arguments the same way, as a table drawn once per argument from its own
+  seed.  One prints as the calls it answered."
+  [g]
+  (gen/fmap (fn [seed] (GenFn. seed g (atom {}))) (gen/choose 0 1000000)))
+
 (def ^:private finite-double
   (gen/double* {:NaN? false :infinite? false}))
 
@@ -952,7 +991,7 @@
           Set (gen/set (el 0))
           Map (gen/map (el 0) (el 1))
           (Tuple &) (apply gen/tuple (map #(type->gen % tenv) as))
-          -> (fail! "cannot generate functions: quantify over data, not `" (pr-str t) "`")
+          -> (fn-gen (type->gen (last t) tenv))
           (if-let [[d args] (data-decl t tenv)]
             (data-gen d args h tenv)
             (fail! "cannot generate values of type `" (pr-str t) "`"))))
