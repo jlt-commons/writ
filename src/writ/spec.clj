@@ -399,6 +399,9 @@
   :never [a b], :before [a b] and :final are rules of the graph itself,
   as for `machine`; with every edge proved they hold for every run.
 
+  An edge on a record state may give :changes [:k ...], alone or beside
+  :when: the step changes only those keys, and keeps every other one.
+
   :tested {state \"why\"} lets the edges out of state off proof, as a law's
   {:require :tested :because \"why\"} does: their obligations are tested,
   and every report shows the reason.
@@ -451,15 +454,21 @@
                    "` takes the state alone, a " (pr-str (get (:states m) from))))
           (when (map? tos)
             (let [edge (str where ": the edge " (pr-str from) " " (pr-str k))
-                  {w :when el :else} tos
+                  {w :when el :else ch :changes} tos
                   n (inc (count (remove #{'_} (rest k))))]
-              (when-let [bad (seq (remove #{:to :when :else} (keys tos)))]
-                (fail! edge " has unknown keys " (pr-str bad) "; a guarded edge takes :to, :when and :else"))
-              (when-not (and (seq? w) (= 'fn (first w)) (vector? (second w)) (= 3 (count w)))
-                (fail! edge " needs :when (fn [state arg ...] test), had " (pr-str w)))
-              (when-not (= n (count (second w)))
-                (fail! edge ": its :when takes the fn's " n " argument(s), in the fn's order, had "
-                       (pr-str (second w))))
+              (when-let [bad (seq (remove #{:to :when :else :changes} (keys tos)))]
+                (fail! edge " has unknown keys " (pr-str bad) "; an edge map takes :to, :when, :else and :changes"))
+              (when (contains? tos :changes)
+                (when-not (and (vector? ch) (seq ch) (every? keyword? ch))
+                  (fail! edge ": :changes is a vector of the keys the step may change, had " (pr-str ch))))
+              (when (or (contains? tos :when) (not (contains? tos :changes)))
+                (when-not (and (seq? w) (= 'fn (first w)) (vector? (second w)) (= 3 (count w)))
+                  (fail! edge " needs :when (fn [state arg ...] test), had " (pr-str w)))
+                (when-not (= n (count (second w)))
+                  (fail! edge ": its :when takes the fn's " n " argument(s), in the fn's order, had "
+                         (pr-str (second w)))))
+              (when (and el (not (contains? tos :when)))
+                (fail! edge ": :else says what a refused step does, so it needs :when"))
               (when-not (or (nil? el) (= :keep el) (contains? states el))
                 (fail! edge ": :else is :keep, the state unchanged when the guard fails, or a state, had "
                        (pr-str el)))))
@@ -1971,7 +1980,8 @@
     (cond-> {:from from :f f :args (vec (remove #{'_} args)) :key k
              :pos (or (first (keep-indexed #(when (= '_ %2) %1) args)) 0)
              :tos (filterv (set tos) (keys (:states m)))}
-      (map? v) (assoc :guard (:when v) :else (or (:else v) :keep)))))
+      (and (map? v) (:when v)) (assoc :guard (:when v) :else (or (:else v) :keep))
+      (and (map? v) (:changes v)) (assoc :changes (:changes v)))))
 
 (defn- insert-at [v i x] (vec (concat (take i v) [x] (drop i v))))
 
@@ -2048,11 +2058,11 @@
   test that is an `and`, one per clause says it fails while the others
   hold, so each clause rules out something of its own."
   [[gname m :as g] refs invs]
-  (vec (for [{:keys [from f args tos pos guard else]} (graph-edges g)
+  (vec (for [{:keys [from f args tos pos guard else changes]} (graph-edges g)
              :let [ty #(get (:states m) %)
                    ref-of #(let [t (plain (ty %))] (when (symbol? t) (get refs t)))
                    refined? (every? ref-of tos)]
-             :when (or refined? guard)
+             :when (or refined? guard (seq changes))
              :let [v (or (:var (ref-of from)) 's)
                    avs (reduce (fn [acc [i t]]
                                  (conj acc (if (fixed-arg? t) (second t) (arg-var t i (set (conj acc v))))))
@@ -2098,6 +2108,17 @@
                                       :step-of gname}
                                (get-in m [:witnesses [from t]])
                                (assoc :witness (get-in m [:witnesses [from t]]))))))
+                   ;; a frame: the keys the step may change, and every other
+                   ;; key, named by the record or not, as it was
+                   (when (seq changes)
+                     [(off-proof
+                        {:name (symbol (str edge ":frame"))
+                         :oid (str "frame." gname "." (name from) "." f)
+                         :prop (list 'forall binders
+                                     (under (list '= (list* 'dissoc call changes) (list* 'dissoc v changes))))
+                         :explain (str "a " f " from " (name from) " may change only "
+                                       (str/join ", " changes) ", and must keep every other key as it was")
+                         :graph gname})])
                    (when guard
                      (concat
                        (when (or (= :keep else) (ref-of else))
@@ -2156,6 +2177,17 @@
   (let [base #(plain (erase % refs))
         ty #(get (:states m) %)]
     (vec (concat (same-type-errors g refs)
+         (for [{:keys [from key changes]} (graph-edges g)
+               :when (seq changes)
+               :let [t (base (ty from))
+                     edge (str "graph `" gname "`: the edge " (pr-str from) " " (pr-str key))]
+               err (if (kind/record-type? t)
+                     (for [k changes :when (not (contains? t k))]
+                       (str edge ": :changes names " k ", which the record of " (pr-str from)
+                            " does not have; name only its keys"))
+                     [(str edge ": :changes needs a record state, but " (pr-str from) " is a " (pr-str t)
+                           "; a frame names the keys a step may change")])]
+           err)
          (for [{:keys [from f args pos key else] tos :tos} (graph-edges g)
                :let [tos (cond-> tos (and else (not= :keep else) (not-any? #{else} tos)) (conj else))
                      proj (get projections f)

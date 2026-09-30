@@ -658,6 +658,33 @@ that is an `and`, `:when.1`, `:when.2`, ... say each clause fails while
 the others hold. A clause that never fails on its own rules out nothing
 the others do not: `(<= 0 amt)` on a `Nat` amount is such a clause.
 
+**Frames.** On a record state, an edge can say which keys its step may
+change. Every other key must come through as it was, whether the record
+names it or not:
+
+```clojure
+(graph membership
+  {:states {:fresh Fresh, :active Active}
+   :edges  {:fresh  {[award Pos] {:to #{:active} :changes [:points]}}
+            :active {[award Nat] {:to #{:active} :changes [:points]}}}})
+```
+
+`membership:fresh:award:frame` is the law `(= (dissoc (award m pos)
+:points) (dissoc m :points))`, run and proved like the edge's own, and an
+award that also rewrites the email fails it:
+
+```
+law `membership:fresh:award:frame` fails for
+  m   = {:email "", :id 0, :nick "", :points 0}
+  pos = 1
+  a award from fresh may change only :points, and must keep every other key as it was
+  (dissoc (award m pos) :points) => {:email "!", :id 0, :nick ""}
+  (dissoc m :points) => {:email "", :id 0, :nick ""}
+```
+
+`:changes` goes with `:when` too, and then the frame holds under the
+guard. It needs a record state and names only the record's keys.
+
 **Runs.** `:runs N` walks N runs through the real fns from a `[state
 value]` start, up to `:depth` steps each (default 20). At each step it
 takes an edge chosen by the seed, with generated arguments. Each landing
