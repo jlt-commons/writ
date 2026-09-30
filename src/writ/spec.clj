@@ -3053,12 +3053,16 @@
 
 (defn- checked
   ([nm f sig tenv argn] (checked nm f sig tenv argn nil))
-  ([nm f sig tenv argn {:keys [requires ensures]}]
+  ([nm f sig tenv argn {:keys [requires ensures assumed]}]
    (fn [& args]
      (doseq [[i t a] (map vector (range) (:params sig) args)]
        (when-not (conforms? t a tenv)
          (fail! "`" nm "` argument " (inc i) " (" (nth argn i (str "arg" i)) ") expects "
-                (pr-str t) ", got " (pr-str a))))
+                (pr-str t) ", got " (pr-str a)
+                ;; the fn is wrapped wherever it is called, writ included
+                (when assumed
+                  (str "; the spec assumes this signature of every call, the target's, the laws' and"
+                       " writ's own, so assume what the fn documents")))))
      (when (and requires (not ((:f requires) args)))
        (fail! "`" nm "` requires " (pr-str (:test requires)) ", but is called with " (pr-str (vec args))))
      (let [r (apply f args)]
@@ -3139,7 +3143,8 @@
                  :when (and (var? v) (fn? @v) (not (contains? @originals v)))]
              (let [f @v]
                (swap! originals assoc v f)
-               (alter-var-root v (constantly (checked q f sig tenv (arg-names v (count (:params sig))))))
+               (alter-var-root v (constantly (checked q f sig tenv (arg-names v (count (:params sig)))
+                                                      {:assumed true})))
                v))))))
 
 (defn- unwrap! [vars]
