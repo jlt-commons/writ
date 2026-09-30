@@ -118,6 +118,7 @@
                    :assume-fn (assoc-in e [:assumes (first v)] (second v))
                    :assume-law (update e :assumptions (fnil conj []) v)
                    :ann (assoc-in e [:anns (first v)] (second v))
+                   :contract (assoc-in e [:contracts (first v)] (second v))
                    :law (update e :laws conj v))))
   nil)
 
@@ -179,10 +180,44 @@
     (dt/parse f)
     `(-register! '~(ns-name *ns*) :data '~f)))
 
+(defn- contract-fn!
+  "Check an ann's :requires or :ensures: (fn [arg ...] test), taking n
+  parameters."
+  [where k f n what]
+  (when-not (and (seq? f) (= 'fn (first f)) (= 3 (count f)) (vector? (second f))
+                 (every? simple-sym? (second f)) (= n (count (second f))))
+    (fail! where ": " k " takes " what ", as (fn [" (str/join " " (repeat n "x")) "] test), had "
+           (pr-str f))))
+
 (defmacro ann
-  "Give a target fn its signature: (ann f [A B -> R])."
-  [nm sig]
-  `(-register! '~(ns-name *ns*) :ann '~[nm (parse-ann nm sig)]))
+  "Give a target fn its signature: (ann f [A B -> R]).  An options map may
+  say more than the types:
+
+    (ann clamp [Int Int Int -> Int]
+      {:requires (fn [lo hi x] (<= lo hi))
+       :ensures  (fn [lo hi x r] (<= lo r hi))})
+
+  :ensures is a law, `clamp:ensures`: on arguments of the parameter types
+  that meet :requires, the result meets it.  It is tested, proved and
+  cited like any law.  While the laws run, a call whose arguments break
+  :requires fails at the call, and a result that breaks :ensures where it
+  returns."
+  ([nm sig] `(ann ~nm ~sig {}))
+  ([nm sig opts]
+   (let [s (parse-ann nm sig)
+         where (str "`ann " nm "`")
+         n (count (:params s))]
+     (when-not (map? opts)
+       (fail! where " takes an options map after the signature, had " (pr-str opts)))
+     (when-let [bad (seq (remove #{:requires :ensures} (keys opts)))]
+       (fail! where " has unknown options " (pr-str bad) "; it takes :requires and :ensures"))
+     (when (contains? opts :requires)
+       (contract-fn! where :requires (:requires opts) n (str "the fn's " n " argument(s)")))
+     (when (contains? opts :ensures)
+       (contract-fn! where :ensures (:ensures opts) (inc n)
+                     (str "the fn's " n " argument(s) and its result, " (inc n) " in all")))
+     `(do (-register! '~(ns-name *ns*) :ann '~[nm s])
+          ~(when (seq opts) `(-register! '~(ns-name *ns*) :contract '~[nm opts]))))))
 
 (defn- resolve-callee
   "A callee as the spec writes it: a target fn by its simple name, or a fn
@@ -2204,6 +2239,22 @@
                             :step-of gname :guard-law true})))))]
          law)))
 
+(defn- ensures-laws
+  "A law per ann with :ensures, `f:ensures`: on arguments of f's parameter
+  types that meet its :requires, what f returns meets :ensures."
+  [e]
+  (vec (for [[f {:keys [requires ensures]}] (sort-by (comp str key) (:contracts e))
+             :when ensures
+             :let [{:keys [params]} (get (:anns e) f)
+                   avs (reduce (fn [acc [i t]] (conj acc (arg-var t i (set acc)))) [] (map-indexed vector params))
+                   call (apply list f avs)
+                   post (guard-of ensures (conj avs call))
+                   pre (when requires (guard-of requires avs))]]
+         {:name (symbol (str f ":ensures"))
+          :oid (str "ensures." f)
+          :prop (list 'forall (vec (interleave avs params)) (if pre (list '=> pre post) post))
+          :explain (str "what `" f "` returns must meet its :ensures, " (pr-str (nth ensures 2)))})))
+
 (defn- fits?
   "Does a value of type `a` fit where type `b` is expected?"
   [a b]
@@ -2591,6 +2642,8 @@
                        (for [[f sig] (sort-by (comp str key) (:anns e))
                              :let [ls (laws-of f)]]
                          (str "\n  " f "  " (sig-str sig)
+                              (when-let [c (get-in e [:contracts f :requires])] (str "\n    requires: " (pr-str (nth c 2))))
+                              (when-let [c (get-in e [:contracts f :ensures])] (str "\n    ensures: " (pr-str (nth c 2))))
                               (if (seq ls)
                                 (str "\n    laws: " (str/join ", " ls))
                                 "\n    laws: none")
@@ -2788,17 +2841,24 @@
                           (:arglists (meta v))))]
     (vec (or al (map #(symbol (str "arg" %)) (range n))))))
 
-(defn- checked [nm f sig tenv argn]
-  (fn [& args]
-    (doseq [[i t a] (map vector (range) (:params sig) args)]
-      (when-not (conforms? t a tenv)
-        (fail! "`" nm "` argument " (inc i) " (" (nth argn i (str "arg" i)) ") expects "
-               (pr-str t) ", got " (pr-str a))))
-    (let [r (apply f args)]
-      (when-not (conforms? (:ret sig) r tenv)
-        (fail! "`" nm "` returns " (pr-str (:ret sig)) ", but returned " (pr-str r)
-               " for arguments " (pr-str (vec args))))
-      r)))
+(defn- checked
+  ([nm f sig tenv argn] (checked nm f sig tenv argn nil))
+  ([nm f sig tenv argn {:keys [requires ensures]}]
+   (fn [& args]
+     (doseq [[i t a] (map vector (range) (:params sig) args)]
+       (when-not (conforms? t a tenv)
+         (fail! "`" nm "` argument " (inc i) " (" (nth argn i (str "arg" i)) ") expects "
+                (pr-str t) ", got " (pr-str a))))
+     (when (and requires (not ((:f requires) args)))
+       (fail! "`" nm "` requires " (pr-str (:test requires)) ", but is called with " (pr-str (vec args))))
+     (let [r (apply f args)]
+       (when-not (conforms? (:ret sig) r tenv)
+         (fail! "`" nm "` returns " (pr-str (:ret sig)) ", but returned " (pr-str r)
+                " for arguments " (pr-str (vec args))))
+       (when (and ensures (not ((:f ensures) (concat args [r]))))
+         (fail! "`" nm "` returns " (pr-str r) " for arguments " (pr-str (vec args))
+                ", which breaks its :ensures " (pr-str (:test ensures))))
+       r))))
 
 (defn- default-proof-ns [spec-ns]
   (let [n (name spec-ns)]
@@ -2848,9 +2908,21 @@
            (for [[nm sig] anns
                  :let [v (ns-resolve (the-ns target) nm)]
                  :when (and v (not (contains? @originals v)))]
-             (let [f @v]
+             (let [f @v
+                   ;; an ann's :requires and :ensures, read as the spec reads a
+                   ;; law: its names are the target's fns, then the spec's own
+                   compile (fn [form]
+                             (when form
+                               (let [q (qualify form #{} (set (keys (ns-publics (the-ns target))))
+                                                (set (keys (ns-interns (the-ns (::ns e))))) target (::ns e))]
+                                 {:test (nth form 2)
+                                  :f (let [g (binding [*ns* (the-ns (::ns e))] (eval q))]
+                                       #(apply g %))})))
+                   c (get (:contracts e) nm)]
                (swap! originals assoc v f)
-               (alter-var-root v (constantly (checked nm f sig tenv (arg-names v (count (:params sig))))))
+               (alter-var-root v (constantly (checked nm f sig tenv (arg-names v (count (:params sig)))
+                                                      {:requires (compile (:requires c))
+                                                       :ensures (compile (:ensures c))})))
                v))
            (for [[q sig] assumes
                  :let [v (assumed-var q)]
@@ -3744,13 +3816,15 @@
   (let [refs (refines-of e)
         signed (set (keys (:anns e)))
         fns-of (fn [form] (into (sorted-set) (filter signed) (names-in form)))
-        glaws (mapcat #(graph-obligations % refs (:invariants e)) (:graphs e))
+        glaws (concat (ensures-laws e) (mapcat #(graph-obligations % refs (:invariants e)) (:graphs e)))
         law-oids (set (keep :oid glaws))]
     (vec (concat
            (for [{:keys [name prop]} (:laws e)]
              {:id (str "law." name) :kind :law :of name :law name :fns (fns-of prop) :text (pr-str prop)})
            (for [[f sig] (sort-by (comp str key) (:anns e))]
              {:id (str "signature." f) :kind :signature :of f :fns #{f} :text (sig-str sig)})
+           (for [{:keys [name oid prop explain]} (ensures-laws e)]
+             {:id oid :kind :ensures :of name :law name :fns (fns-of prop) :text explain})
            (for [[gname m :as g] (:graphs e)
                  o (concat
                      (for [{:keys [name oid prop explain]} (graph-obligations g refs (:invariants e))]
@@ -4024,7 +4098,9 @@
        (let [refs (refines-of e)
              tenv (type-env-of e spec-ns)
              data-tenv (tenv-of data)
-             laws (into (vec laws) (mapcat #(graph-obligations % refs (:invariants e)) (:graphs e)))
+             laws (-> (vec laws)
+                      (into (ensures-laws e))
+                      (into (mapcat #(graph-obligations % refs (:invariants e)) (:graphs e))))
              publics (set (keys (ns-publics (the-ns target))))
              interns (set (keys (ns-interns (the-ns spec-ns))))
              proof-own* (proof-own (:ns proof-e))
