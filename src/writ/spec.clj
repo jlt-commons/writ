@@ -939,9 +939,17 @@
   (invoke [this a b] (.applyTo this (list a b)))
   (invoke [this a b c] (.applyTo this (list a b c)))
   (invoke [this a b c d] (.applyTo this (list a b c d)))
+  (invoke [this a b c d e] (.applyTo this (list a b c d e)))
+  (invoke [this a b c d e f] (.applyTo this (list a b c d e f)))
+  (invoke [this a b c d e f g] (.applyTo this (list a b c d e f g)))
+  (invoke [this a b c d e f g h] (.applyTo this (list a b c d e f g h)))
   (applyTo [_ args]
     (let [k (if (= 1 (count args)) (first args) (vec args))
-          r (gen/generate results 20 (hash [seed k]))]
+          ;; a fn's hash is its identity, which a replay does not share,
+          ;; so a fn among the arguments counts as any fn: the answer is
+          ;; still the same for the same arguments
+          stable (walk/postwalk #(if (and (ifn? %) (not (coll? %)) (not (keyword? %)) (not (symbol? %))) ::fn %) k)
+          r (gen/generate results 20 (hash [seed stable]))]
       (swap! calls assoc k r)
       r)))
 

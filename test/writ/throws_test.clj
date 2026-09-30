@@ -2,6 +2,7 @@
   "Laws about when code throws, and laws quantified over fns."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
+            [clojure.test.check.generators :as gen]
             [writ.spec :as spec]))
 
 (defn- has? [r s] (str/includes? (:message r) s))
@@ -38,3 +39,11 @@
     (is (every? #(= (% 3) (% 3)) fs))
     (is (every? nat-int? (map #(% 5) fs)))
     (is (< 1 (count (distinct (map #(% 7) fs)))) "different fns give different answers")))
+
+(deftest a-generated-fn-takes-many-arguments-and-replays
+  (let [g (#'spec/fn-gen (gen/return 0))
+        f (gen/generate g 10 1)]
+    (is (= 0 (f 1 2 3 4 5 6 7 8))))
+  (let [g (#'spec/fn-gen gen/nat)
+        a (gen/generate g 10 7), b (gen/generate g 10 7)]
+    (is (= (a inc) (b dec)) "a fn argument answers as any fn does, run to run")))
