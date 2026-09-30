@@ -1513,7 +1513,9 @@ they do stays tested. `assume` says what the spec takes as given:
 An assumed signature types every call to the fn in the static check, so
 code that hands `str/trim` a number fails there. While the laws run, the
 fn is wrapped like a signed one, so a signature it does not keep fails
-where it returns. The prover takes its result to be of its return type.
+where it returns. Only the code's calls and the laws' are checked: writ's
+own calls to the fn, and the dependency's calls to itself, are not the
+spec's to type. The prover takes its result to be of its return type.
 
 An assumed law is about such fns and never the target's: one that calls
 a fn of the target fails, directly or through a spec helper or project

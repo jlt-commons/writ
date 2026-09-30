@@ -1114,6 +1114,12 @@
   (boolean (some #(and (symbol? %) (= (name target) (namespace %)))
                  (tree-seq coll? seq qp))))
 
+(def ^:dynamic *in-code*
+  "Is the target's code, or a law, running?  An assumed fn's signature
+  types those calls; writ's own calls to the fn, and the fn's calls to
+  itself, are not the spec's to type."
+  false)
+
 (defn- evaluator
   "Compile and cache term fns: (ev vars term env) runs `term` with the
   variables bound from env."
@@ -1127,7 +1133,8 @@
                             (eval (list 'fn (vec vars) term)))]
                     (swap! cache assoc k f)
                     f))]
-        (apply f (map #(get env %) vars))))))
+        ;; compiling the term is writ's; running it is the law's
+        (binding [*in-code* true] (apply f (map #(get env %) vars)))))))
 
 (defn- run-term
   "{:ok v} or {:thrown msg}."
@@ -3062,24 +3069,26 @@
   ([nm f sig tenv argn] (checked nm f sig tenv argn nil))
   ([nm f sig tenv argn {:keys [requires ensures assumed]}]
    (fn [& args]
-     (doseq [[i t a] (map vector (range) (:params sig) args)]
-       (when-not (conforms? t a tenv)
-         (fail! "`" nm "` argument " (inc i) " (" (nth argn i (str "arg" i)) ") expects "
-                (pr-str t) ", got " (pr-str a)
-                ;; the fn is wrapped wherever it is called, writ included
-                (when assumed
-                  (str "; the spec assumes this signature of every call, the target's, the laws' and"
-                       " writ's own, so assume what the fn documents")))))
-     (when (and requires (not ((:f requires) args)))
-       (fail! "`" nm "` requires " (pr-str (:test requires)) ", but is called with " (pr-str (vec args))))
-     (let [r (apply f args)]
-       (when-not (conforms? (:ret sig) r tenv)
-         (fail! "`" nm "` returns " (pr-str (:ret sig)) ", but returned " (pr-str r)
-                " for arguments " (pr-str (vec args))))
-       (when (and ensures (not ((:f ensures) (concat args [r]))))
-         (fail! "`" nm "` returns " (pr-str r) " for arguments " (pr-str (vec args))
-                ", which breaks its :ensures " (pr-str (:test ensures))))
-       r))))
+     (if (and assumed (not *in-code*))
+       ;; writ's own call, or the dependency calling itself
+       (apply f args)
+       (do
+         (doseq [[i t a] (map vector (range) (:params sig) args)]
+           (when-not (conforms? t a tenv)
+             (fail! "`" nm "` argument " (inc i) " (" (nth argn i (str "arg" i)) ") expects "
+                    (pr-str t) ", got " (pr-str a))))
+         (when (and requires (not ((:f requires) args)))
+           (fail! "`" nm "` requires " (pr-str (:test requires)) ", but is called with " (pr-str (vec args))))
+         ;; a target fn runs as code, whoever called it; an assumed fn
+         ;; runs as the dependency's own
+         (let [r (binding [*in-code* (not assumed)] (apply f args))]
+           (when-not (conforms? (:ret sig) r tenv)
+             (fail! "`" nm "` returns " (pr-str (:ret sig)) ", but returned " (pr-str r)
+                    " for arguments " (pr-str (vec args))))
+           (when (and ensures (not ((:f ensures) (concat args [r]))))
+             (fail! "`" nm "` returns " (pr-str r) " for arguments " (pr-str (vec args))
+                    ", which breaks its :ensures " (pr-str (:test ensures))))
+           r))))))
 
 (defn- default-proof-ns [spec-ns]
   (let [n (name spec-ns)]
