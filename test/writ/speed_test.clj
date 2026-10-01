@@ -144,3 +144,48 @@
 (deftest induction-on-a-number-a-loop-counts-down-is-still-tried
   (let [r (spec/check 'writ.spec-demo.climb-spec {:seed 1 :cache false})]
     (is (:ok r) (:message r))))
+
+;; --- cache files written whole -----------------------------------------------------
+
+(def ^:private spit-whole! @#'spec/spit-whole!)
+
+(deftest a-file-written-at-once-by-many-checks-is-one-of-them-whole
+  (let [dir (java.io.File. (str (System/getProperty "java.io.tmpdir") "/writ-spit-" (System/nanoTime)))
+        f (java.io.File. dir "c.edn")
+        texts (vec (for [i (range 8)] (pr-str {:i i :pad (vec (range 2000))})))]
+    (.mkdirs dir)
+    (run! deref (doall (for [t texts] (future (dotimes [_ 20] (spit-whole! f t))))))
+    (is (contains? (set texts) (slurp f)))
+    (is (= ["c.edn"] (vec (.list dir))) "no temporary file is left")))
+
+;; --- a refinement that starved says so at once after ------------------------------
+
+(def ^:private filtered @#'spec/filtered)
+(def ^:private such-that-opts @#'spec/such-that-opts)
+(def ^:private remembering-starved @#'spec/remembering-starved)
+
+(deftest a-filter-that-meets-few-sizable-values-starves
+  (let [g (filtered #(= 7 %) clojure.test.check.generators/large-integer (such-that-opts 'Zero))
+        msg (some #(try (clojure.test.check.generators/generate g 30 %) nil
+                        (catch Exception e (ex-message e)))
+                  (range 2000))]
+    (is (re-find #"could not generate a value of refinement `Zero`" (str msg)))
+    (is (re-find #"candidates of size 20 or more" (str msg)))
+    (is (re-find #"\{:build f\}" (str msg)))))
+
+(deftest a-refinement-that-starved-fails-its-next-draw-at-once
+  (let [g (remembering-starved (filtered #(= 7 %) clojure.test.check.generators/large-integer (such-that-opts 'Zero)))
+        draw! #(try (clojure.test.check.generators/generate g 30 %) nil
+                    (catch Exception e (ex-message e)))
+        first-msg (some draw! (range 2000))
+        t0 (System/currentTimeMillis)
+        again (draw! 5000)]
+    (is first-msg)
+    (is (= first-msg again))
+    (is (< (- (System/currentTimeMillis) t0) 100))))
+
+(deftest a-filtered-value-is-never-drawn-past-the-largest-size
+  (let [g (filtered #(> (count %) 150) (clojure.test.check.generators/vector clojure.test.check.generators/nat)
+                    {:max-tries 5000 :ex-fn (fn [_] (ex-info "none" {}))})
+        v (clojure.test.check.generators/generate g 0 1)]
+    (is (<= 151 (count v) 200))))

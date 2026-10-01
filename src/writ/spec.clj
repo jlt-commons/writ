@@ -59,6 +59,7 @@
             [clojure.test.check :as tc]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
+            [clojure.test.check.random :as random]
             [clojure.test.check.rose-tree :as rose]))
 
 (defn- fail! [& msg]
@@ -3617,18 +3618,61 @@
        'Any (into kws near)})
     (catch Throwable _ {})))
 
+(def ^:private filter-size
+  "The largest size a filtered generator draws at.  test.check's such-that
+  grows the size by one each time its predicate refuses a value, so 5000
+  refusals would draw vectors 5000 long."
+  200)
+
+(defn- starved-error [nm what]
+  (ex-info (str "writ could not generate a value of refinement `" nm
+                "`: its predicate rejected " what ". Refine its parts"
+                " (a refined field, a narrower base type) so values are built"
+                " to fit rather than filtered, or give it {:build f}, a fn of"
+                " the spec that makes any value of its base one of it.")
+           {:writ/error true}))
+
+(def ^:private sizable
+  "The size from which a filter's candidates count toward its starving."
+  20)
+
+(defn- filtered
+  "gen/such-that, as test.check has it -- each refused candidate the next
+  one drawn a size larger -- but no larger than filter-size.  A
+  refinement's filter (opts from such-that-opts) also starves when fewer
+  than one in 200 of its candidates of size 20 or more meet it, after 1000
+  of them: the values it finds are the few small ones a random draw
+  happens on, such as a receipt with no items, and a law tested on them
+  tests little."
+  [pred g {:keys [max-tries ex-fn] :as opts}]
+  (let [nm (::name opts)
+        big (atom [0 0])]
+    (gen/->Generator
+      (fn [rnd size]
+        (loop [rnd rnd, size size, k 0]
+          (when (>= k max-tries)
+            (throw (ex-fn {:pred pred :gen g :max-tries max-tries})))
+          (let [[r1 r2] (random/split rnd)
+                sz (min size filter-size)
+                tree ((:gen g) r1 sz)
+                ok (pred (rose/root tree))]
+            (when (and nm (>= sz sizable))
+              (let [[t h] (swap! big (fn [[t h]] [(inc t) (if ok (inc h) h)]))]
+                (when (and (>= t 1000) (< (* 200 h) t))
+                  (throw (starved-error nm (str "all but " h " of the " t " candidates of size "
+                                                sizable " or more"))))))
+            (if ok
+              (rose/filter pred tree)
+              (recur r2 (inc size) (inc k)))))))))
+
 (defn- such-that-opts
   "How hard to look for a value of a refinement.  A value can be rare --
   a tag and an exact score together -- so it tries many times, and says
   which refinement starved if it still finds none."
   [nm]
   {:max-tries 5000
-   :ex-fn (fn [_] (ex-info (str "writ could not generate a value of refinement `" nm
-                                "`: its predicate rejected 5000 candidates. Refine its parts"
-                                " (a refined field, a narrower base type) so values are built"
-                                " to fit rather than filtered, or give it {:build f}, a fn of"
-                                " the spec that makes any value of its base one of it.")
-                           {:writ/error true}))})
+   ::name nm
+   :ex-fn (fn [_] (starved-error nm "5000 candidates in a row"))})
 
 (defn- fitting
   "A fn that sets the fields of a refinement's value that its predicate
@@ -3725,11 +3769,11 @@
               (fail! "refinement `" name "` has no value between " (- int-window) " and " int-window
                      ", nor at any number the spec names or any power of ten or two")
               (gen/frequency [[1 (gen/return anchor)]
-                              [3 (gen/such-that #(try (and (conforms? b % tenv) (pred %)) (catch Throwable _ false))
+                              [3 (filtered #(try (and (conforms? b % tenv) (pred %)) (catch Throwable _ false))
                                                 (gen/fmap #(+ anchor %) gen/small-integer)
                                                 (such-that-opts name))]])))
           (or (= (first ok) (- int-window)) (= (peek ok) int-window))
-          (gen/such-that pred (type->gen b tenv) (such-that-opts name))
+          (filtered pred (type->gen b tenv) (such-that-opts name))
           :else
           (let [lo (first ok) hi (peek ok)
                 spread (if (= (count ok) (inc (- hi lo)))
@@ -3763,13 +3807,13 @@
                                               m2)))
                                         {} rs))
                               (index-records r k tenv))]
-          (gen/such-that ok? built (such-that-opts name)))
+          (filtered ok? built (such-that-opts name)))
         (let [g (type->gen base (assoc tenv ::bias (::bias-of-refine tenv)))]
           (if-let [fit (fitting r tenv)]
             ;; set as the predicate pins it, and still judged by it and
             ;; by the base, whose own rule a set field may break
-            (gen/such-that #(and (conforms? base % tenv) (pred %)) (gen/fmap fit g) (such-that-opts name))
-            (gen/such-that pred g (such-that-opts name))))))))
+            (filtered #(and (conforms? base % tenv) (pred %)) (gen/fmap fit g) (such-that-opts name))
+            (filtered pred g (such-that-opts name))))))))
 
 (defn- int-leaves
   "Paths to the integers inside v, through maps and vectors: their
@@ -3800,6 +3844,21 @@
                             (gen/fmap (fn [[p n]] (let [v2 (if (seq p) (assoc-in v p n) n)] (if (ok? v2) v2 v)))
                                       (gen/tuple (gen/elements paths) (gen/elements nums)))))))]])))
 
+(defn- remembering-starved
+  "Generator g, which once it starves -- its filter finds no value -- fails
+  every draw after with the same error at once, rather than looking as
+  hard again for each law."
+  [g]
+  (let [starved (atom nil)]
+    (gen/->Generator
+      (fn [rnd size]
+        (if-let [e @starved]
+          (throw e)
+          (try ((:gen g) rnd size)
+               (catch clojure.lang.ExceptionInfo e
+                 (when (:writ/error (ex-data e)) (reset! starved e))
+                 (throw e))))))))
+
 (defn- type-env-of
   "The data types and refinements of a spec entry.  Refinements sit under
   ::refines, apart from the data the prover and the static check read."
@@ -3826,13 +3885,14 @@
                                                            window (assoc :window (finite-window window))))
                     bias (bias-of (literals (:pred r) spec-ns @bodies))]
                 (assoc-in tenv [::refines name :gen]
+                          (remembering-starved
                           (at-boundaries
                           (if-let [b (:build r)]
                             ;; built by the spec's own fn, then checked
                             (let [build (some-> (ns-resolve (the-ns spec-ns) b) deref)]
                               (when-not (fn? build)
                                 (fail! "refinement `" name "` is built by `" b "`, which is not a fn of the spec"))
-                              (gen/such-that #(try (boolean (pred %)) (catch Throwable _ false))
+                              (filtered #(try (boolean (pred %)) (catch Throwable _ false))
                                              (gen/fmap build (type->gen (:base r) tenv))
                                              {:max-tries 100
                                               :ex-fn (fn [_] (ex-info (str "the :build of refinement `" name "`, `" b
@@ -3842,7 +3902,7 @@
                                         pred (assoc tenv ::bias-of-refine bias ::spec-ints @spec-ints)))
                           @boundary-nums
                           #(try (and (conforms? (:base r) % tenv) (boolean (pred %)))
-                                (catch Throwable _ false))))))
+                                (catch Throwable _ false)))))))
             ;; the spec's one-line fns, which a refinement built to fit
             ;; reads its predicate through
             (cond-> (tenv-of data) (seq refines) (assoc ::helpers (one-line-helpers spec-ns)))
@@ -4376,6 +4436,18 @@
 (def ^:private writ-version
   (delay (apply str (map #(or (some-> (io/resource %) slurp) "") writ-sources))))
 
+(defn- spit-whole!
+  "Write text to file f whole: to a file of its own first, then renamed
+  over f, so two checks writing one cache at once leave one of their
+  files, never the two run together, and a reader never sees half of one."
+  [f text]
+  (let [f (io/file f)
+        tmp (io/file (.getParentFile f) (str (.getName f) "." (java.util.UUID/randomUUID) ".tmp"))]
+    (try (spit tmp text)
+         (when-not (.renameTo tmp f)
+           (throw (ex-info (str "could not write " f) {})))
+         (finally (when (.exists tmp) (.delete tmp))))))
+
 (defn- cache-file
   "One file per spec and target: a spec checked against several
   implementations keeps a cache for each."
@@ -4399,7 +4471,7 @@
 
 (defn- save-proofs! [dir spec-ns version cache]
   (try (.mkdirs (io/file dir))
-       (spit (cache-file dir spec-ns) (pr-str (assoc cache :version version)))
+       (spit-whole! (cache-file dir spec-ns) (pr-str (assoc cache :version version)))
        (catch Throwable _ nil)))
 
 (defn- canonical-names
@@ -4450,7 +4522,7 @@
             (try (let [text (pr-str data)]
                    (when (= data (edn/read-string text))
                      (.mkdirs (io/file dir))
-                     (spit f text)))
+                     (spit-whole! f text)))
                  (catch Throwable _ nil)))
           rules))))
 

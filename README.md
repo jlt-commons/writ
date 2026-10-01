@@ -716,7 +716,12 @@ zero amounts, read through the spec's one-line fns. `(= c (:k o))`,
 `(first t)`, `(second t)` and `(nth t i)` a tuple's position. A predicate
 a random value rarely meets in any other way
 starves: a receipt whose total is the sum of its items, a library whose
-members' loan counts match the copies they hold. `{:build f}` names a fn
+members' loan counts match the copies they hold. The check fails, naming
+the refinement, when 5000 candidates in a row are refused, or when fewer
+than one in 200 of the candidates of size 20 or more meet it: the values
+it finds then are the few small ones a draw happens on, a receipt with no
+items, and the laws would be tested on little else. Once a refinement
+starves, the rest of the check's draws of it fail at once. `{:build f}` names a fn
 of the spec that makes any value of the base type one of the refinement,
 and its values are drawn through it:
 
@@ -1959,8 +1964,15 @@ rest of writ has no dependencies.
 
 ```
 jolt -M:test                   # or ./bin/test
+jolt -M:test --serial          # every namespace in one process
+jolt -M:test --run writ.spec-test writ.starved-test:0/4   # some, or a shard
 cd examples && jolt -M:test    # the example programs and their specs
 ```
+
+`jolt -M:test` runs each test namespace in a jolt process of its own, four
+at a time (`WRIT_TEST_JOBS` sets how many), the slow ones split into
+shards that each take every nth test, and prints a failing one's output
+whole.
 
 `jolt -M:bench DIR-or-spec-ns ...` (`./bin/bench` for the demo specs,
 `examples/bin/bench` for the examples) benchmarks the prover:
