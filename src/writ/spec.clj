@@ -1359,10 +1359,10 @@
   [ctx t size seed]
   (let [make #(gen/generate (type->gen t (:tenv ctx)) size seed)]
     (if-let [cache (:draws ctx)]
+      ;; a delay, so threads that want the same draw at once make it once
       (let [k [t size seed]]
-        (if-let [e (find @cache k)]
-          (val e)
-          (let [v (make)] (swap! cache assoc k v) v)))
+        @(or (get @cache k)
+             (get (swap! cache #(if (contains? % k) % (assoc % k (delay (make))))) k)))
       (make))))
 
 ;; --- evaluating laws ---------------------------------------------------------
@@ -1894,14 +1894,44 @@
                           (range n))))))
             (calls-on-vars prop qnm (count args))))))
 
+(def ^:dynamic *stand-ins*
+  "var -> the fn a stand-in puts in its place, on this thread: a var
+  adequacy dispatches calls it while it judges stand-ins, so threads judge
+  different ones at once."
+  {})
+
+(defn- dispatching
+  "In place of fn real at var v: the stand-in this thread has for v, or real."
+  [v real]
+  (fn [& args]
+    (if-let [g (get *stand-ins* v)]
+      (apply g args)
+      (apply real args))))
+
+(declare adequacy*)
+
 (defn- adequacy
-  "Swap each signed public fn for its impostors, one at a time, and run
-  every law against each.  Returns, per fn, [{:fn f :laws n :rejected
+  "Swap each signed public fn for its impostors, and run every law against
+  each.  The impostors of every fn are judged at once, each on its own
+  thread's view of the fns.  Returns, per fn, [{:fn f :laws n :rejected
   [impostor] :survivors [desc]}]: a survivor is a gap in the spec."
   [ctx target fns anns props trials seed & [extra]]
-  (vec (for [nm fns
+  (let [vars (into {} (for [nm fns
+                            :let [v (ns-resolve (the-ns target) nm)]
+                            :when (and (var? v) (fn? @v))]
+                        [nm [v @v]]))]
+    (try
+      (doseq [[_ [v real]] vars] (alter-var-root v (constantly (dispatching v real))))
+      (adequacy* ctx target fns anns props trials seed extra vars)
+      (finally
+        (doseq [[_ [v real]] vars] (alter-var-root v (constantly real)))))))
+
+(defn- adequacy*
+  [ctx target fns anns props trials seed extra vars]
+  (let [per-fn
+        (vec (for [nm fns
              :let [v (ns-resolve (the-ns target) nm)
-                   real @v
+                   real (or (second (get vars nm)) @v)
                    sig (get anns nm)
                    argn (vec (take (count (:params sig)) (first (:arglists (meta v)))))
                    qnm (symbol (name target) (name nm))
@@ -1915,12 +1945,11 @@
                    judges (fn [imp] (if (= :off-example (:kind imp)) (remove #(::example (meta %)) props) props))
                    survives? (fn [imp]
                                (try
-                                 (alter-var-root v (constantly ((:make imp) real)))
-                                 (and (every? #(holds-sampled? ctx % trials seed) (judges imp))
-                                      (not (and (:args imp)
-                                                (some #(rejects-at? ctx % qnm (:args imp) 10 seed) (judges imp)))))
-                                 (catch Throwable _ false)
-                                 (finally (alter-var-root v (constantly real)))))
+                                 (binding [*stand-ins* {v ((:make imp) real)}]
+                                   (and (every? #(holds-sampled? ctx % trials seed) (judges imp))
+                                        (not (and (:args imp)
+                                                  (some #(rejects-at? ctx % qnm (:args imp) 10 seed) (judges imp))))))
+                                 (catch Throwable _ false)))
                    off-examples (let [ret (plain (:ret sig))
                                       other (other-value ret (:tenv ctx) seed)]
                                   (when other
@@ -1942,11 +1971,30 @@
                                        ", and no law tells it apart, even run there"
                                        (str ", and no law calls `" nm "` on its own variables, so none could be run there")))
                                 (:desc imp)))
-                   {survived true rejected false}
-                   (group-by (comp boolean survives?)
-                             (concat (impostors nm sig argn (:tenv ctx) seed pins)
+                   imps (vec (concat (impostors nm sig argn (:tenv ctx) seed pins)
                                      off-examples
-                                     (when extra (extra nm sig))))
+                                     (when extra (extra nm sig))))]]
+           {:nm nm :v v :real real :qnm qnm :imps imps :survives? survives? :gap-desc gap-desc}))
+        ;; the values every stand-in is judged on, drawn first and at once:
+        ;; judged at once, the stand-ins would all wait on the same draw
+        _ (par-map (fn [[t size sd]] (try (draw ctx t size sd) (catch Throwable _ nil)))
+                   (distinct (for [p props
+                                   :let [[bs] (leading-foralls p)]
+                                   i (range trials)
+                                   [j [_ t]] (map-indexed vector bs)]
+                               [t (mod i 30) (+ seed i (* 7919 j))])))
+        ;; every stand-in of every fn, judged at once
+        verdicts (par-map (fn [[i imp]] ((:survives? (nth per-fn i)) imp))
+                          (for [[i f] (map-indexed vector per-fn), imp (:imps f)] [i imp]))
+        verdicts (loop [vs verdicts, fs per-fn, out []]
+                   (if-let [f (first fs)]
+                     (let [n (count (:imps f))]
+                       (recur (drop n vs) (rest fs) (conj out (vec (take n vs)))))
+                     out))]
+    (vec (for [[{:keys [nm v real qnm imps gap-desc]} vs] (map vector per-fn verdicts)
+               :let [{survived true rejected false} (group-by first (map vector vs imps))
+                     survived (map second survived)
+                     rejected (map second rejected)
                    ;; which laws, each on its own, tell some stand-in apart: a
                    ;; law that tells none says no more than the types do
                    about (filter #(some #{qnm} (tree-seq coll? seq %)) props)
@@ -1956,12 +2004,11 @@
                                         (if (empty? open)
                                           (reduced done)
                                           (try
-                                            (alter-var-root v (constantly ((:make imp) real)))
-                                            (into done (keep #(when-not (holds-sampled? ctx % trials seed)
-                                                                (::law (meta %)))
-                                                             open))
-                                            (catch Throwable _ done)
-                                            (finally (alter-var-root v (constantly real)))))))
+                                            (binding [*stand-ins* {v ((:make imp) real)}]
+                                              (into done (keep #(when-not (holds-sampled? ctx % trials seed)
+                                                                  (::law (meta %)))
+                                                               open)))
+                                            (catch Throwable _ done)))))
                                     #{} rejected)]]
          {:fn nm
           :laws (count about)
@@ -1969,7 +2016,7 @@
           :credited credited
           :impostors (+ (count rejected) (count survived))
           :rejected (mapv #(dissoc % :make :args) rejected)
-          :survivors (mapv gap-desc survived)})))
+          :survivors (mapv gap-desc survived)}))))
 
 ;; --- the target's source -----------------------------------------------------
 

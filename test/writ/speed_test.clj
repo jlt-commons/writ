@@ -96,3 +96,12 @@
           one (spec/check s {:seed 42 :cache false :parallel false})]
       (is (:ok par) (:message par))
       (is (= (view one) (view par)) (str s)))))
+
+(deftest stand-ins-judged-in-parallel-come-out-as-they-do-one-at-a-time
+  (doseq [s '[writ.spec-demo.sort-spec writ.spec-demo.racks-spec writ.spec-demo.bulk-weak-spec]]
+    (let [view (fn [r] [(:gaps r) (:rejected r) (:silent r)])
+          real (do (require 'writ.spec-demo.racks) @(resolve 'writ.spec-demo.racks/put))
+          par (spec/check s {:seed 42 :adequacy :mutants})
+          one (spec/check s {:seed 42 :adequacy :mutants :parallel false})]
+      (is (= (view one) (view par)) (str s))
+      (is (identical? real @(resolve 'writ.spec-demo.racks/put)) "the target's fns are restored"))))

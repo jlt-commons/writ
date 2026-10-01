@@ -1217,7 +1217,8 @@ stage, for example while a spec is still being written, and
 needs, in place of the spec's own. `:proof` names the proof namespace
 (`false` for none), and `:fuel` gives the prover more rewrites per
 attempt. The laws are tested, given more trials and proved over one thread
-a processor; `:parallel false` runs them one at a time.
+a processor, and the stand-ins of the adequacy stage are judged the same
+way; `:parallel false` runs them one at a time.
 
 Proofs are cached in `.writ-cache/`, one file per spec. Each law's result
 is kept under a key of everything its proof can rest on: the law, its
