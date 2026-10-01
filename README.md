@@ -1228,6 +1228,11 @@ and data and writ, so editing a law or the proof namespace keeps them.
 `:cache false` turns it off; `:cache-dir` puts it
 elsewhere. Add `.writ-cache/` to `.gitignore`.
 
+A report's `:timings` says where the check's time went, in milliseconds:
+`{:static :tests :prover :more-trials :adequacy :graphs :total}`. Each
+tested law carries `:test-ms`, the time its first trials took, and a bench
+row carries it too.
+
 A spec can build on another's proved laws:
 
 ```clojure

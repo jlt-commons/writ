@@ -5224,13 +5224,19 @@
    (when (and (contains? opts :record) (not (string? (:record opts))))
      (fail! "`check` :record is a path to write the report to, had: " (pr-str (:record opts))))
    (let [{:keys [trials seed max-size] :or {trials 100 max-size 50}} opts
+         t0 (System/nanoTime)
+         clock (atom (zipmap [:static :tests :prover :more-trials :adequacy :graphs] (repeat 0)))
+         ;; each phase's time, in ms, for the report's :timings
+         timed (fn [k f] (let [t (System/nanoTime)]
+                           (try (f) (finally (swap! clock update k + (quot (- (System/nanoTime) t) 1000000))))))
+         timings #(assoc @clock :total (quot (- (System/nanoTime) t0) 1000000))
          e (entry spec-ns (:target opts) (:proof opts))
          {:keys [target anns data laws]} e
          proof-e (::proof e)
          lemma-names (set (map :name (:lemmas proof-e)))
          ;; lemmas first, so a law proved after them may cite them
          laws (into (mapv #(assoc % :lemma true) (:lemmas proof-e)) laws)
-         static (static-check e)
+         static (timed :static #(static-check e))
          ambiguous (when (:ok static) (ambiguous-names e spec-ns))
          base (cond-> {:spec spec-ns :target target
                        :static (if (:ok static) {:ok true} static)
@@ -5240,7 +5246,7 @@
                 (seq ambiguous) (assoc :ambiguous (mapv :name ambiguous) ::ambiguous ambiguous))]
      (if (or (not (:ok static)) (seq ambiguous))
        (let [r (assoc base :ok false :laws [] :gaps [] :calls [] :flows [] :machines [] :graphs [])]
-         (assoc r :message (format-report r)))
+         (assoc r :message (format-report r) :timings (timings)))
        (let [refs (refines-of e)
              tenv (type-env-of e spec-ns)
              data-tenv (tenv-of data)
@@ -5268,10 +5274,11 @@
              ;; only what this check wrapped is unwrapped after it, so a
              ;; caller's own instrument stays in place
              wrapped (wrap! e)
-             assumed (try (assumption-results e ctx publics interns target spec-ns
-                                              {:trials trials :seed seed :max-size max-size})
-                          (catch Throwable ex (unwrap! wrapped) (throw ex)))
-             results (try
+             assumed (timed :tests
+                            #(try (assumption-results e ctx publics interns target spec-ns
+                                                      {:trials trials :seed seed :max-size max-size})
+                                  (catch Throwable ex (unwrap! wrapped) (throw ex))))
+             results (timed :tests #(try
                        (vec (for [{:keys [name prop explain graph total lemma step-of witness guard-law example]} laws
                                   :let [p (eliminate-exists (desugar prop) helpers)]]
                               (try
@@ -5293,9 +5300,10 @@
                                                "implementation, so any code satisfies it")}
 
                                     :else
-                                    (cond-> (assoc (test-law ctx {:name name :prop qp :witness witness}
-                                                             {:trials trials :seed seed :max-size max-size})
-                                                   :prop qp)
+                                    (cond-> (let [t (System/nanoTime)
+                                                  r (test-law ctx {:name name :prop qp :witness witness}
+                                                              {:trials trials :seed seed :max-size max-size})]
+                                              (assoc r :prop qp :test-ms (quot (- (System/nanoTime) t) 1000000)))
                                       explain (assoc :explain explain)
                                       graph (assoc :graph graph)
                                       step-of (assoc :step-of step-of)
@@ -5309,12 +5317,12 @@
                                 (catch Throwable ex
                                   {:law name :status :failed :counterexample {} :detail []
                                    :error (or (ex-message ex) (str ex))}))))
-                       (finally (unwrap! wrapped)))
+                       (finally (unwrap! wrapped))))
              level (or (:require opts) (:require e) :tested)
              _ (check-level! "`check`" level)
              results (mapv #(cond-> % (contains? lemma-names (:law %)) (assoc :lemma true)) results)
              imports (imports-of spec-ns e opts)
-             results (-> (prove-laws results (assoc opts ::hints (:hints proof-e) ::proof-ns (:ns proof-e)
+             results (-> (timed :prover #(prove-laws results (assoc opts ::hints (:hints proof-e) ::proof-ns (:ns proof-e)
                                                    ::imports (:lemmas imports)
                                                    ;; what held is given to the prover
                                                    ::assumed {:sigs (into {} (for [{f :fn sig :sig st :status} assumed
@@ -5323,12 +5331,13 @@
                                                               :lemmas (vec (for [{a :assumption p :prop st :status} assumed
                                                                                  :when (and a (= :held st))]
                                                                              {:name a :prop p}))})
-                                     target spec-ns (merge (:tenv imports) data-tenv) anns refs ctx)
+                                     target spec-ns (merge (:tenv imports) data-tenv) anns refs ctx))
                          ;; a law the prover could not prove rests on its
                          ;; tests alone, so it gets more of them
-                         ((fn [rs] (let [wrapped (wrap! e)]
-                                     (try (mapv #(more-trials ctx % opts) rs)
-                                          (finally (unwrap! wrapped))))))
+                         ((fn [rs] (timed :more-trials
+                                          #(let [wrapped (wrap! e)]
+                                             (try (mapv (fn [r] (more-trials ctx r opts)) rs)
+                                                  (finally (unwrap! wrapped)))))))
                          (require-evidence
                            ;; a lemma is there to be cited, so it must be proved
                            (mapv #(if (:lemma %) (assoc-in % [:opts :require] :proved) %) laws)
@@ -5345,7 +5354,7 @@
                            results)
              sound? (not-any? #(contains? #{:failed :vacuous} (:status %)) results)
              per-fn (if (and sound? (not= false (:adequacy opts)))
-                      (adequacy ctx target
+                      (timed :adequacy #(adequacy ctx target
                                 (sort (filter #(contains? publics %) (keys anns)))
                                 ;; a step's witness is found by search, so a stand-in
                                 ;; that misses it may only be unlucky: it pins nothing
@@ -5367,7 +5376,7 @@
                                 ;; mutants of the fn's source, on request: they cost
                                 ;; a static check each
                                 (when (= :mutants (:adequacy opts))
-                                  (fn [nm sig] (mutants e target nm sig ctx (or seed 42) 12))))
+                                  (fn [nm sig] (mutants e target nm sig ctx (or seed 42) 12)))))
                       [])
              gaps (vec (for [{f :fn s :survivors} per-fn :when (seq s)]
                          {:fn f :survivors s}))
@@ -5396,7 +5405,7 @@
              call-results (check-calls e target-forms forms-of)
              flow-results (check-flows e target-forms forms-of)
              machine-results (mapv #(check-machine % e target) (:machines e))
-             graph-results (mapv (fn [g]
+             graph-results (timed :graphs #(mapv (fn [g]
                                    (let [q #(qualify % #{} publics interns target spec-ns)
                                          errs (vec (concat (graph-flow-errors g anns refs)
                                                            (graph-start-errors g spec-ns tenv q (:invariants e))
@@ -5448,7 +5457,7 @@
                                                 (seq errs) (assoc :errors errs)
                                                 (seq rules) (assoc :rules rules)
                                                 (seq run-errs) (assoc :runs-failed run-errs)))))
-                                 (:graphs e))
+                                 (:graphs e)))
              graphless (and (empty? (:graphs e)) (empty? (:machines e)))
              problems (vec (for [[g st] (:invariants e)
                                  :when (not-any? #(= g (first %)) (:graphs e))]
@@ -5515,7 +5524,8 @@
                (spit path (pr-str (::record r))))
              (assoc r :message (format-report (assoc r :machines machine-results
                                                      :graphs graph-results
-                                                     ::explain (:explain opts))))))))))
+                                                     ::explain (:explain opts)))
+                    :timings (timings))))))))
 (defn check!
   "`check`, throwing with the report's message when anything fails."
   ([spec-ns] (check! spec-ns {}))
