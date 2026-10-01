@@ -1984,7 +1984,10 @@ per law the prover tried, with the strategy that proved it, the rewrites
 and the time; the table ends with how many laws were proved and which
 strategies won. `--save FILE` keeps the rows, and `--baseline FILE` lists
 the laws a change gained, lost, sped up or slowed down against them. It
-never writes the proof cache.
+never writes the proof cache. `./bin/bench-trials` runs it over `bench/trials`, the
+four small projects (a room calendar, an order lifecycle, a token bucket,
+a library's lending rules) used to try writ out, against
+`bench/trials-baseline.edn`.
 
 The prover's knobs are one map, `writ.prove/default-config` (the fuel, how
 deep case splits go, the strategy order, ...), which check's `:prover`
