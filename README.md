@@ -692,6 +692,17 @@ and its values are drawn through it:
 The predicate still decides: a built value it rejects is a mistake in
 the builder, and the check says so.
 
+When a fn returns a value outside its refinement, the report says which
+rule it breaks. writ follows the predicate through the spec's helpers of
+one expression, through `and` to the clause that fails, and through
+`every?` and `not-any?` to the element that breaks them:
+
+```
+`lend` returns Lib, but returned {...} for arguments [...]: it breaks
+(= (:loans m) (lent-to l (:id m))), at (:members l) key 0, m = {:id 0, :loans 0},
+(:loans m) => 0, (lent-to l (:id m)) => 1
+```
+
 Whichever way a refinement's values are made, writ sets one of their
 integers, now and then, to a number the code or the spec mentions, or
 one either side of it, and keeps the change when the value is still one

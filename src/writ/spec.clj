@@ -1405,7 +1405,11 @@
                                    (fn [& vals]
                                      (case (:result (holds ctx* body (zipmap vars vals)))
                                        :pass (do (count-atoms! ctx* atoms counts (zipmap vars vals)) true)
-                                       :discard (do (swap! discards inc) true)
+                                       ;; a trial its hypothesis refused still shows
+                                       ;; how the hypothesis came out
+                                       :discard (do (swap! discards inc)
+                                                    (count-atoms! ctx* atoms counts (zipmap vars vals))
+                                                    true)
                                        false))))]
         (cond
           (not (:pass? res))
@@ -3349,7 +3353,8 @@
                                               (get (code-seeds (:target e)) 'Int)))))]
     (reduce (fn [tenv {:keys [name pred-name] :as r}]
               (let [pred (deref (ns-resolve (the-ns spec-ns) pred-name))
-                    tenv (assoc-in tenv [::refines name] (assoc r :pred pred))
+                    tenv (assoc-in tenv [::refines name] (assoc r :pred pred :pred-form (:pred r)
+                                                                :spec-ns spec-ns))
                     bias (bias-of (literals (:pred r) spec-ns @bodies))]
                 (assoc-in tenv [::refines name :gen]
                           (at-boundaries
@@ -3376,6 +3381,95 @@
   [spec-ns]
   (require spec-ns)
   (type-env-of (get @registry spec-ns) spec-ns))
+
+;; --- why a value is not of its type ----------------------------------------------
+
+(def ^:private one-line-helpers
+  (memoize
+    (fn [spec-ns]
+      (try
+        (into {} (for [f (book/read-forms (source-url spec-ns))
+                       :when (and (seq? f) (contains? '#{defn defn-} (first f)))
+                       :let [{:keys [name params body]} (defn-parts f)]
+                       :when (and (vector? params) (every? symbol? params) (not-any? #{'&} params)
+                                  (= 1 (count body)))]
+                   [name [params (first body)]]))
+        (catch Throwable _ {})))))
+
+(defn- broken-rule
+  "Where in predicate form, with env binding its names, the value breaks
+  it: [{:rule form :at note} ...] from the outside in, ending at the
+  clause that is false.  A spec helper of one expression is read through,
+  `and` to the clause that fails, `every?` and `not-any?` to the element
+  that breaks them.  nil when it holds or cannot be followed."
+  [spec-ns helpers form env depth]
+  (let [run (fn [f] (try (let [ks (vec (keys env))]
+                           {:ok (apply (binding [*ns* (the-ns spec-ns)] (eval (list 'fn ks f)))
+                                       (map env ks))})
+                         (catch Throwable e {:thrown (or (ex-message e) (str e))})))
+        holds? (fn [f] (let [r (run f)] (and (contains? r :ok) (boolean (:ok r)))))
+        fn-body (fn [f] (when (and (seq? f) (contains? '#{fn fn*} (first f)) (vector? (second f))
+                                   (= 1 (count (second f))) (= 3 (count f)))
+                          [(first (second f)) (nth f 2)]))
+        key-of (fn [coll-form x]
+                 (let [c (:ok (run (if (and (seq? coll-form) (= 'vals (first coll-form))) (second coll-form) coll-form)))]
+                   (when (map? c) (first (keep (fn [[k v]] (when (or (= v x) (= [k v] x)) k)) c)))))]
+    (when (and (< depth 8) (seq? form))
+      (let [h (first form)]
+        (cond
+          (and (contains? helpers h) (= (count (first (get helpers h))) (count (rest form))))
+          (let [[params body] (get helpers h)]
+            (broken-rule spec-ns helpers (walk/postwalk-replace (zipmap params (rest form)) body) env (inc depth)))
+
+          (= 'and h)
+          (some (fn [c] (when-not (holds? c)
+                          (or (broken-rule spec-ns helpers c env (inc depth)) [{:rule c :env env}])))
+                (rest form))
+
+          (and (contains? '#{every? not-any?} h) (= 3 (count form)))
+          (let [[_ f coll] form
+                pf (:ok (run f))
+                xs (:ok (run coll))
+                bad (when (and (ifn? pf) (seqable? xs))
+                      (first (filter #(let [b (try (boolean (pf %)) (catch Throwable _ (= 'every? h)))]
+                                        (if (= 'every? h) (not b) b))
+                                     (seq xs))))]
+            (when (some? bad)
+              (let [[y] (fn-body f)
+                    at {:at (if (and (seq? coll) (= 'vals (first coll))) (second coll) coll)
+                        :key (key-of coll bad) :elem bad :as y}]
+                (if-let [[y body] (fn-body f)]
+                  (let [env2 (assoc env y bad)]
+                    (if (= 'every? h)
+                      (cons at (or (broken-rule spec-ns helpers body env2 (inc depth)) [{:rule body :env env2}]))
+                      [at {:rule body :env env2 :holds true}]))
+                  [at {:rule (list f bad) :env env :holds (= 'not-any? h)}]))))
+
+          :else nil)))))
+
+(defn- why-not
+  "Which rule of its refinement v breaks, when t is one: the clause that
+  is false, where in v, and what its parts are.  nil otherwise."
+  [t v tenv]
+  (let [t (plain t)]
+    (when-let [{:keys [base pred-form var spec-ns]} (refinement t tenv)]
+      (cond
+        (not (conforms? base v tenv)) (why-not base v tenv)
+        (and pred-form spec-ns)
+        (when-let [steps (seq (broken-rule spec-ns (one-line-helpers spec-ns) pred-form {var v} 0))]
+          (let [show (fn [x] (let [s (pr-str x)] (if (> (count s) 160) (str (subs s 0 157) "...") s)))
+                run (fn [f env] (try (let [ks (vec (keys env))]
+                                       (pr-str (apply (binding [*ns* (the-ns spec-ns)] (eval (list 'fn ks f)))
+                                                      (map env ks))))
+                                     (catch Throwable e (str "threw: " (ex-message e)))))
+                {:keys [rule env holds]} (last steps)]
+            (str "it breaks " (pr-str rule) (when holds ", which must not hold")
+                 (apply str (for [{:keys [at key elem as]} (butlast steps) :when at]
+                              (str ", at " (pr-str at) (when (some? key) (str " key " (pr-str key)))
+                                   ", " (if as (str as " = ") "the element ") (show elem))))
+                 (apply str (for [a (rest rule)
+                                  :when (and (seq? a) (not (contains? '#{fn fn*} (first a))))]
+                              (str ", " (pr-str a) " => " (run a env)))))))))))
 
 ;; --- instrument --------------------------------------------------------------
 
@@ -3405,7 +3499,9 @@
          (let [r (binding [*in-code* (not assumed)] (apply f args))]
            (when-not (conforms? (:ret sig) r tenv)
              (fail! "`" nm "` returns " (pr-str (:ret sig)) ", but returned " (pr-str r)
-                    " for arguments " (pr-str (vec args))))
+                    " for arguments " (pr-str (vec args))
+                    (when-let [w (try (why-not (:ret sig) r tenv) (catch Throwable _ nil))]
+                      (str ": " w))))
            (when (and ensures (not ((:f ensures) (concat args [r]))))
              (fail! "`" nm "` returns " (pr-str r) " for arguments " (pr-str (vec args))
                     ", which breaks its :ensures " (pr-str (:test ensures))))
@@ -4800,12 +4896,12 @@
             atoms (law-atoms body (map first bs))
             ;; every clause seen both ways, often enough: more trials of the
             ;; same would say little more
-            covered? (fn [cov ran] (and (seq atoms) (>= ran 300)
+            covered? (fn [cov ran held] (and (seq atoms) (>= ran 300) (>= held thin-tests)
                                         (every? #(and (<= 5 (get-in cov [% true] 0)) (<= 5 (get-in cov [% false] 0)))
                                                 atoms)))]
         (loop [k 1, ran first-run, held (if starved? 0 (- first-run (or (:discarded r) 0))),
                cov (or (:coverage r) {})]
-          (if (or (> (* 100 k) extra) (> (- (System/currentTimeMillis) t0) ms) (covered? cov ran))
+          (if (or (> (* 100 k) extra) (> (- (System/currentTimeMillis) t0) ms) (covered? cov ran held))
             (cond
               (not starved?) (assoc r :trials ran :discarded (- ran held) :held held :coverage cov
                                     :one-sided (vec (for [a atoms, side [false true]

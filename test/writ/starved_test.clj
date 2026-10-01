@@ -186,3 +186,11 @@
   (let [l (law-result (spec/check 'writ.spec-demo.spend-spec {:seed 1}) 'spending-stays-within-the-limit)]
     (is (= :tested (:status l)))
     (is (< (:trials l) 1000))))
+
+;; --- which rule a value breaks ----------------------------------------------------
+
+(deftest a-value-out-of-its-refinement-is-told-which-rule-it-breaks
+  (let [r (spec/check 'writ.spec-demo.shelf-q-spec {:seed 1 :target 'writ.spec-demo.shelf-q-uncounted})]
+    (is (not (:ok r)))
+    (is (has? r "it breaks (= (:loans m) (lent-to l (:id m)))") (:message r))
+    (is (has? r "at (:members l) key 0, m = {:id 0, :loans 0}") (:message r))))
