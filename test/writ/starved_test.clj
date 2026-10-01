@@ -55,7 +55,7 @@
       (is (= :failed (:status (law-result r 'overlap-is-a-shared-unit))) (str "seed " seed))))
   (let [l (law-result (spec/check 'writ.spec-demo.span-spec {:seed 1}) 'overlap-is-a-shared-unit)]
     (is (= :tested (:status l)))
-    (is (= 1000 (:trials l)))))
+    (is (< 100 (:trials l)))))
 
 (deftest a-failure-in-the-extra-trials-replays-from-its-seed
   (let [miss? #(= :tested (:status (law-result (spec/check 'writ.spec-demo.span-spec
@@ -162,3 +162,27 @@
   (let [r (spec/check 'writ.spec-demo.bulk-weak-spec {:seed 42 :cache false :adequacy :mutants})]
     (is (not (:ok r)))
     (is (has? r "no law tells it apart, even run there"))))
+
+;; --- each comparison of a law, both ways ------------------------------------------
+
+(deftest a-comparison-the-trials-never-turned-is-turned-by-the-solver
+  ;; one trial, so only the solver turns the comparison
+  (doseq [seed [1 2 3]]
+    (let [r (spec/check 'writ.spec-demo.spend-spec
+                        {:seed seed :trials 1 :more-trials false :target 'writ.spec-demo.spend-open :prove false})
+          l (law-result r 'spending-stays-within-the-limit)]
+      (is (= :tested (:status l)) "the tests alone pass it"))
+    (let [r (spec/check 'writ.spec-demo.spend-spec
+                        {:seed seed :trials 1 :more-trials false :target 'writ.spec-demo.spend-open})
+          l (law-result r 'spending-stays-within-the-limit)]
+      (is (= :failed (:status l)) (str "seed " seed ": " (:message r)))
+      (is (= :solver (:found-by l))))))
+
+(deftest a-comparison-seen-one-way-is-reported
+  (let [r (spec/check 'writ.spec-demo.spend-freq-spec {:seed 1})]
+    (is (has? r "was never false in"))))
+
+(deftest extra-trials-stop-once-each-comparison-went-both-ways
+  (let [l (law-result (spec/check 'writ.spec-demo.spend-spec {:seed 1}) 'spending-stays-within-the-limit)]
+    (is (= :tested (:status l)))
+    (is (< (:trials l) 1000))))

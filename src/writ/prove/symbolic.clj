@@ -614,6 +614,11 @@
                        (assoc-in [:unknowns ['sequential? x]] true)
                        (assoc-in [:unknowns ['map? x]] false)))
         x)
+      ;; any seq, nil among them: opaque, so a law that only passes it
+      ;; along, or a record that holds one, is decided without it; reading
+      ;; it gives up
+      (and (seq? ty) (= 'List (first ty)))
+      {:opaque (fresh! st :int)}
       (and (seq? ty) (= 'Set (first ty)))
       (let [tmpl (var-value st (atom []) (second ty) tenv v)
             n (count (or (flat tmpl) (give-up! (str "a set of " (pr-str (second ty))))))
@@ -1409,7 +1414,7 @@
   "{:formula :decls} saying that under hyps, goal g is truthy, for every
   value of the typed variables -- and, when opts has :total, that its
   evaluation never throws; nil when some part is outside."
-  [{:keys [types defs tenv total]} hyps g]
+  [{:keys [types defs tenv total lenient]} hyps g]
   (try
     (let [st (state)
           facts (atom [])
@@ -1417,7 +1422,15 @@
           occurs (reduce into (t/vars g) (map t/vars hyps))
           env (into {} (for [v (sort-by str (keys types)) :when (contains? occurs v)]
                          [v (var-value st facts (get types v) tenv v)]))
-          hs (mapv #(truth (ev st env %)) hyps)
+          ;; a search for a counterexample may leave out a hypothesis it
+          ;; cannot read -- what it finds is run on the code before it is
+          ;; believed -- where a proof needs every one
+          hs (if lenient
+               (vec (keep #(try (truth (ev st env %))
+                                (catch clojure.lang.ExceptionInfo e
+                                  (if (::outside (ex-data e)) nil (throw e))))
+                          hyps))
+               (mapv #(truth (ev st env %)) hyps))
           ;; what the goal may assume when it prunes a branch
           _ (swap! st assoc :assumed (into (vec @facts) hs))
           ;; only what the goal throws on counts: a hypothesis that throws
@@ -1521,10 +1534,14 @@
       ;; a map: the entries present in the model; a record's keys it does
       ;; not name are none, which is one value it may take
       (contains? v :map)
+      ;; an entry whose value the model leaves open -- a list the formula
+      ;; never reads -- is left out, for the caller to fill and check
       (let [es (for [[p k x] (:map v)
                      :when (if (boolean? p) p (solve/eval-formula p model))]
                  [(dec k) (dec x)])]
-        (if (some #{::none} (flatten (seq es))) ::none (into {} es)))
+        (if (some #(= ::none (first %)) es)
+          ::none
+          (into {} (remove #(= ::none (second %))) es)))
       (:set v) (let [{:keys [pred elem]} (:set v)
                      {m :map d :default} (get model pred)]
                  (if (or (nil? pred) d)
@@ -1537,7 +1554,7 @@
   "Values of the variables for which hyps hold and goal g does not, from
   the solver's counter-model, or nil."
   [opts hyps g]
-  (when-let [{:keys [formula decls env codes]} (formula opts hyps g)]
+  (when-let [{:keys [formula decls env codes]} (formula (assoc opts :lenient true) hyps g)]
     (let [r (try (solve/valid? formula decls {:budget budget})
                  (catch clojure.lang.ExceptionInfo _ nil))]
       (when (= :invalid (:result r))

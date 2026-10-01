@@ -1327,6 +1327,32 @@
 
 (def ^:private witness-trials 1000)
 
+(defn- law-atoms
+  "The clauses of a law whose outcome a test should see both ways: each
+  comparison in it, and each part of its hypotheses, that mentions one of
+  its variables.  Not inside a fn literal, whose locals a test cannot
+  bind.  At most 8."
+  [body vars]
+  (let [vars (set vars)
+        mentions? (fn [f] (some vars (tree-seq coll? seq f)))
+        walk (fn walk [f]
+               (cond
+                 (and (seq? f) (contains? '#{fn fn* letfn} (first f))) []
+                 (seq? f) (concat (when (contains? '#{< <= > >=} (first f)) [f]) (mapcat walk (rest f)))
+                 (coll? f) (mapcat walk f)
+                 :else []))
+        flat (fn flat [f] (if (and (seq? f) (contains? '#{and or not} (first f))) (mapcat flat (rest f)) [f]))
+        hyps (loop [p body, hs []] (if (head? p "=>") (recur (nth p 2) (into hs (flat (nth p 1)))) hs))]
+    (vec (take 8 (distinct (filter #(and (seq? %) (mentions? %)) (concat hyps (walk body))))))))
+
+(defn- count-atoms!
+  "Note how each atom came out at env, in counts: {atom {true n false n}}."
+  [ctx atoms counts env]
+  (doseq [a atoms]
+    (let [r (run-term ctx a env)]
+      (when (contains? r :ok)
+        (swap! counts update-in [a (boolean (:ok r))] (fnil inc 0))))))
+
 (defn- test-law
   [ctx {:keys [name prop witness]} {:keys [trials seed max-size]}]
   (let [[bs body] (leading-foralls prop)
@@ -1373,10 +1399,12 @@
       (let [vars (mapv first bs)
             ctx* (assoc ctx :vars vars)
             discards (atom 0)
+            atoms (law-atoms body vars)
+            counts (atom {})
             res (qc (prop/for-all* (mapv #(type->gen (second %) (:tenv ctx)) bs)
                                    (fn [& vals]
                                      (case (:result (holds ctx* body (zipmap vars vals)))
-                                       :pass true
+                                       :pass (do (count-atoms! ctx* atoms counts (zipmap vars vals)) true)
                                        :discard (do (swap! discards inc) true)
                                        false))))]
         (cond
@@ -1394,7 +1422,7 @@
 
           :else
           {:law name :status :tested :trials (:num-tests res) :seed (:seed res)
-           :discarded @discards})))))
+           :discarded @discards :coverage @counts})))))
 
 ;; --- adequacy: does the spec pin the code down? ------------------------------
 
@@ -3542,6 +3570,13 @@
                 (str "; tested, not proved: " (str/join ", " (map :law ts))
                      (when-let [n (some->> (seq (keep :trials ts)) (apply min))]
                        (str " (each on at least " n " inputs)"))))))
+       ;; a clause a test saw come out one way only tests one side of it
+       (apply str (for [{:keys [law one-sided trials evidence]} laws
+                        :when (= :test evidence)
+                        [a side] one-sided]
+                    (str "\n  law `" law "`: " (pr-str a) " was never " side " in " trials
+                         " trials, nor at an input the solver found. A clause that never turns"
+                         " tests one side only: build inputs that turn it, or drop it if it always holds")))
        ;; a test of a law whose hypothesis seldom holds says little
        (apply str (for [{:keys [law held trials evidence]} laws
                         :when (and (= :test evidence) held trials (< held thin-tests))]
@@ -3829,6 +3864,21 @@
                  (catch Throwable _ nil)))
           rules))))
 
+(defn- completed
+  "A solver's values for bindings bs, a record it gave only the keys its
+  formula reads filled from a value of the record's type.  What it fills
+  is checked like the rest, by the type and by running the law."
+  [ctx bs cex]
+  (when cex
+    (merge cex
+           (into {} (for [[x t] bs
+                          :let [v (get cex x)]
+                          :when (and (map? v) (not (conforms? t v (:tenv ctx))))
+                          :let [g (try (gen/generate (type->gen t (:tenv ctx)) 0 (hash v))
+                                       (catch Throwable _ nil))]
+                          :when (map? g)]
+                      [x (merge g v)])))))
+
 (defn- refuted
   "The law's failure at the counterexample the solver found, confirmed by
   running the law there; nil when there is none, running it holds, or it
@@ -3838,7 +3888,8 @@
   [ctx r cex]
   (when cex
     (let [[bs body] (leading-foralls (:prop r))
-          vars (mapv first bs)]
+          vars (mapv first bs)
+          cex (completed ctx bs cex)]
       (when (and (every? #(contains? cex %) vars)
                  (every? (fn [[x t]] (conforms? t (get cex x) (:tenv ctx))) bs))
         (let [res (try (holds (assoc ctx :vars vars) body cex)
@@ -4137,7 +4188,7 @@
                     apart (for [w seen] (cons 'or (for [x vars] (list 'not= x (get w x)))))
                     h* (if (seq apart) (list* 'and h apart) h)
                     none (reduce (fn [p [x t]] (list 'forall [x t] p)) (list 'not h*) (reverse bs))
-                    cex (:counterexample (attempt** {:law (:law r) :prop none} [] nil))]
+                    cex (completed ctx bs (:counterexample (attempt** {:law (:law r) :prop none} [] nil)))]
                 (when (and cex (every? #(contains? cex %) vars)
                            (every? (fn [[x t]] (conforms? t (get cex x) (:tenv ctx))) bs)
                            (= :pass (:result (try (holds (assoc ctx :vars vars) h* cex)
@@ -4182,6 +4233,27 @@
                                    bad (when w (refuted ctx r w))]
                              :when bad]
                          (assoc bad :boundary (list '= t n))))))
+            ;; a clause the trials saw come out only one way, turned the
+            ;; other by the solver: the law run there, and failing or not,
+            ;; the clause counted as seen both ways
+            turn-clauses
+            (fn [r]
+              (let [[bs body] (leading-foralls (:prop r))
+                    hyps (hyps-of body)
+                    cov (:coverage r)
+                    one-sided (for [a (law-atoms body (map first bs))
+                                    side [true false]
+                                    :when (zero? (get-in cov [a side] 0))]
+                                [a side])]
+                (loop [[[a side] & more] (take 4 one-sided), r r]
+                  (if-not a
+                    r
+                    (let [w (meeting r bs (cons 'and (conj (vec hyps) (if side a (list 'not a)))) [])
+                          bad (when w (refuted ctx r w))]
+                      (cond
+                        bad (assoc bad :turned [a side])
+                        w (recur more (update-in r [:coverage a side] (fnil inc 0)))
+                        :else (recur more r)))))))
             open? (fn [r] (and (:prop r) (contains? #{:tested :failed} (:status r))
                                (not (:proof r)) (not (:unproved-final r))))
             pass (fn [[rs lemmas]]
@@ -4259,7 +4331,8 @@
                         rs2 (if (false? (:prove opts))
                               rs2
                               (mapv #(or (when (and (= :tested (:status %)) (not (:lemma %)))
-                                           (try (at-the-boundary %) (catch Throwable _ nil)))
+                                           (or (try (at-the-boundary %) (catch Throwable _ nil))
+                                               (try (turn-clauses %) (catch Throwable _ nil))))
                                          %)
                                     rs2))]
                     (if (:suggest opts)
@@ -4722,13 +4795,25 @@
       r
       (let [t0 (System/currentTimeMillis)
             base (or (:seed r) 0)
-            first-run (or (:trials r) (:trials opts) 100)]
-        (loop [k 1, ran first-run, held (if starved? 0 (- first-run (or (:discarded r) 0)))]
-          (if (or (> (* 100 k) extra) (> (- (System/currentTimeMillis) t0) ms))
+            first-run (or (:trials r) (:trials opts) 100)
+            [bs body] (leading-foralls (:prop r))
+            atoms (law-atoms body (map first bs))
+            ;; every clause seen both ways, often enough: more trials of the
+            ;; same would say little more
+            covered? (fn [cov ran] (and (seq atoms) (>= ran 300)
+                                        (every? #(and (<= 5 (get-in cov [% true] 0)) (<= 5 (get-in cov [% false] 0)))
+                                                atoms)))]
+        (loop [k 1, ran first-run, held (if starved? 0 (- first-run (or (:discarded r) 0))),
+               cov (or (:coverage r) {})]
+          (if (or (> (* 100 k) extra) (> (- (System/currentTimeMillis) t0) ms) (covered? cov ran))
             (cond
-              (not starved?) (assoc r :trials ran :discarded (- ran held) :held held)
+              (not starved?) (assoc r :trials ran :discarded (- ran held) :held held :coverage cov
+                                    :one-sided (vec (for [a atoms, side [false true]
+                                                          :when (zero? (get-in cov [a side] 0))]
+                                                      [a side])))
               (pos? held) (-> r (dissoc :counterexample :detail :no-hypothesis)
-                              (assoc :status :tested :trials ran :discarded (- ran held) :held held))
+                              (assoc :status :tested :trials ran :discarded (- ran held) :held held
+                                     :coverage cov))
               :else r)
             (let [t (try (test-law ctx {:name (:law r) :prop (:prop r)}
                                    {:trials 100 :seed (+ base k) :max-size (or (:max-size opts) 50)})
@@ -4741,7 +4826,8 @@
                        (select-keys t [:status :counterexample :original :trial :seed :detail :error])
                        {:after-trials ran})
                 (recur (inc k) (+ ran 100)
-                       (+ held (if (:no-hypothesis t) 0 (- (or (:trials t) 100) (or (:discarded t) 0)))))))))))))
+                       (+ held (if (:no-hypothesis t) 0 (- (or (:trials t) 100) (or (:discarded t) 0))))
+                       (merge-with (partial merge-with +) cov (:coverage t)))))))))))
 
 (defn- reachable-from
   "Every fn of graph g that f reaches through calls."

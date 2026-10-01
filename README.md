@@ -1177,6 +1177,17 @@ A law that is only tested runs its first 100 trials and then up to 900
 more, since tests are all it rests on. A failure among the extra ones is
 reported with the seed that replays it in the first hundred.
 
+Each trial also notes how the law's clauses came out: every comparison
+in it, and every part of its hypotheses. A clause the first hundred saw
+only one way is turned the other by the solver, under the law's
+hypotheses, and the law run there. The extra trials stop once every
+clause has gone both ways a few times, and a clause that never turned,
+by the trials or the solver, is named:
+
+```
+law `spending-stays-within-the-limit`: (<= 0 (count (frequencies (:flags a)))) was never false in 1000 trials, nor at an input the solver found. ...
+```
+
 A spec can require proof. Then a law that is only tested fails:
 
 ```clojure
