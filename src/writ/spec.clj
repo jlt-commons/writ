@@ -1142,6 +1142,73 @@
 (def ^:private finite-double
   (gen/double* {:NaN? false :infinite? false}))
 
+(defn- domain-size
+  "How many values type t has, when it is a handful: a Bool, a refinement
+  of an integer over a finite range, an enumeration.  nil for a type with
+  many.  A refinement of a finite type has at most its base's values."
+  [t tenv]
+  (let [t (plain t)]
+    (cond
+      (= 'Bool t) 2
+      (= 'Unit t) 1
+      (refinement t tenv) (let [r (refinement t tenv)]
+                            (or (some-> (:window r) count)
+                                (when-not (:window r) (domain-size (:base r) tenv))))
+      (and (symbol? t) (data-decl t tenv))
+      (let [[d args] (data-decl t tenv)
+            cs (keys (:ctors d))]
+        (when (and (seq cs) (every? #(empty? (:fields (ctor-info d args %))) cs))
+          (count cs)))
+      :else nil)))
+
+(defn- record-field-type
+  "The type of field k of a record type r, or of the record a refinement
+  refines."
+  [r k tenv]
+  (let [r (plain r)]
+    (cond (map? r) (get r k)
+          (refinement r tenv) (record-field-type (:base (refinement r tenv)) k tenv)
+          :else nil)))
+
+(defn- collection-type?
+  "Is t a collection whose length its generator chooses from the size?"
+  [t tenv]
+  (let [t (plain t)]
+    (or (and (seq? t) (contains? '#{List Vec Set Map} (first t)))
+        (and (kind/index-type? t) (not (data-decl t tenv))))))
+
+(defn- element-gen
+  "The generator of a collection's elements of type t.  An element that is
+  itself a collection is at most the square root of the size long, so a
+  map of vectors stays near the size rather than its square; the values
+  inside keep the whole size, so a number in a nested vector is as large
+  as one anywhere."
+  [t tenv]
+  (let [tenv (dissoc tenv ::nested)]
+    (type->gen t (cond-> tenv (collection-type? t tenv) (assoc ::nested true)))))
+
+(defn- max-length
+  "The longest a collection may be at size s: s, its root when the
+  collection is inside another, and no more than cap."
+  [tenv s cap]
+  (cond-> (if (::nested tenv) (long (Math/sqrt s)) s)
+    cap (min cap)))
+
+(defn- capped-vector
+  "A vector of g, no longer than max-length allows."
+  [g tenv cap]
+  (if (or cap (::nested tenv))
+    (gen/sized (fn [s] (gen/vector g 0 (max-length tenv s cap))))
+    (gen/vector g)))
+
+(defn- index-records
+  "Records for an index keyed by k: as many as its key type can tell
+  apart, and a few more for the ones that clash, never the size's worth
+  of records that would collapse onto a few keys."
+  [r k tenv]
+  (capped-vector (element-gen r tenv) tenv
+                 (some->> (record-field-type r k tenv) (#(domain-size % tenv)) (* 2))))
+
 (defn type->gen
   "The test.check generator for values of type `t`."
   [t tenv]
@@ -1215,7 +1282,7 @@
                                 m
                                 (assoc m (get x k) x)))
                             {} rs))
-                  (gen/vector (type->gen r tenv))))
+                  (index-records r k tenv)))
 
       (seq? t)
       (let [[h & as] t
@@ -1224,14 +1291,27 @@
           Opt (gen/frequency [[1 (gen/return nil)] [3 (el 0)]])
           ;; a (List T) is any seq Clojure hands around: a list, a vector,
           ;; a lazy seq or nil.  Shrinking prefers the list.
-          List (let [g (el 0)]
-                 (gen/frequency [[3 (gen/list g)]
-                                 [3 (gen/vector g)]
-                                 [2 (gen/fmap #(map identity %) (gen/list g))]
+          List (let [g (element-gen (nth as 0) tenv)
+                     v (capped-vector g tenv nil)
+                     l (if (::nested tenv) (gen/fmap #(apply list %) v) (gen/list g))]
+                 (gen/frequency [[3 l]
+                                 [3 v]
+                                 [2 (gen/fmap #(map identity %) l)]
                                  [1 (gen/return nil)]]))
-          Vec (gen/vector (el 0))
-          Set (gen/set (el 0))
-          Map (gen/map (el 0) (el 1))
+          Vec (capped-vector (element-gen (nth as 0) tenv) tenv nil)
+          Set (let [g (element-gen (nth as 0) tenv)
+                    n (domain-size (nth as 0) tenv)]
+                (if (or n (::nested tenv))
+                  (gen/sized (fn [s] (gen/set g {:max-elements (max-length tenv s n)})))
+                  (gen/set g)))
+          ;; at most one entry a key: a map over three keys never draws
+          ;; fifty values to keep three
+          Map (let [kg (element-gen (nth as 0) tenv)
+                    vg (element-gen (nth as 1) tenv)
+                    n (domain-size (nth as 0) tenv)]
+                (if (or n (::nested tenv))
+                  (gen/sized (fn [s] (gen/map kg vg {:max-elements (max-length tenv s n)})))
+                  (gen/map kg vg)))
           (Tuple &) (apply gen/tuple (map #(type->gen % tenv) as))
           -> (fn-gen (type->gen (last t) tenv))
           (if-let [[d args] (data-decl t tenv)]
@@ -3461,16 +3541,28 @@
                                 " the spec that makes any value of its base one of it.")
                            {:writ/error true}))})
 
+(defn- window-values
+  "The values of integer base b in the window around 0 that meet pred."
+  [b pred tenv]
+  (filterv #(and (conforms? b % tenv) (try (pred %) (catch Throwable _ false)))
+           (range (- int-window) (inc int-window))))
+
+(defn- finite-window
+  "The values of an integer refinement, when they all lie inside the
+  window: none at its edges, so none past them."
+  [ok]
+  (when (and (seq ok) (not= (first ok) (- int-window)) (not= (peek ok) int-window))
+    ok))
+
 (defn- refine-gen
   "Values of a refinement.  An integer one is found once across a window
   and generated in its range, so a narrow range is never starved; any
   other is its base's values, favouring the literals its predicate
   mentions, that satisfy the predicate."
-  [{:keys [name base]} pred tenv]
+  [{:keys [name base] :as r} pred tenv]
   (let [b (plain base)]
     (if (contains? '#{Int Nat} b)
-      (let [ok (filterv #(and (conforms? b % tenv) (pred %))
-                        (range (- int-window) (inc int-window)))]
+      (let [ok (or (::window r) (window-values b pred tenv))]
         (cond
           (empty? ok)
           ;; none near 0: a range past the window, such as (<= 5000 q).
@@ -3522,7 +3614,7 @@
                                               m
                                               m2)))
                                         {} rs))
-                              (gen/vector (type->gen r tenv)))]
+                              (index-records r k tenv))]
           (gen/such-that ok? built (such-that-opts name)))
         (gen/such-that pred (type->gen base (assoc tenv ::bias (::bias-of-refine tenv))) (such-that-opts name))))))
 
@@ -3571,8 +3663,14 @@
                                               (get (code-seeds (:target e)) 'Int)))))]
     (reduce (fn [tenv {:keys [name pred-name] :as r}]
               (let [pred (deref (ns-resolve (the-ns spec-ns) pred-name))
-                    tenv (assoc-in tenv [::refines name] (assoc r :pred pred :pred-form (:pred r)
-                                                                :spec-ns spec-ns))
+                    ;; an integer refinement's values near 0, found once:
+                    ;; its generator draws from them, and when they are
+                    ;; all of its values, a collection keyed by it is sized by them
+                    window (when (contains? '#{Int Nat} (plain (:base r)))
+                             (window-values (plain (:base r)) pred tenv))
+                    tenv (assoc-in tenv [::refines name] (cond-> (assoc r :pred pred :pred-form (:pred r)
+                                                                        :spec-ns spec-ns)
+                                                           window (assoc :window (finite-window window))))
                     bias (bias-of (literals (:pred r) spec-ns @bodies))]
                 (assoc-in tenv [::refines name :gen]
                           (at-boundaries
@@ -3587,7 +3685,8 @@
                                               :ex-fn (fn [_] (ex-info (str "the :build of refinement `" name "`, `" b
                                                                            "`, makes values its predicate rejects")
                                                                       {:writ/error true}))}))
-                            (refine-gen r pred (assoc tenv ::bias-of-refine bias ::spec-ints @spec-ints)))
+                            (refine-gen (cond-> r window (assoc ::window window))
+                                        pred (assoc tenv ::bias-of-refine bias ::spec-ints @spec-ints)))
                           @boundary-nums
                           #(try (and (conforms? (:base r) % tenv) (boolean (pred %)))
                                 (catch Throwable _ false))))))
