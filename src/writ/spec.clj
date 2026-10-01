@@ -1183,10 +1183,15 @@
   itself a collection is at most the square root of the size long, so a
   map of vectors stays near the size rather than its square; the values
   inside keep the whole size, so a number in a nested vector is as large
-  as one anywhere."
+  as one anywhere.  A collection of a type with few values keeps the
+  whole size."
   [t tenv]
-  (let [tenv (dissoc tenv ::nested)]
-    (type->gen t (cond-> tenv (collection-type? t tenv) (assoc ::nested true)))))
+  (let [tenv (dissoc tenv ::nested)
+        t* (plain t)
+        ;; a vector of a few values, such as a queue of members, keeps the
+        ;; whole size: its elements cost little, and its repeats are the point
+        few? (and (seq? t*) (contains? '#{List Vec Set} (first t*)) (domain-size (second t*) tenv))]
+    (type->gen t (cond-> tenv (and (collection-type? t tenv) (not few?)) (assoc ::nested true)))))
 
 (defn- max-length
   "The longest a collection may be at size s: s, its root when the
@@ -1202,13 +1207,34 @@
     (gen/sized (fn [s] (gen/vector g 0 (max-length tenv s cap))))
     (gen/vector g)))
 
+(defn- keys-first
+  "A generator of [[key value] ...] with distinct keys: the keys drawn as
+  a vector the size long, as many as a collection's entries, and a value
+  made for each distinct one.  As many keys come out as when whole
+  entries are drawn and those that share a key dropped, but no value is
+  made to be dropped: a map over three titles draws its values three
+  times, not fifty."
+  [kg vg tenv]
+  (gen/sized
+    (fn [s]
+      (gen/bind (gen/vector kg 0 (max-length tenv s nil))
+                (fn [ks]
+                  (let [ks (vec (distinct ks))]
+                    (if (empty? ks)
+                      (gen/return [])
+                      (gen/fmap #(mapv vector ks %) (apply gen/tuple (repeat (count ks) vg))))))))))
+
 (defn- index-records
-  "Records for an index keyed by k: as many as its key type can tell
-  apart, and a few more for the ones that clash, never the size's worth
-  of records that would collapse onto a few keys."
+  "Records for an index keyed by k.  When its key type has few values,
+  the keys are drawn first and a record made for each, its key set: a
+  record that would land on a key already taken is never made."
   [r k tenv]
-  (capped-vector (element-gen r tenv) tenv
-                 (some->> (record-field-type r k tenv) (#(domain-size % tenv)) (* 2))))
+  (if-let [kt (when (domain-size (record-field-type r k tenv) tenv) (record-field-type r k tenv))]
+    (gen/fmap (fn [kvs] (into [] (comp (map (fn [[kk rec]] (if (map? rec) (assoc rec k kk) rec)))
+                                       (filter #(conforms? r % tenv)))
+                              kvs))
+              (keys-first (type->gen kt tenv) (element-gen r tenv) tenv))
+    (capped-vector (element-gen r tenv) tenv nil)))
 
 (defn type->gen
   "The test.check generator for values of type `t`."
@@ -1300,19 +1326,17 @@
                                  [2 (gen/fmap #(map identity %) l)]
                                  [1 (gen/return nil)]]))
           Vec (capped-vector (element-gen (nth as 0) tenv) tenv nil)
-          Set (let [g (element-gen (nth as 0) tenv)
-                    n (domain-size (nth as 0) tenv)]
-                (if (or n (::nested tenv))
-                  (gen/sized (fn [s] (gen/set g {:max-elements (max-length tenv s n)})))
+          Set (let [g (element-gen (nth as 0) tenv)]
+                (if (::nested tenv)
+                  (gen/sized (fn [s] (gen/set g {:max-elements (max-length tenv s nil)})))
                   (gen/set g)))
-          ;; at most one entry a key: a map over three keys never draws
-          ;; fifty values to keep three
+          ;; keys first, when they have few values: a map over three
+          ;; keys never draws fifty values to keep three
           Map (let [kg (element-gen (nth as 0) tenv)
-                    vg (element-gen (nth as 1) tenv)
-                    n (domain-size (nth as 0) tenv)]
-                (if (or n (::nested tenv))
-                  (gen/sized (fn [s] (gen/map kg vg {:max-elements (max-length tenv s n)})))
-                  (gen/map kg vg)))
+                    vg (element-gen (nth as 1) tenv)]
+                (cond (domain-size (nth as 0) tenv) (gen/fmap #(into {} %) (keys-first kg vg tenv))
+                      (::nested tenv) (gen/sized (fn [s] (gen/map kg vg {:max-elements (max-length tenv s nil)})))
+                      :else (gen/map kg vg)))
           (Tuple &) (apply gen/tuple (map #(type->gen % tenv) as))
           -> (fn-gen (type->gen (last t) tenv))
           (if-let [[d args] (data-decl t tenv)]

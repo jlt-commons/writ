@@ -357,9 +357,12 @@ names it: `(law eof-sentinel (forall [e Bool] (= :eof (classify-read -127 e))))`
 A collection is at most `max-size` long, and one inside another collection
 at most its square root, 7 by default, so a map of vectors stays near the
 size rather than its square; the numbers inside it still range over the
-whole size. A map, set or index whose key can take only a few values (a
-`Bool`, an integer refinement such as `(< t 3)`, a data type of constants)
-gets no more entries than its key can tell apart.
+whole size, and a collection of a type with few values, such as a queue of
+one of four members, keeps the whole size. A map or index whose key can
+take only a few values (a `Bool`, an integer refinement such as `(< t 3)`,
+a data type of constants) draws its keys first and makes a value for each
+distinct one, so it is as full as when every entry was drawn, without
+making the values that would share a key.
 
 ### Data
 

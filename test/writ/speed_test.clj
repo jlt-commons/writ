@@ -189,3 +189,13 @@
                     {:max-tries 5000 :ex-fn (fn [_] (ex-info "none" {}))})
         v (clojure.test.check.generators/generate g 0 1)]
     (is (<= 151 (count v) 200))))
+
+(deftest a-collection-over-few-keys-is-as-full-as-when-every-entry-was-drawn
+  ;; drawn as before, fifty entries a value at size 50, a map over three
+  ;; slots nearly always had all three: drawing the keys first keeps that
+  (let [tenv (spec/type-env 'writ.spec-demo.racks-spec)
+        vs (for [i (range 200)] (clojure.test.check.generators/generate (spec/type->gen 'Racks tenv) 50 i))
+        avg (fn [f] (/ (reduce + (map f vs)) 200.0))]
+    (is (< 2.5 (avg (comp count :items))))
+    (is (< 2.5 (avg (comp count :queues))))
+    (is (every? (fn [r] (every? (fn [[k i]] (= k (:slot i))) (:items r))) vs))))
