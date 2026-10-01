@@ -9,7 +9,7 @@
             [writ.spec :as spec]
             [clojure.string :as str]))
 
-(require 'writ.spec-demo.shapes 'writ.spec-demo.signal 'writ.spec-demo.court)
+(require 'writ.spec-demo.shapes 'writ.spec-demo.signal 'writ.spec-demo.court 'writ.spec-demo.ledger-off)
 
 (defn- defs-of [ns-sym file]
   (first (prover/definitions [[ns-sym (writ.book/read-forms (clojure.java.io/resource file))]])))
@@ -191,3 +191,35 @@
 (deftest nth-of-nil-is-nil
   (is (sym/prove {} [] [:call 'nil? [:call 'nth [:nil] [:lit 3]]]))
   (is (sym/prove {} [] [:call '= [:lit :d] [:call 'nth [:nil] [:lit 0] [:lit :d]]])))
+
+;; --- maps of any size -----------------------------------------------------------------
+
+(deftest laws-over-maps-of-any-size-are-proved
+  (let [r (spec/check 'writ.spec-demo.ledger-spec {:seed 1 :cache false})]
+    (is (:ok r) (:message r))
+    (doseq [l (:laws r) :when (not (str/includes? (str (:law l)) ":"))]
+      (is (= :proved (:status l)) (str (:law l) ": " (:unproved l))))))
+
+(deftest false-laws-over-maps-are-never-proved
+  (let [r (spec/check 'writ.spec-demo.ledger-spec {:seed 1 :cache false :target 'writ.spec-demo.ledger-off})
+        st (into {} (map (juxt :law :status)) (:laws r))]
+    (is (not (:ok r)))
+    (is (not-any? :prover-bug (:laws r)))
+    (doseq [l '[a-deposit-to-no-account-changes-nothing a-closed-account-is-gone]]
+      (is (= :failed (get st l)) (str l)))
+    (testing "the laws the wrong code still keeps are proved of it"
+      (doseq [l '[a-deposit-adds-to-the-balance a-tag-reads-back closing-leaves-the-others]]
+        (is (= :proved (get st l)) (str l))))))
+
+(deftest a-counterexample-over-a-map-of-any-size-is-a-map
+  (let [defs (defs-of 'writ.spec-demo.ledger-off "writ/spec_demo/ledger_off.clj")
+        q (fn [f & args] (into [:app (symbol "writ.spec-demo.ledger-off" f)] args))
+        types '{l {:accts (Index :id {:id Nat, :balance Int}), :tags (Map Keyword Nat)}, a Nat, n Int}
+        ;; a deposit to no account changes nothing: false of the wrong code
+        cex (sym/counterexample {:types types :defs defs :tenv {}}
+                                [[:call 'not [:call 'contains? [:call 'get 'l [:lit :accts]] 'a]]]
+                                [:call '= 'l (q "deposit" 'l 'a 'n)])]
+    (is (map? (get cex 'l)) (pr-str cex))
+    (is (map? (:accts (get cex 'l))) (pr-str cex))
+    (is (not (contains? (:accts (get cex 'l)) (get cex 'a))) (pr-str cex))
+    (is (not= (get cex 'l) (writ.spec-demo.ledger-off/deposit (get cex 'l) (get cex 'a) (get cex 'n))))))

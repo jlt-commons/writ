@@ -1622,6 +1622,23 @@ built from literals and sets of unknown size filtered, mapped by a
 translation, or tested for membership, and calls of pure core fns on
 literal data. Recursion is left to rewriting and induction.
 
+A map of unknown size, a variable of type `(Map K V)` or `(Index :k R)`,
+is read as the theory of arrays is reduced in an SMT solver: a predicate
+of the key says whether the map holds it, and each scalar part of the
+value it holds there is a fn of the key the solver knows nothing about.
+What the code does to it -- `assoc`, `dissoc`, `assoc-in`, `update`,
+`update-in` -- is a chain of stores on top; `get`, `get-in`, `contains?`
+and calling the map read the newest store at an equal key, else the map
+underneath. Two maps changed from one are equal when they agree at every
+key either changed, since everywhere else both are the map they came
+from. An index's record is known to hold its own key. So laws such as
+"a refused checkout changes nothing" or "paying touches only that
+member's fines" are proved for libraries of any size. Walking every entry
+(`vals`, `keys`, `count`, `every?` over one) is not read this way yet; a
+hypothesis that does so is left out of the proof, which only makes the
+proof hold under less, and a counterexample decodes the map the model
+chose into a Clojure map.
+
 ### Which fns qualify
 
 Before writing a spec, `(spec/scan 'my.ns)` says which of a namespace's

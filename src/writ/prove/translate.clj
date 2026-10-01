@@ -22,7 +22,7 @@
      sort sort-by distinct reverse last butlast take drop str name keyword
      vector? sequential? map? get nil? some?
      keyword? symbol? string? char? boolean?
-     hash-map assoc dissoc merge keys vals
+     hash-map assoc dissoc merge keys vals get-in assoc-in update update-in
      subvec mapv filterv keep remove not-any? range conj number? fn?})
 
 (def ^:private vector-fns
