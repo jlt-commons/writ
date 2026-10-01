@@ -105,3 +105,30 @@
           one (spec/check s {:seed 42 :adequacy :mutants :parallel false})]
       (is (= (view one) (view par)) (str s))
       (is (identical? real @(resolve 'writ.spec-demo.racks/put)) "the target's fns are restored"))))
+
+;; --- refinements built to fit ---------------------------------------------------
+
+(def ^:private fitting @#'spec/fitting)
+
+(deftest a-refinement-sets-the-fields-its-predicate-pins
+  (let [tenv (spec/type-env 'writ.spec-demo.parcel-spec)
+        r #(get-in tenv [:writ.spec/refines %])
+        o {:status :shipped :total 7 :paid 3 :refunded 2}]
+    (is (= {:status :placed :total 7 :paid 0 :refunded 0} ((fitting (r 'Placed) tenv) o)))
+    (testing "a field equal to another takes its value"
+      (is (= {:status :paid :total 7 :paid 7 :refunded 0} ((fitting (r 'Paid) tenv) o))))
+    (testing "a tuple's positions"
+      (is (= [:open 4] ((fitting (r 'Ticket) tenv) [:x 4]))))
+    (testing "nothing to set"
+      (is (nil? (fitting (r 'Parcel) tenv))))))
+
+(deftest values-built-to-fit-are-of-their-refinement
+  (let [tenv (spec/type-env 'writ.spec-demo.parcel-spec)]
+    (doseq [t '[Placed Paid Ticket]]
+      (let [vs (for [i (range 100)] (clojure.test.check.generators/generate (spec/type->gen t tenv) (mod i 30) i))]
+        (is (every? #(spec/conforms? t % tenv) vs) (str t))
+        (is (< 5 (count (distinct vs))) (str t))))))
+
+(deftest a-spec-of-fitted-states-passes
+  (let [r (spec/check 'writ.spec-demo.parcel-spec {:seed 1})]
+    (is (:ok r) (:message r))))

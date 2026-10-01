@@ -707,7 +707,14 @@ static check sees the base type. `refine` also defines the predicate, as
 `Paddle?`, for laws to use.
 
 Other values are found by drawing from the base type and keeping those
-that meet the predicate, and a predicate a random value rarely meets
+that meet the predicate. A field the predicate pins is set before the
+predicate judges the value: in `(refine Placed [o Order] (and (= :placed
+(:status o)) (unpaid? o)))`, with `(defn unpaid? [o] (and (zero? (:paid
+o)) (zero? (:refunded o))))`, the drawn order gets `:status :placed` and
+zero amounts, read through the spec's one-line fns. `(= c (:k o))`,
+`(zero? (:k o))`, `(nil? (:k o))` and `(= (:a o) (:b o))` pin a field, and
+`(first t)`, `(second t)` and `(nth t i)` a tuple's position. A predicate
+a random value rarely meets in any other way
 starves: a receipt whose total is the sum of its items, a library whose
 members' loan counts match the copies they hold. `{:build f}` names a fn
 of the spec that makes any value of the base type one of the refinement,

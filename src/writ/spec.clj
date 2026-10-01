@@ -3630,6 +3630,65 @@
                                 " the spec that makes any value of its base one of it.")
                            {:writ/error true}))})
 
+(defn- fitting
+  "A fn that sets the fields of a refinement's value that its predicate
+  pins, or nil when it pins none: a conjunct (= :placed (:status o)) sets
+  :status, (zero? (:paid o)) sets :paid to 0, (= (:paid o) (:total o))
+  gives :paid the value of :total, and a tuple's (first t), (second t)
+  and (nth t i) are positions.  The spec's one-line helpers are read
+  through, (unpaid? o) as its body.  A value a random one of the base
+  rarely meets is then built rather than filtered for; the predicate
+  still judges it."
+  [r tenv]
+  (let [x (:var r)
+        form (or (:pred-form r) (when-not (fn? (:pred r)) (:pred r)))
+        helpers (::helpers tenv {})
+        conjuncts (fn conjuncts [f depth]
+                    (cond
+                      (and (seq? f) (= 'and (first f))) (mapcat #(conjuncts % depth) (rest f))
+                      (and (seq? f) (symbol? (first f)) (= [x] (vec (rest f))) (< depth 4))
+                      (if-let [[[p] body] (let [h (get helpers (symbol (name (first f))))]
+                                            (when (= 1 (count (first h))) h))]
+                        (conjuncts (walk/postwalk-replace {p x} body) (inc depth))
+                        [f])
+                      :else [f]))
+        place (fn [f]
+                (when (and (seq? f) (= x (second f)))
+                  (let [[h _ b] f n (count f)]
+                    (cond (and (keyword? h) (= 2 n)) [:key h]
+                          (and (= 'get h) (keyword? b) (= 3 n)) [:key b]
+                          (and (= 'first h) (= 2 n)) [:pos 0]
+                          (and (= 'second h) (= 2 n)) [:pos 1]
+                          (and (= 'nth h) (nat-int? b) (= 3 n)) [:pos b]))))
+        lit? #(or (keyword? %) (number? %) (string? %) (nil? %) (boolean? %))
+        sets (for [f (conjuncts form 0)
+                   :when (seq? f)
+                   :let [[h a b] f n (count f)
+                         s (cond
+                             (and (= '= h) (= 3 n) (place a) (lit? b)) [:const (place a) b]
+                             (and (= '= h) (= 3 n) (lit? a) (place b)) [:const (place b) a]
+                             (and (= '= h) (= 3 n) (place a) (place b)) [:copy (place a) (place b)]
+                             (and (= 'zero? h) (= 2 n) (place a)) [:const (place a) 0]
+                             (and (= 'nil? h) (= 2 n) (place a)) [:const (place a) nil]
+                             (and (= 'true? h) (= 2 n) (place a)) [:const (place a) true]
+                             (and (= 'false? h) (= 2 n) (place a)) [:const (place a) false])]
+                   :when s]
+               s)]
+    (when (seq sets)
+      (let [at (fn [v [kind k]] (if (= :key kind) (get v k) (nth v k nil)))
+            put (fn [v [kind k] y] (cond (and (= :key kind) (map? v)) (assoc v k y)
+                                         (and (= :pos kind) (vector? v) (< k (count v))) (assoc v k y)
+                                         :else v))
+            ;; the constants first, then the copies, so a copy of a set
+            ;; field takes its set value
+            ordered (concat (filter #(= :const (first %)) sets) (filter #(= :copy (first %)) sets))]
+        (fn [v]
+          (if (or (map? v) (vector? v))
+            (reduce (fn [v [kind to from]]
+                      (put v to (if (= :const kind) from (at v from))))
+                    v ordered)
+            v))))))
+
 (defn- window-values
   "The values of integer base b in the window around 0 that meet pred."
   [b pred tenv]
@@ -3705,7 +3764,12 @@
                                         {} rs))
                               (index-records r k tenv))]
           (gen/such-that ok? built (such-that-opts name)))
-        (gen/such-that pred (type->gen base (assoc tenv ::bias (::bias-of-refine tenv))) (such-that-opts name))))))
+        (let [g (type->gen base (assoc tenv ::bias (::bias-of-refine tenv)))]
+          (if-let [fit (fitting r tenv)]
+            ;; set as the predicate pins it, and still judged by it and
+            ;; by the base, whose own rule a set field may break
+            (gen/such-that #(and (conforms? base % tenv) (pred %)) (gen/fmap fit g) (such-that-opts name))
+            (gen/such-that pred g (such-that-opts name))))))))
 
 (defn- int-leaves
   "Paths to the integers inside v, through maps and vectors: their
@@ -3779,7 +3843,9 @@
                           @boundary-nums
                           #(try (and (conforms? (:base r) % tenv) (boolean (pred %)))
                                 (catch Throwable _ false))))))
-            (tenv-of data)
+            ;; the spec's one-line fns, which a refinement built to fit
+            ;; reads its predicate through
+            (cond-> (tenv-of data) (seq refines) (assoc ::helpers (one-line-helpers spec-ns)))
             refines)))
 
 (defn type-env
