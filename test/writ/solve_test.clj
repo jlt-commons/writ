@@ -302,3 +302,48 @@
                                 (agrees-with-brute-force (into [:and] ps)))
                           :seed 7 :max-size 8)]
     (is (:pass? r) (pr-str (select-keys r [:shrunk :fail])))))
+
+(deftest a-backjump-past-a-thousand-assignments-keeps-the-trail-whole
+  ;; jolt's subvec just past a trie boundary (1025 of more) leaves a vector
+  ;; whose next conj fails; the search truncates by popping instead
+  (let [backjump @#'writ.solve.cdcl/backjump
+        n 1100
+        lits (vec (for [i (range n)] [:bool (symbol (str "b" i)) true]))
+        st {:trail lits :lims (vec (range 0 n 1)) :tabs (vec (repeat (inc n) :t))
+            :val {} :level {} :reason {}}
+        st2 (backjump st 1025)]
+    (is (= 1025 (count (:trail st2))))
+    (is (= 1100 (count (reduce conj (:trail st2) (range 75)))))
+    (is (= 1100 (count (reduce conj (:lims st2) (range 75)))))
+    (is (= 1100 (count (reduce conj (:tabs st2) (range 74)))))))
+
+;; --- congruence on demand --------------------------------------------------------
+
+(deftest congruence-is-added-only-where-a-model-breaks-it
+  ;; forty applications of f, one pair of which the proof needs: the
+  ;; certificate names the pairs added, far fewer than every pair
+  (let [d {'f [:fn 1]}
+        xs (map #(symbol (str "x" %)) (range 40))
+        noise (into [:and true] (for [x xs] [:<= 0 [:app 'f x]]))
+        f [:=> [:and noise [:= 'a 'b]] [:= [:app 'f 'a] [:app 'f 'b]]]
+        r (s/valid? f d {})]
+    (is (= :valid (:result r)))
+    (is (s/verify f d (:certificate r)))
+    (is (< (count (:congruence (:certificate r))) 20))))
+
+(deftest a-certificate-naming-the-wrong-pair-is-refused
+  (let [d {'f [:fn 1]}
+        f [:=> [:= 'a 'b] [:= [:app 'f 'a] [:app 'f 'b]]]
+        r (s/valid? f d {})
+        c (:certificate r)]
+    (is (= :valid (:result r)))
+    (is (seq (:congruence c)))
+    (is (thrown? Exception (s/verify f d (assoc c :congruence []))))
+    (is (thrown? Exception (s/verify f d (assoc c :congruence [[0 7]]))))))
+
+(deftest congruence-pairs-are-of-one-fn
+  ;; a fn and a predicate applied to the same argument are no pair
+  (let [d {'f [:fn 1] 'p [:pred 1]}
+        f [:=> [:and [:papp 'p 'x] [:= [:app 'f 'x] 3] [:= 'x 'y]] [:and [:papp 'p 'y] [:= [:app 'f 'y] 3]]]]
+    (is (valid? f d))
+    (is (invalid-model [:=> [:papp 'p 'x] [:= [:app 'f 'x] 3]] d))))

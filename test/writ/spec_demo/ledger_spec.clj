@@ -15,10 +15,14 @@
 (ann close-acct [Ledger Nat -> Ledger])
 (ann tag        [Ledger Keyword Nat -> Ledger])
 (ann balance    [Ledger Nat -> Int])
+(ann withdraw   [Ledger Nat Int -> Ledger])
+
+(defn solvent? [l] (every? (fn [x] (<= 0 (:balance x))) (vals (:accts l))))
 
 (graph books {:states {:l Ledger}
               :edges {:l {[deposit Nat Int] #{:l} [open-acct Nat] #{:l}
-                          [close-acct Nat] #{:l} [tag Keyword Nat] #{:l}}}})
+                          [close-acct Nat] #{:l} [tag Keyword Nat] #{:l}
+                          [withdraw Nat Int] #{:l}}}})
 
 (law a-deposit-adds-to-the-balance
   (forall [l Ledger, a Nat, n Int]
@@ -65,3 +69,16 @@
 (law no-account-has-no-balance
   (forall [l Ledger, a Nat]
     (=> (not (contains? (:accts l) a)) (= 0 (balance l a)))))
+
+(law a-withdrawal-keeps-every-balance-whole
+  (forall [l Ledger, a Nat, n Int]
+    (=> (solvent? l) (solvent? (withdraw l a n)))))
+
+(law a-withdrawal-takes-from-the-balance
+  (forall [l Ledger, a Nat, n Int]
+    (=> (and (contains? (:accts l) a) (<= 0 n (balance l a)))
+        (= (- (balance l a) n) (balance (withdraw l a n) a)))))
+
+(law an-overdraft-changes-nothing
+  (forall [l Ledger, a Nat, n Int]
+    (=> (< (balance l a) n) (= l (withdraw l a n)))))

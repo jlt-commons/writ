@@ -49,23 +49,55 @@
                 :when (not (contains? fns x))]
             [x (if (bool? x) (contains? assign [:bool x true]) (value-of x))]))))
 
+(defn- broken-pairs
+  "[i j] of the applications of one fn that solver result r gives equal
+  arguments and different results, i < j, none of them in seen."
+  [apps {:keys [assign values]}]
+  (let [value-of #(get values % 0)
+        result (fn [{:keys [kind var]}] (if (= :fn kind) (value-of var) (contains? assign [:bool var true])))]
+    (fn [seen]
+      (vec (for [[_ group] (group-by (fn [[_ a]] [(:kind a) (:f a)]) (map-indexed vector apps))
+                 [_ same-args] (group-by (fn [[_ a]] (mapv #(pre/lin-value % value-of) (:args a))) group)
+                 :when (next same-args)
+                 :let [[[i a] & more] same-args]
+                 [j b] more
+                 :when (and (not= (result a) (result b)) (not (contains? seen [i j])))]
+             [i j])))))
+
 (defn check
   "Is formula f satisfiable?  {:result :sat :model m}, {:result :unsat
   :certificate c} or {:result :unknown :reason s}.  opts: :budget, the
-  most decisions and conflicts to make, and :engine, :cdcl (clause
-  learning, the default) or :dpll (the tree search, kept for comparison)."
+  most decisions and conflicts to make, :engine, :cdcl (clause
+  learning, the default) or :dpll (the tree search, kept for comparison),
+  and :congruence false, which leaves out that equal arguments give
+  equal results: its :unsat holds of the formula, its :sat may not."
   [f decls opts]
-  (let [{:keys [clauses apps]} (pre/preprocess f decls)
+  (let [{:keys [clauses apps]} (pre/preprocess f decls {:congruence false})
+        apps (vec apps)
         budget (or (:budget opts) default-budget)
-        sopts {:budget budget :max-pivots (* 100 (max budget 100))}]
+        sopts {:budget budget :max-pivots (* 100 (max budget 100))}
+        run (fn [cls] (if (= :dpll (:engine opts)) (search/solve cls sopts) (cdcl/solve cls sopts)))]
     (try
-      (let [r (if (= :dpll (:engine opts))
-                (search/solve clauses sopts)
-                (cdcl/solve clauses sopts))]
-        (if (:sat r)
-          {:result :sat :model (model f decls apps r)}
-          {:result :unsat :certificate {:claim :unsat
-                                        :proof (if (:lemmas r) {:lemmas (:lemmas r)} (:proof r))}}))
+      ;; congruence on demand, as SMT solvers add Ackermann's constraints
+      ;; dynamically: search without them, and where the model gives two
+      ;; applications of a fn equal arguments and different results, add
+      ;; that pair's constraint and search again.  A certificate lists the
+      ;; pairs, so the checker adds the same clauses
+      (loop [cls clauses, pairs [], seen #{}, rounds 0]
+        (let [r (run cls)]
+          (if (:sat r)
+            (let [broken (if (false? (:congruence opts)) [] ((broken-pairs apps r) seen))]
+              (cond
+                ;; with {:congruence false} a model may give one fn two
+                ;; results at equal arguments: for a caller that wants only
+                ;; to hear :unsat, which holds of the full formula too
+                (empty? broken) {:result :sat :model (model f decls apps r)}
+                (> rounds 200) {:result :unknown :reason "congruence kept breaking"}
+                :else (recur (into cls (mapcat (fn [[i j]] (pre/congruence-clauses (apps i) (apps j))) broken))
+                             (into pairs broken) (into seen broken) (inc rounds))))
+            {:result :unsat :certificate {:claim :unsat
+                                          :congruence pairs
+                                          :proof (if (:lemmas r) {:lemmas (:lemmas r)} (:proof r))}})))
       (catch clojure.lang.ExceptionInfo e
         (if (or (::search/budget (ex-data e)) (::simplex/budget (ex-data e)))
           {:result :unknown :reason (ex-message e)}

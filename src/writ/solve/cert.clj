@@ -174,7 +174,18 @@
                  :unsat f
                  :valid [:not f]
                  (reject! "a certificate claims :unsat or :valid, not " (pr-str (:claim c))))]
-    (let [clauses (:clauses (pre/preprocess target decls))
+    (let [clauses (if (contains? c :congruence)
+                    ;; congruence added on demand: the formula's clauses,
+                    ;; then each listed pair's constraint, in order
+                    (let [{:keys [clauses apps]} (pre/preprocess target decls {:congruence false})
+                          apps (vec apps)]
+                      (into clauses (mapcat (fn [pr]
+                                              (let [[i j] (when (and (vector? pr) (= 2 (count pr))) pr)]
+                                                (when-not (and (integer? i) (integer? j) (< -1 i (count apps)) (< -1 j (count apps)))
+                                                  (reject! "no pair of applications " (pr-str pr)))
+                                                (pre/congruence-clauses (apps i) (apps j))))
+                                            (:congruence c))))
+                    (:clauses (pre/preprocess target decls)))
           p (:proof c)]
       (if (and (map? p) (contains? p :lemmas))
         (lemmas! clauses (:lemmas p))

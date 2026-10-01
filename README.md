@@ -1633,11 +1633,33 @@ underneath. Two maps changed from one are equal when they agree at every
 key either changed, since everywhere else both are the map they came
 from. An index's record is known to hold its own key. So laws such as
 "a refused checkout changes nothing" or "paying touches only that
-member's fines" are proved for libraries of any size. Walking every entry
-(`vals`, `keys`, `count`, `every?` over one) is not read this way yet; a
-hypothesis that does so is left out of the proof, which only makes the
-proof hold under less, and a counterexample decodes the map the model
-chose into a Clojure map.
+member's fines" are proved for libraries of any size, and a
+counterexample decodes the map the model chose into a Clojure map.
+
+A vector of unknown length, a `(Vec T)`, is an array the same way: a
+length, and an element at each index made of fns of the index the solver
+knows nothing about. A value is a slice of it and the elements the code
+conj'd after: `first`, `rest`, `next` and `nth` move along the slice,
+`conj` adds after it, `count` is the slice's length and the added ones'.
+So a hold queue's "the first in line is served" and "a hold joins the end"
+are proved for queues of any length.
+
+`every?`, `some`, `not-any?`, `filter`, `remove`, `map`, `seq` and
+`empty?` over a map's entries, keys or vals, or over a vector of unknown
+length, are quantified tests, read as an SMT solver reads a quantifier
+(the array property fragment of Bradley, Manna and Sipma). The test is a
+boolean: when it is false, it fails at a fresh key or index, its witness;
+when it is true, it holds at each key or index the formula reads, the
+instances added once the goal is read, until no key is new or a bound is
+reached (instances of instances go one level deep, as an SMT solver
+bounds matching). So a refinement's rule over every member, assumed as
+a hypothesis, is used at the members a step touches, and a step is proved
+to keep it: "a withdrawal leaves every balance whole" holds of ledgers of
+any size. Two filters of one vector are equal when the filters agree at a
+fresh index, which is what "cancelling leaves the others in order" needs.
+A hypothesis evaluation cannot read at all is left out of the proof,
+which only makes the proof hold under less. Counting a filtered map or
+vector is not read yet.
 
 ### Which fns qualify
 

@@ -150,6 +150,14 @@
             [(update st :inc / 0.95) learned back])
           (recur st (nth (:clauses st) (get-in st [:reason (atom-of t)])) seen out counter (dec idx) t))))))
 
+(defn- truncate
+  "The first n elements of vector v, by popping the rest: jolt's subvec
+  just past a trie boundary (1025 elements and more) makes a vector whose
+  next conj throws, and a trail is conj'd onto after every backjump.  The
+  pops cost what the conjs that made them did."
+  [v n]
+  (loop [v v] (if (> (count v) n) (recur (pop v)) v)))
+
 (defn- backjump
   "Undo every assignment above level k."
   [st k]
@@ -165,8 +173,8 @@
                              (update :reason dissoc a))))
                      st gone)]
       (-> st
-          (assoc :trail (subvec (:trail st) 0 cut) :qhead cut :lims (subvec (:lims st) 0 k))
-          (assoc :tabs (subvec (:tabs st) 0 (inc k)))))))
+          (assoc :trail (truncate (:trail st) cut) :qhead cut :lims (truncate (:lims st) k))
+          (assoc :tabs (truncate (:tabs st) (inc k)))))))
 
 (defn- learn
   "Learn clause c (justified by just) after a conflict, jump back and assert

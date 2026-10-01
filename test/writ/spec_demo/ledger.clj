@@ -19,3 +19,9 @@
 
 (defn balance [l a]
   (get-in l [:accts a :balance] 0))
+
+(defn withdraw [l a n]
+  (let [b (get-in l [:accts a :balance] 0)]
+    (if (and (contains? (:accts l) a) (<= 0 n b))
+      (update-in l [:accts a :balance] - n)
+      l)))

@@ -205,7 +205,8 @@
         st (into {} (map (juxt :law :status)) (:laws r))]
     (is (not (:ok r)))
     (is (not-any? :prover-bug (:laws r)))
-    (doseq [l '[a-deposit-to-no-account-changes-nothing a-closed-account-is-gone]]
+    (doseq [l '[a-deposit-to-no-account-changes-nothing a-closed-account-is-gone
+                a-withdrawal-keeps-every-balance-whole an-overdraft-changes-nothing]]
       (is (= :failed (get st l)) (str l)))
     (testing "the laws the wrong code still keeps are proved of it"
       (doseq [l '[a-deposit-adds-to-the-balance a-tag-reads-back closing-leaves-the-others]]
@@ -223,3 +224,20 @@
     (is (map? (:accts (get cex 'l))) (pr-str cex))
     (is (not (contains? (:accts (get cex 'l)) (get cex 'a))) (pr-str cex))
     (is (not= (get cex 'l) (writ.spec-demo.ledger-off/deposit (get cex 'l) (get cex 'a) (get cex 'n))))))
+
+;; --- vectors of unknown length ---------------------------------------------------------
+
+(deftest laws-over-vectors-of-unknown-length-are-proved
+  (let [r (spec/check 'writ.spec-demo.waitlist-spec {:seed 1 :cache false})]
+    (doseq [l (:laws r) :when (not (str/includes? (str (:law l)) ":"))]
+      (is (= :proved (:status l)) (str (:law l) ": " (:unproved l))))))
+
+(deftest false-laws-over-vectors-are-never-proved
+  (let [r (spec/check 'writ.spec-demo.waitlist-spec {:seed 1 :cache false :target 'writ.spec-demo.waitlist-off})
+        st (into {} (map (juxt :law :status)) (:laws r))]
+    (is (not (:ok r)))
+    (is (not-any? :prover-bug (:laws r)))
+    (doseq [l '[joining-again-changes-nothing serving-takes-the-first-off cancelling-keeps-the-others-in-order]]
+      (is (= :failed (get st l)) (str l)))
+    (doseq [l '[the-first-in-line-is-next]]
+      (is (= :proved (get st l)) (str l)))))

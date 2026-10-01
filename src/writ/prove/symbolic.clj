@@ -42,6 +42,10 @@
                        shaped like its elements
     {:amap m}          a map of unknown size, of keys of type :kt and values
                        of type :vt (see 'maps of any size' below)
+    {:seqv s}          a vector of unknown length: a slice of a base array
+                       and known elements after it (see 'sequences' below)
+    {:view v}          the elements of a map of unknown size or of a vector
+                       of unknown length, filtered and mapped
     {:fn f}            a fn value: f takes a vector of values
     {:union [[g v] ...]}  v where formula g holds; the gs are disjoint
     :bottom            a throw
@@ -184,6 +188,9 @@
         (:set v) :set
         (:map v) [:map (mapv second (:map v))]
         (:amap v) [:amap (:base (:amap v))]
+        ;; a view merges only with itself
+        (:view v) [:view v]
+        (:seqv v) (let [{:keys [base off len sfx]} (:seqv v)] [:seqv base off len (count sfx)])
         (:fn v) :fn
         (contains? v :opaque) :opaque
         :else (give-up! "a value of no known shape")))
@@ -214,8 +221,12 @@
   "Merge two values of one shape under formula c."
   [st c a b]
   (cond
+    (= a b) a
     (:map a) (merge-maps st c a b)
     (:amap a) (merge-amaps st c a b)
+    (:seqv a) (let [sa (:seqv a) sb (:seqv b)]
+                {:seqv (cond-> (assoc sa :sfx (mapv #(merge-values st c %1 %2) (:sfx sa) (:sfx sb)))
+                         (not= (:kind sa) (:kind sb)) (dissoc :kind))})
     (contains? a :const) (cond-> {:const (define! st :int [:ite c (:const a) (:const b)])}
                            (and (:ctype a) (= (:ctype a) (:ctype b))) (assoc :ctype (:ctype a)))
     :else
@@ -306,6 +317,10 @@
                  seen))]
     (filterv (fn [d] (some cone (vars-of d))) defs)))
 
+(def ^:private max-prunes
+  "The most branches one goal's evaluation asks the solver about."
+  20)
+
 (def ^:private max-prune-size
   "The most definitions and path conditions a branch is pruned under."
   400)
@@ -315,13 +330,17 @@
   -- its hypotheses, its variables' facts and the definitions so far?  Asked
   of the solver, with a small budget: :unsat, :sat or :unknown."
   [st]
-  (let [{:keys [assumed path decls]} @st
+  (let [{:keys [assumed path decls prunes]} @st
         defs (relevant-defs st (concat assumed path))]
     ;; a large formula is not asked about: the solver's budget bounds its
     ;; search, not the work of reading the formula in, and pruning only
-    ;; ever buys completeness
-    (if (<= (+ (count assumed) (count defs) (count path)) max-prune-size)
-      (case (:result (try (solve/check (into [:and true] (concat assumed defs path)) decls {:budget 2000})
+    ;; ever buys completeness.  Nor are more than max-prunes questions
+    ;; asked of one goal
+    (swap! st update :prunes (fnil inc 0))
+    (if (and (<= (+ (count assumed) (count defs) (count path)) max-prune-size)
+             (< (or prunes 0) max-prunes))
+      ;; only an :unsat prunes, and one without congruence is one with it
+      (case (:result (try (solve/check (into [:and true] (concat assumed defs path)) decls {:budget 2000 :congruence false})
                           (catch clojure.lang.ExceptionInfo _ nil)))
         :unsat :unsat
         :sat :sat
@@ -389,7 +408,7 @@
 (defn- fresh-like
   "A value shaped like v, of fresh variables the solver may choose."
   [st v]
-  (when (or (:map v) (:amap v)) (give-up! "a set of maps"))
+  (when (or (:map v) (:amap v) (:seqv v) (:view v)) (give-up! "a set of collections of unknown size"))
   (if (contains? v :const)
     (cond-> {:const (fresh! st :int)} (:ctype v) (assoc :ctype (:ctype v)))
   (case (shape v)
@@ -446,13 +465,19 @@
   [es]
   (mapv (fn [i] (into [:+ 0] (map (comp one-if first) (take i es)))) (range (count es))))
 
-(declare map-equal amap-equal)
+(declare map-equal amap-equal seq-equal view-equal)
 
 (defn- equal
   "The formula for (= a b)."
   [st a b]
   (let [sa (shape a) sb (shape b)]
     (cond
+      (and (:view a) (:view b)) (view-equal st a b)
+      (or (:view a) (:view b)) (unknown! st '= [a b] :bool)
+      (and (or (:seqv a) (:seqv b))
+           (let [o (if (:seqv a) b a)] (or (:seqv o) (:vec o) (contains? o :opaque) (:set o))))
+      (seq-equal st a b)
+      (or (:seqv a) (:seqv b)) false
       (and (:amap a) (:amap b)) (amap-equal st a b)
       ;; a map of unknown size against a map of known keys, or a value of
       ;; type Any: which keys it holds is not known
@@ -610,7 +635,7 @@
         (seq? ty) (apply list (map #(if (symbol? %) (symbol (name %)) %) ty))
         :else ty))
 
-(declare amap-of)
+(declare amap-of seqv-of)
 
 (defn- template
   "The value of type ty that map base b holds at the key whose integer
@@ -640,12 +665,7 @@
        ;; the keys its record does not name, the same at the same key
        :rest (at (conj path :rest) :fn)}
       (and (seq? ty) (= 'Vec (first ty)))
-      (let [x {:opaque (at path :fn)}]
-        (swap! st #(-> %
-                       (assoc-in [:unknowns ['vector? x]] true)
-                       (assoc-in [:unknowns ['sequential? x]] true)
-                       (assoc-in [:unknowns ['map? x]] false)))
-        x)
+      (seqv-of st {:id [(:id b) path] :args args} (second ty) :vector)
       (and (seq? ty) (= 'List (first ty))) {:opaque (at path :fn)}
       (and (seq? ty) (or (= 'Map (first ty)) (kind/index-type? ty)))
       (amap-of st {:id [(:id b) path] :args args} ty)
@@ -685,6 +705,13 @@
 
 (declare map-lookup)
 
+(def ^:private max-gen
+  "How deep instances nest: a quantified test met while instantiating
+  another is one generation deeper, and only the first two are
+  instantiated -- the matching depth an SMT solver bounds, so instances
+  that make keys that make instances end."
+  1)
+
 (defn- base-at
   "[present value] of key x in the base of map m: whether the base holds x,
   and what, with the facts that come with reading it -- an index's record
@@ -702,7 +729,12 @@
                           (= 'Nat (plain-type kt)) (conj [:=> present [:<= 0 (first ks)]])
                           index (conj [:=> present (truth (lift st (fn [r] {:bool (equal st (map-lookup st r {:const (code! st index) :ctype :keyword} {:nil true}) x)}) v))]))]
               (swap! st update :defs into facts)
-              (swap! st assoc-in [:base-reads k] [present v])
+              (swap! st #(-> % (assoc-in [:base-reads k] [present v])
+                             ;; a key the map is read at: where its quantified
+                             ;; facts are instantiated, unless it was read
+                             ;; deep inside another instance
+                             (cond-> (<= (:gen % 0) max-gen)
+                               (update-in [:ground (:id base) (:args base)] (fnil conj []) x))))
               [present v])))
       [false {:nil true}])))
 
@@ -749,6 +781,327 @@
         n (count (take-while true? (map = sa sb)))
         guard (fn [g ss] (map (fn [[h k p v]] [(conj-f g h) k p v]) ss))]
     (assoc-in a [:amap :stores] (vec (concat (take n sa) (guard c (drop n sa)) (guard [:not c] (drop n sb)))))))
+
+;; --- sequences ------------------------------------------------------------------
+;;
+;; A vector of unknown length -- a variable of type (Vec T), or one a map of
+;; unknown size holds -- is an array too: a base, whose length is an
+;; uninterpreted fn of the base's arguments and whose element at index i is
+;; a value of type T built of uninterpreted fns of the arguments and i.  A
+;; value is a slice of the base, [off, off+len), and the known elements the
+;; code conj'd after it: first and rest move the slice, conj adds after it,
+;; count is the slice's length and the known elements', and some, every?,
+;; filter and the like quantify over the slice's indices as a map's over
+;; its keys.
+
+(declare witness-key run-steps)
+
+(defn- seq-len
+  "The length of sequence base b, never negative."
+  [st b]
+  (let [k [(:id b) (:args b) :len]]
+    (or (get-in @st [:base-reads k])
+        (let [args (vec (:args b))
+              l (into [:app (uf! st b [:len] :fn (count args))] args)]
+          (swap! st #(-> % (update :defs conj [:<= 0 l]) (assoc-in [:base-reads k] l)))
+          l))))
+
+(defn- seqv-of
+  "A vector of unknown length of elements of type et over base b, whole."
+  [st b et kind]
+  {:seqv {:base b :off 0 :len (seq-len st b) :sfx [] :kind kind :et et}})
+
+(defn- seq-elem
+  "The element of sequence s's base at index term j."
+  [st s j]
+  (let [{:keys [base et]} (:seqv s)
+        k [(:id base) (:args base) [:el j]]]
+    (or (get-in @st [:base-reads k])
+        (let [v (template st base [:el] et (conj (vec (:args base)) j))]
+          (swap! st #(-> % (assoc-in [:base-reads k] v)
+                         (cond-> (<= (:gen % 0) max-gen)
+                           (update-in [:ground (:id base) (:args base)] (fnil conj []) {:int j}))))
+          v))))
+
+(defn- seq-slice-has
+  "The formula for 'index x of s's base is in its slice'."
+  [s x]
+  (let [{:keys [off len]} (:seqv s)]
+    (if (contains? x :int)
+      [:and [:<= off (:int x)] [:< (:int x) [:+ off len]]]
+      false)))
+
+(defn- seq-count [s]
+  (let [{:keys [len sfx]} (:seqv s)] (fold [:+ len (count sfx)])))
+
+(defn- seq-nth
+  "[in-range value]: s's element at index term i, counting from its start."
+  [st s i]
+  (let [{:keys [off len sfx]} (:seqv s)
+        in-base (define! st :bool [:and [:<= 0 i] [:< i len]])
+        from-sfx (reduce (fn [acc k]
+                           (merge-values st (define! st :bool [:= i [:+ len k]]) (nth sfx k) acc))
+                         :bottom (reverse (range (count sfx))))
+        v (merge-values st in-base (seq-elem st s (fold [:+ off i])) from-sfx)]
+    [(define! st :bool [:and [:<= 0 i] [:< i (seq-count s)]]) v]))
+
+(defn- seq-first [st s]
+  (let [[in v] (seq-nth st s 0)] (merge-values st in v {:nil true})))
+
+(defn- seq-rest
+  "s without its first element, a seq."
+  [st s]
+  (let [{:keys [off len sfx]} (:seqv s)
+        ;; the test itself, not a name for it, so the rest of one slice is
+        ;; the same term however often it is taken
+        some? [:> len 0]]
+    (if (empty? sfx)
+      {:seqv (assoc (:seqv s) :off (fold [:+ off [:ite some? 1 0]]) :len (fold [:ite some? [:- len 1] 0]) :kind :seq)}
+      (union-of st [[some? {:seqv (assoc (:seqv s) :off (fold [:+ off 1]) :len (fold [:- len 1]) :kind :seq)}]
+                    [[:not some?] {:seqv (assoc (:seqv s) :len 0 :sfx (vec (rest sfx)) :kind :seq)}]]))))
+
+(defn- seq-last [st s]
+  (let [{:keys [off len sfx]} (:seqv s)]
+    (if (seq sfx)
+      (peek sfx)
+      (merge-values st (define! st :bool [:> len 0]) (seq-elem st s (fold [:- [:+ off len] 1])) {:nil true}))))
+
+(defn- seq-append
+  "s with the known elements xs after it."
+  [s xs]
+  (update-in s [:seqv :sfx] into xs))
+
+(defn- seq-equal
+  "The formula for (= a b) where one is a vector of unknown length: the
+  same slice of one base with equal known elements, or a vector of known
+  length element by element; else a boolean the solver chooses."
+  [st a b]
+  (let [sa (:seqv a) sb (:seqv b)]
+    (cond
+      (and sa sb (= (:base sa) (:base sb)) (= (fold (:off sa)) (fold (:off sb)))
+           (= (fold (:len sa)) (fold (:len sb))) (= (count (:sfx sa)) (count (:sfx sb))))
+      (reduce conj-f true (map (fn [x y] (if (= x y) true (truth (lift2 st (fn [p q] {:bool (equal st p q)}) x y))))
+                               (:sfx sa) (:sfx sb)))
+      (and (or sa sb) (:vec (if sa b a)))
+      (let [s (if sa a b) xs (:vec (if sa b a)) n (count xs)]
+        (reduce conj-f [:= (seq-count s) n]
+                (for [i (range n)]
+                  (let [[_ v] (seq-nth st s i)]
+                    [:or [:not [:= (seq-count s) n]]
+                     (truth (lift2 st (fn [p q] {:bool (equal st p q)}) v (nth xs i)))]))))
+      ;; two slices of one base: equal when as long and equal at every
+      ;; index -- enough, not needed, so a boolean the solver chooses that
+      ;; follows from it at a fresh index (where they differ, if anywhere),
+      ;; and that says the counts agree
+      (and sa sb (= (:base sa) (:base sb)) (empty? (:sfx sa)) (empty? (:sfx sb)))
+      (let [r (unknown! st '= [a b] :bool)
+            i (:int (witness-key st 'Int))
+            same-len [:= (:len sa) (:len sb)]
+            ea (seq-elem st a (fold [:+ (:off sa) i]))
+            eb (seq-elem st b (fold [:+ (:off sb) i]))
+            agree [:or [:not [:and [:<= 0 i] [:< i (:len sa)]]]
+                   (truth (lift2 st (fn [p q] {:bool (equal st p q)}) ea eb))]]
+        (swap! st update :defs into [[:=> (conj-f same-len agree) r] [:=> r same-len]])
+        r)
+      :else (unknown! st '= [a b] :bool))))
+
+(defn- view-equal
+  "The formula for (= a b) of two views of one vector, filtered: equal when
+  their filters agree at every element.  That is only enough, not needed,
+  so the formula is a boolean b with b following from it: at a fresh index
+  where the filters disagree, if they disagree anywhere -- the index the
+  solver may choose."
+  [st a b]
+  (let [va (:view a) vb (:view b)]
+    (if (and va vb (= (:src va) (:src vb)) (= :vals (:proj va) (:proj vb))
+             (every? #(= :filter (first %)) (concat (:steps va) (:steps vb)))
+             (:seqv (:src va)))
+      (let [r (unknown! st '= [a b] :bool)
+            src (:src va)
+            i (witness-key st 'Int)
+            e (seq-elem st src (:int i))
+            keep (fn [steps] (first (run-steps st steps true e)))
+            agree [:or [:not (seq-slice-has src i)] [:iff (keep (:steps va)) (keep (:steps vb))]]
+            sfx-agree (reduce conj-f true (for [x (:sfx (:seqv src))]
+                                            [:iff (first (run-steps st (:steps va) true x))
+                                                  (first (run-steps st (:steps vb) true x))]))]
+        (swap! st update :defs conj [:=> (conj-f agree sfx-agree) r])
+        r)
+      (unknown! st '= [a b] :bool))))
+
+;; --- walking every entry of a map of unknown size ------------------------------
+
+(declare var-value apply-fn)
+;;
+;; (every? f (vals m)), (some f (keys m)), (filter f (vals m)) and the like
+;; quantify over the keys m holds.  The vals, keys or entries of m are a view
+;; of it, a pipeline of filters and maps applied to the entry at each key;
+;; a quantified test over a view is a boolean b with two sides, as an SMT
+;; solver reads a quantifier:
+;;
+;;   - b true: the test holds at each key the formula reads the map at --
+;;     the keys a lookup, a store or another quantifier's witness names --
+;;     instantiated there once the goal is read (the array property fragment
+;;     of Bradley, Manna and Sipma, where these instances decide it)
+;;   - b false: it fails at a key w, a fresh one, the witness
+;;
+;; Both sides hold of b taken as the test's truth, with w its failing key
+;; when there is one, so a formula valid with them is valid of the code.
+
+(defn- view-of
+  "A view of the elements of src, a map of unknown size or a vector of
+  unknown length: a map's :vals, :keys or :entries, a vector's elements."
+  [src proj]
+  {:view {:src src :proj proj :steps []}})
+
+(defn- view-step [v step]
+  (update-in v [:view :steps] conj step))
+
+(defn- as-view
+  "x as a view: a map of unknown size as its entries, a vector of unknown
+  length as its elements, a view as itself."
+  [x]
+  (cond (:view x) x
+        (:amap x) (view-of x :entries)
+        (:seqv x) (view-of x :vals)
+        :else nil))
+
+(declare seq-elem seq-slice-has)
+
+(defn- run-steps
+  "[c e] after the view's filters and maps, from element e present when c."
+  [st steps c e]
+  (reduce (fn [[c e] [kind f]]
+            (case kind
+              :filter [(conj-f c (truth (apply-fn st f [e]))) e]
+              :map [c (apply-fn st f [e])]))
+          [c e] steps))
+
+(defn- view-at
+  "[c e]: whether the view has an element at key x -- a map's key, an index
+  into a vector's base -- and the element."
+  [st v x]
+  (let [{:keys [src proj steps]} (:view v)]
+    (if (:amap src)
+      (let [[pres val] (amap-lookup st src x)
+            e0 (case proj :vals val :keys x :entries {:vec [x val] :kind :vector})]
+        (run-steps st steps pres e0))
+      (run-steps st steps (seq-slice-has src x) (seq-elem st src (:int x))))))
+
+(defn- view-extra
+  "[[c e] ...]: the elements a view has that no key of its base holds -- the
+  known elements after a vector's slice -- after its filters and maps."
+  [st v]
+  (let [{:keys [src steps]} (:view v)]
+    (if (:seqv src)
+      (mapv #(run-steps st steps true %) (:sfx (:seqv src)))
+      [])))
+
+(defn- view-base
+  "The base a view's keys are keys of, and their type."
+  [v]
+  (let [src (:src (:view v))]
+    (if (:amap src)
+      [(:base (:amap src)) (:kt (:amap src))]
+      [(:base (:seqv src)) 'Int])))
+
+(defn- witness-key
+  "A fresh key of type kt."
+  [st kt]
+  (let [facts (atom [])
+        w (var-value st facts kt (:tenv @st) 'witness)]
+    (swap! st update :defs into @facts)
+    w))
+
+(defn- for-all!
+  "The formula for 'f holds of every element of view v': a boolean with its
+  failing side now, at a fresh witness key, and its holding side at each key
+  the formula reads, when quantifiers are instantiated; and f at each
+  element the view has that no key holds."
+  [st v f]
+  (let [[base kt] (view-base v)]
+    ;; where a throw must be ruled out: f run at a key of its own, apart
+    ;; from the witness, on the path where the view has an element there,
+    ;; so what it throws on counts for every key
+    (when (:total @st)
+      (let [w2 (witness-key st kt)
+            [c2 e2] (view-at st v w2)]
+        (on-path st c2 #(guarded st (fn [e] (apply-fn st f [e])) e2))))
+    (let [b (fresh! st :bool)
+          w (witness-key st kt)
+          [c e] (view-at st v w)
+          ;; evaluated before the swap below: evaluation swaps st itself
+          fails (conj-f c [:not (truth (apply-fn st f [e]))])
+          extra (reduce conj-f true (for [[c e] (view-extra st v)]
+                                      [:or [:not c] (truth (apply-fn st f [e]))]))]
+      (swap! st #(-> %
+                     (update :defs conj [:=> [:not b] fails])
+                     (cond-> (< (:gen % 0) max-gen) (update-in [:ground (:id base) (:args base)] (fnil conj []) w))
+                     (update :quants (fnil conj []) {:b b :view v :f f :gen (:gen % 0)})))
+      (conj-f b extra))))
+
+(defn- negated [st f]
+  {:fn (fn [vs] {:bool [:not (truth (apply-fn st f vs))]})})
+
+(defn- exists!
+  "The formula for 'f holds of some element of view v'."
+  [st v f]
+  [:not (for-all! st v (negated st f))])
+
+(defn- some-in!
+  "(some f v) over view v: true when f holds of some element and its
+  values are booleans, or the element itself when f is a set of one; nil
+  when it holds of none."
+  [st v f]
+  (let [ex (exists! st v f)
+        one (when (and (:set f) (= 1 (count (:elems (:set f)))) (true? (ffirst (:elems (:set f)))))
+              (second (first (:elems (:set f)))))]
+    (cond
+      (and one (or (contains? one :int) (contains? one :const)))
+      (union-of st [[ex one] [[:not ex] {:nil true}]])
+      ;; f at an element of no key in particular: the kind of value it gives
+      (let [[_ kt] (view-base v)
+            probe (apply-fn st f [(second (view-at st v (witness-key st kt)))])]
+        (every? #(or (contains? (second %) :bool) (:nil (second %))) (alts probe)))
+      (union-of st [[ex {:bool true}] [[:not ex] {:nil true}]])
+      :else (give-up! "some over a collection of unknown size, of a fn that gives other than booleans"))))
+
+(def ^:private max-instances
+  "The most instances of quantified facts one goal's formula is given."
+  200)
+
+(defn- instantiate!
+  "Each quantified test's holding side, at each key the formula reads its
+  map at, until no key is new: an instance can read the map at another
+  key, or another map.  An instance that reads what evaluation cannot is
+  left out -- one fact fewer, which only weakens what is assumed."
+  [st]
+  (let [throws (:throws @st) path (:path @st)]
+    (swap! st assoc :path [])
+    (try
+      (loop [round 0]
+        (let [todo (for [[i q] (map-indexed vector (:quants @st))
+                         :when (<= (:gen q) max-gen)
+                         :let [src (:src (:view (:view q)))
+                               [base] (view-base (:view q))
+                               keys (distinct (concat (get-in @st [:ground (:id base) (:args base)])
+                                                      (when (:amap src) (map second (:stores (:amap src))))))]
+                         x keys
+                         :when (not (contains? (get-in @st [:instanced i]) x))]
+                     [i q x])]
+          (when (and (seq todo) (< round 6) (< (:instances @st 0) max-instances))
+            (doseq [[i q x] todo :while (< (:instances @st 0) max-instances)]
+              (swap! st #(-> % (update-in [:instanced i] (fnil conj #{}) x) (update :instances (fnil inc 0))))
+              (swap! st assoc :gen (inc (:gen q)))
+              (try
+                (let [[c e] (view-at st (:view q) x)
+                      body (truth (apply-fn st (:f q) [e]))]
+                  (swap! st update :defs conj [:=> (:b q) [:=> c body]]))
+                (catch clojure.lang.ExceptionInfo ex
+                  (when-not (or (::outside (ex-data ex)) (::throws (ex-data ex))) (throw ex)))
+                (finally (swap! st assoc :gen 0))))
+            (recur (inc round)))))
+      (finally (swap! st assoc :throws throws :path path)))))
 
 ;; --- evaluating terms -------------------------------------------------------------
 
@@ -804,12 +1157,7 @@
       ;; (vector? v) is true of it and a law that only passes it along is
       ;; decided without its elements; reading them gives up, as for Any
       (and (seq? ty) (= 'Vec (first ty)))
-      (let [x {:opaque (fresh! st :int)}]
-        (swap! st #(-> %
-                       (assoc-in [:unknowns ['vector? x]] true)
-                       (assoc-in [:unknowns ['sequential? x]] true)
-                       (assoc-in [:unknowns ['map? x]] false)))
-        x)
+      (seqv-of st {:id (symbol (str "%vec" (:n (swap! st update :n inc)))) :args []} (second ty) :vector)
       ;; any seq, nil among them: opaque, so a law that only passes it
       ;; along, or a record that holds one, is decided without it; reading
       ;; it gives up
@@ -855,6 +1203,9 @@
   (let [join (fn [x y]
                (lift2 st (fn [x y]
                            (cond (and (:vec x) (:vec y)) {:vec (into (:vec x) (:vec y))}
+                                 ;; known elements after a vector of unknown length
+                                 (and (:seqv x) (:vec y)) (seq-append x (:vec y))
+                                 (and (:vec x) (empty? (:vec x)) (:seqv y)) y
                                  (and (guarded-elems x) (guarded-elems y))
                                  (ordered st (concat (guarded-elems x) (guarded-elems y)))
                                  :else (give-up! "the elements of a value of unknown length")))
@@ -865,6 +1216,7 @@
       :eapp (join (elems st env (nth e 1)) (elems st env (nth e 2)))
       :elems (lift st (fn [v]
                         (cond (:vec v) {:vec (:vec v)}
+                              (:seqv v) v
                               (:nil v) {:vec []}
                               (guarded-elems v) v
                               :else (give-up! "the elements of a value of unknown length")))
@@ -882,6 +1234,7 @@
         (contains? v :opaque) (give-up! "the elements of a value of type Any")
         (:map v) (give-up! "the order of a map's entries")
         (:amap v) (give-up! "the entries of a map of unknown size")
+        (or (:seqv v) (:view v)) (give-up! "every element of a vector of unknown length, in order")
         :else (throws!)))
 
 (defn- opaque? [v] (contains? v :opaque))
@@ -1133,6 +1486,10 @@
       identity a
       hash-set (finite-set st (map (fn [x] [true x]) args) true)
       set (lift st (fn [x] (cond (:set x) {:set (assoc (:set x) :distinct true)}
+                                 (as-view x)
+                                 (let [v (as-view x)]
+                                   {:set {:mem (fn [y] (exists! st v {:fn (fn [[e]] {:bool (equal st e y)})}))
+                                          :distinct true}})
                                  :else (finite-set st (map (fn [e] [true e]) (seq-of x)) true)))
                 a)
       ;; the integers from a up to b: a set by membership, its bounds kept,
@@ -1186,6 +1543,8 @@
                                 :elem (or (:elem sx) (:elem sy))}}))
                   a b)
       filter (lift st (fn [xs]
+                        (if (as-view xs)
+                          (view-step (as-view xs) [:filter a])
                         (let [keep? (fn [e] (truth (apply-fn st a [e])))
                               sx (cond (:set xs) (:set xs)
                                        ;; a seq of known length, filtered: which
@@ -1197,8 +1556,17 @@
                                  :elems (when (:elems sx) (vec (for [[g v] (:elems sx)] [(conj-f g (keep? v)) v])))
                                  :distinct (:distinct sx)
                                  :ordered (:ordered sx)
-                                 :elem (:elem sx)}}))
+                                 :elem (:elem sx)}})))
                 b)
+      remove (core* st 'filter [(negated st a) b])
+      complement {:fn (fn [vs] {:bool [:not (truth (apply-fn st a vs))]})}
+      comp (if (empty? args)
+             {:fn (fn [vs] (first vs))}
+             {:fn (fn [vs] (reduce (fn [acc h] (apply-fn st h [acc]))
+                                   (apply-fn st (last args) vs)
+                                   (rest (reverse args))))})
+      key (lift st (fn [e] (if (and (:vec e) (= 2 (count (:vec e)))) (first (:vec e)) (give-up! "key of a value that is not a map entry"))) a)
+      val (lift st (fn [e] (if (and (:vec e) (= 2 (count (:vec e)))) (second (:vec e)) (give-up! "val of a value that is not a map entry"))) a)
       ;; keep over a seq of known length: f's values, each there when it is
       ;; not nil
       keep (lift st (fn [xs]
@@ -1212,6 +1580,8 @@
                  b)
       (map mapcat) (lift st (fn [xs]
                               (cond
+                                (and (= 'map f) (as-view xs))
+                                (view-step (as-view xs) [:map a])
                                 (:vec xs) (if (= 'map f)
                                             {:vec (mapv #(apply-fn st a [%]) (:vec xs)) :kind :seq}
                                             {:vec (vec (mapcat #(seq-of (apply-fn st a [%])) (:vec xs))) :kind :seq})
@@ -1220,8 +1590,12 @@
                          b)
       list {:vec (vec args) :kind :seq}
       vector {:vec (vec args) :kind :vector}
-      vec (lift st (fn [x] {:vec (seq-of x) :kind :vector}) a)
-      vector? (lift st (fn [x] {:bool (kind-is? st x)}) a)
+      vec (lift st (fn [x] (cond (:seqv x) (assoc-in x [:seqv :kind] :vector)
+                                 (:view x) (assoc-in x [:view :kind] :vector)
+                                 :else {:vec (seq-of x) :kind :vector})) a)
+      vector? (lift st (fn [x] {:bool (cond (:seqv x) (if-let [k (:kind (:seqv x))] (= :vector k) (unknown! st 'vector? x :bool))
+                                            (:view x) (if-let [k (:kind (:view x))] (= :vector k) false)
+                                            :else (kind-is? st x))}) a)
       nil? (lift st (fn [x] {:bool (boolean (:nil x))}) a)
       (keyword? symbol? string? char?)
       (let [want ({'keyword? :keyword 'symbol? :symbol 'string? :string 'char? :char} f)]
@@ -1237,8 +1611,10 @@
       integer? (lift st (fn [x] {:bool (contains? x :int)}) a)
       ;; a fn value is one; a law's values are data, so no other is
       fn? (lift st (fn [x] {:bool (contains? x :fn)}) a)
-      sequential? (lift st (fn [x] {:bool (sequential-value? st x)}) a)
-      map? (lift st (fn [x] {:bool (if (:map x) true (map-value? st x))}) a)
+      sequential? (lift st (fn [x] {:bool (if (or (:seqv x) (:view x)) true (sequential-value? st x))}) a)
+      map? (lift st (fn [x] {:bool (cond (or (:map x) (:amap x)) true
+                                         (or (:seqv x) (:view x)) false
+                                         :else (map-value? st x))}) a)
       hash-map (reduce (fn [m [k v]] (map-assoc st m k v true)) {:map []} (partition 2 args))
       assoc (reduce (fn [m [k v]] (lift st (fn [mm] (if (:amap mm) (amap-store mm k true v) (map-assoc st (as-map mm) k v true))) m))
                     a (partition 2 (rest args)))
@@ -1280,15 +1656,15 @@
                                                   (as-map mm) (:map (as-map nn))))))
                                m n))
                       args))
-      keys (lift st (fn [x] (let [m (as-map x)]
+      keys (lift st (fn [x] (if (:amap x) (view-of x :keys) (let [m (as-map x)]
                               (open! m "the keys")
                               (if (empty? (:map m)) {:nil true}
-                                  (finite-set st (map (fn [[p k _]] [p k]) (:map m)) true))))
+                                  (finite-set st (map (fn [[p k _]] [p k]) (:map m)) true)))))
                  a)
-      vals (lift st (fn [x] (let [m (as-map x)]
+      vals (lift st (fn [x] (if (:amap x) (view-of x :vals) (let [m (as-map x)]
                               (open! m "the vals")
                               (if (empty? (:map m)) {:nil true}
-                                  (finite-set st (map (fn [[p _ v]] [p v]) (:map m)) false))))
+                                  (finite-set st (map (fn [[p _ v]] [p v]) (:map m)) false)))))
                  a)
       ;; distinct of a sequence of known length: each element kept unless an
       ;; earlier one equals it -- decided when the elements are, else outside
@@ -1336,6 +1712,7 @@
       some (lift st (fn [xs]
                       (cond
                         (:nil xs) {:nil true}
+                        (or (:amap xs) (:seqv xs) (:view xs)) (some-in! st (as-view xs) a)
                         (guarded-elems xs) (reduce (fn [acc [g e]]
                                                      (let [v (apply-fn st a [e])]
                                                        (merge-values st (conj-f g (truth v)) v acc)))
@@ -1345,6 +1722,7 @@
       every? (lift st (fn [xs]
                         (cond
                           (:nil xs) {:bool true}
+                          (or (:amap xs) (:seqv xs) (:view xs)) {:bool (for-all! st (as-view xs) a)}
                           (:vec xs) {:bool (reduce conj-f true (map #(truth (apply-fn st a [%])) (:vec xs)))}
                           (and (:set xs) (:elems (:set xs)))
                           {:bool (reduce conj-f true (for [[g e] (:elems (:set xs))]
@@ -1374,6 +1752,14 @@
                         (cond
                           (:map x) (map-lookup st x i (if (= 3 n) c {:nil true}))
                           (:amap x) (amap-get st x i (if (= 3 n) c {:nil true}))
+                          ;; a vector at an index: its element there; a seq has none
+                          (:seqv x) (cond
+                                      (not= :vector (:kind (:seqv x))) (if (and (= :seq (:kind (:seqv x))) true)
+                                                                         (if (= 3 n) c {:nil true})
+                                                                         (unknown-value st 'get [x i]))
+                                      (contains? i :int) (let [[in v] (seq-nth st x (:int i))]
+                                                           (merge-values st in v (if (= 3 n) c {:nil true})))
+                                      :else (if (= 3 n) c {:nil true}))
                           ;; get on nil, a number, a keyword or a list is nil
                           (or (:nil x) (contains? x :int) (contains? x :const) (contains? x :bool)
                               (and (:vec x) (= :seq (:kind x))))
@@ -1388,21 +1774,36 @@
             (give-up! "get with more than a default"))
       ;; of an opaque value -- a map, a longer collection -- the first
       ;; element is some value, its count some count
-      first (lift st (fn [x] (if (opaque? x) (unknown-value st 'first x) (or (first (seq-of x)) {:nil true}))) a)
+      first (lift st (fn [x] (cond (opaque? x) (unknown-value st 'first x)
+                                   (:seqv x) (seq-first st x)
+                                   :else (or (first (seq-of x)) {:nil true}))) a)
       ;; second is the first of the rest, next the seq of it, for a value
       ;; of unknown shape as for any
-      second (lift st (fn [x] (if (opaque? x)
+      second (lift st (fn [x] (cond
+                                (:seqv x) (core* st 'first [(seq-rest st x)])
+                                (opaque? x)
                                  (core* st 'first [(opaque-rest st x)])
+                                 :else
                                  (or (second (seq-of x)) {:nil true})))
                    a)
-      rest (lift st (fn [x] (if (opaque? x) (opaque-rest st x) {:vec (vec (rest (seq-of x))) :kind :seq})) a)
-      next (lift st (fn [x] (if (opaque? x)
-                              (core* st 'seq [(opaque-rest st x)])
+      rest (lift st (fn [x] (cond (opaque? x) (opaque-rest st x)
+                                  (:seqv x) (seq-rest st x)
+                                  :else {:vec (vec (rest (seq-of x))) :kind :seq})) a)
+      next (lift st (fn [x] (if (or (opaque? x) (:seqv x))
+                              (core* st 'seq [(if (:seqv x) (seq-rest st x) (opaque-rest st x))])
                               (let [r (vec (rest (seq-of x)))] (if (seq r) {:vec r :kind :seq} {:nil true}))))
                  a)
       ;; of an opaque value, what its count says: nil when it has none, some
       ;; other truthy value when it has some
       seq (lift st (fn [x]
+                     (cond
+                       (:seqv x) (let [none (define! st :bool [:= (seq-count x) 0])]
+                                   (union-of st [[none {:nil true}] [[:not none] (assoc-in x [:seqv :kind] :seq)]]))
+                       :else
+                     (if (or (:amap x) (:view x))
+                       (let [some? (exists! st (as-view x) {:fn (fn [_] {:bool true})})]
+                         (union-of st [[[:not some?] {:nil true}]
+                                       [some? {:opaque (unknown! st 'seq x :int)}]]))
                      (if-let [[lo hi] (:interval (:set x))]
                        (let [none [:<= hi lo]]
                          (union-of st [[none {:nil true}]
@@ -1411,10 +1812,13 @@
                        (let [none [:= (opaque-count st x) 0]]
                          (union-of st [[none {:nil true}]
                                        [[:not none] {:opaque (unknown! st 'seq x :int)}]]))
-                       (if (seq (seq-of x)) {:vec (seq-of x) :kind :seq} {:nil true}))))
+                       (if (seq (seq-of x)) {:vec (seq-of x) :kind :seq} {:nil true}))))))
                 a)
       empty? (lift st (fn [x]
                         (cond
+                          (:seqv x) {:bool [:= (seq-count x) 0]}
+                          (or (:amap x) (:view x))
+                          {:bool [:not (exists! st (as-view x) {:fn (fn [_] {:bool true})})]}
                           (:interval (:set x)) (let [[lo hi] (:interval (:set x))] {:bool [:<= hi lo]})
                           (:set x)
                           (let [es (or (:elems (:set x)) (give-up! "whether a set of unknown size is empty"))]
@@ -1424,6 +1828,7 @@
                    a)
       count (lift st (fn [x]
                        (cond
+                         (:seqv x) {:int (seq-count x)}
                          (:map x) (do (open! x "the count")
                                       {:int (into [:+ 0] (map (fn [[p _ _]] [:ite p 1 0]) (:map x)))})
                          (opaque? x) {:int (opaque-count st x)}
@@ -1444,6 +1849,11 @@
       cons (lift2 st (fn [x ys] {:vec (into [x] (seq-of ys)) :kind :seq}) a b)
       concat {:vec (vec (mapcat (fn [x] (let [v (lift st identity x)] (seq-of v))) args)) :kind :seq}
       nth (lift2 st (fn [x i]
+                      (if (:seqv x)
+                        (let [[in v] (seq-nth st x (int-of i))]
+                          (if (= 3 n)
+                            (merge-values st in v c)
+                            (do (record-throw! st [:not in]) (merge-values st in v :bottom))))
                       (let [k (int-of i)
                             xs (seq-of x)
                             past (if (= 3 n) c :bottom)]
@@ -1459,8 +1869,15 @@
                           (do (when-not (= 3 n)
                                 (record-throw! st [:not (into [:or false] (for [j (range (count xs))] [:= k j]))]))
                               (reduce (fn [acc j] (merge-values st (define! st :bool [:= k j]) (nth xs j) acc))
-                                      past (reverse (range (count xs))))))))
+                                      past (reverse (range (count xs)))))))))
                  a b)
+      last (lift st (fn [x] (cond (:seqv x) (seq-last st x)
+                                  (:nil x) {:nil true}
+                                  :else (or (last (seq-of x)) {:nil true}))) a)
+      peek (lift st (fn [x] (cond (and (:seqv x) (= :vector (:kind (:seqv x)))) (seq-last st x)
+                                  (and (:vec x) (= :vector (:kind x))) (or (peek (:vec x)) {:nil true})
+                                  (:nil x) {:nil true}
+                                  :else (give-up! "peek of a value not known to be a vector"))) a)
       (give-up! (str "`" f "`")))))
 
 (defn- folded
@@ -1490,6 +1907,7 @@
         (and (contains? v :int) (integer? (:int v))) [:int (:int v)]
         (:map v) [:map (count (:map v))]
         (:amap v) [:amap (count (:stores (:amap v)))]
+        (:seqv v) [:seqv (count (:sfx (:seqv v)))]
         :else (shape v)))
 
 (defn- opaque-in? [g] (boolean (some #{:opaque} (tree-seq coll? seq g))))
@@ -1552,6 +1970,10 @@
     ;; a map is a fn of its keys
     (and (:map fv) (<= 1 (count vs) 2)) (map-lookup st fv (first vs) (if (next vs) (second vs) {:nil true}))
     (and (:amap fv) (<= 1 (count vs) 2)) (amap-get st fv (first vs) (if (next vs) (second vs) {:nil true}))
+    ;; a set is a fn of its elements: the element when it holds it
+    (and (:set fv) (= 1 (count vs)))
+    (let [in (define! st :bool ((:mem (:set fv)) (first vs)))]
+      (union-of st [[in (first vs)] [[:not in] {:nil true}]]))
     :else (give-up! "applying a value that is not a fn")))
 
 ;; --- images of sets --------------------------------------------------------------
@@ -1655,7 +2077,9 @@
     (case (head x)
       :nil {:nil true}
       :lit (lit-value st (second x))
-      :sq (lift st (fn [v] (if (:vec v) (cond-> {:vec (:vec v)} (:vector (meta x)) (assoc :kind :vector)) v))
+      :sq (lift st (fn [v] (cond (:vec v) (cond-> {:vec (:vec v)} (:vector (meta x)) (assoc :kind :vector))
+                                 (:seqv v) (cond-> v (:vector (meta x)) (assoc-in [:seqv :kind] :vector))
+                                 :else v))
                 (elems st env (second x)))
       :if (let [c (truth (ev st env (nth x 1)))
                 c (if (or (boolean? c) (symbol? c)) c (define! st :bool c))]
@@ -1693,7 +2117,7 @@
   (try
     (let [st (state)
           facts (atom [])
-          _ (swap! st assoc :defs-of defs :tenv tenv)
+          _ (swap! st assoc :defs-of defs :tenv tenv :total total)
           occurs (reduce into (t/vars g) (map t/vars hyps))
           env (into {} (for [v (sort-by str (keys types)) :when (contains? occurs v)]
                          [v (var-value st facts (get types v) tenv v)]))
@@ -1711,6 +2135,8 @@
           ;; is one the law does not assume
           _ (swap! st assoc :throws [])
           goal (truth (ev st env g))
+          ;; the quantified facts, at the keys the formula reads
+          _ (instantiate! st)
           throws (into [:or false] (:throws @st))
           goal (if total [:and [:not throws] goal] goal)]
       {:formula [:=> (into [:and true] (concat @facts (:defs @st) hs)) goal]
