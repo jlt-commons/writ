@@ -3827,7 +3827,23 @@
                          (apply str (map #(str "\n  " %) errors))
                          "\n  Pass each step what the step before it returns; the spec names the path"
                          " the data takes.")))
-       (apply str (map #(str "\n\n" (format-failure %)) (filter #(= :failed (:status %)) laws)))
+       ;; a target fn that returned a value outside its type is the fault
+       ;; to fix first: every law that ran into it fails because of it, so
+       ;; it is said once, with one of them, and the rest named after it
+       (let [failed (filter #(= :failed (:status %)) laws)
+             breach (fn [r] (some (fn [[_ v]] (when (string? v)
+                                                (second (re-find #"Writ: `([^`]+)` returns ([^,]+), but returned" v))))
+                                  (:detail r)))
+             by-fn (group-by breach failed)]
+         (str (apply str (for [[f rs] (sort-by (comp str key) (dissoc by-fn nil))
+                               :let [ret (some (fn [r] (some (fn [[_ v]] (when (string? v)
+                                                                            (nth (re-find #"Writ: `([^`]+)` returns ([^,]+), but returned" v) 2)))
+                                                             (:detail r)))
+                                               rs)]]
+                           (str "\n\n`" f "` returns values outside " ret ": fix it first; laws that fail"
+                                " because of it: " (str/join ", " (sort (map (comp str :law) rs)))
+                                "\n" (format-failure (first (sort-by (comp count pr-str :counterexample) rs))))))
+              (apply str (map #(str "\n\n" (format-failure %)) (get by-fn nil)))))
        (apply str (for [{l :lemma :as lr} lemmas :when (= :failed (:status lr))]
                     (str "\n\n" (str/replace-first (format-failure (assoc lr :law l)) "law `" "lemma `")
                          "\n  A lemma must hold: it is a law about the code, written to help prove the spec.")))

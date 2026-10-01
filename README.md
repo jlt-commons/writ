@@ -703,6 +703,12 @@ one expression, through `and` to the clause that fails, and through
 (:loans m) => 0, (lent-to l (:id m)) => 1
 ```
 
+Every law that runs into such a value fails because of it, so the report
+names the fn first, once, with the laws it explains, and shows one of
+them in full: `` `lend` returns values outside Lib: fix it first; laws
+that fail because of it: desk:lib:lend, lending-marks-the-copy ``. The
+other failures follow.
+
 Whichever way a refinement's values are made, writ sets one of their
 integers, now and then, to a number the code or the spec mentions, or
 one either side of it, and keeps the change when the value is still one

@@ -194,3 +194,12 @@
     (is (not (:ok r)))
     (is (has? r "it breaks (= (:loans m) (lent-to l (:id m)))") (:message r))
     (is (has? r "at (:members l) key 0, m = {:id 0, :loans 0}") (:message r))))
+
+(deftest the-step-that-broke-a-value-is-reported-first-and-once
+  (let [r (spec/check 'writ.spec-demo.shelf-q-spec {:seed 1 :target 'writ.spec-demo.shelf-q-uncounted})
+        m (:message r)
+        i (str/index-of m "`lend` returns values outside Lib")]
+    (is (some? i) m)
+    (is (< i (or (str/index-of m "law `") Long/MAX_VALUE)) "before any law's own failure")
+    (is (has? r "laws that fail because of it: desk:lib:lend, lending-marks-the-copy") m)
+    (is (= 1 (count (re-seq #"it breaks \(= \(:loans m\)" m))) "the broken rule once")))
