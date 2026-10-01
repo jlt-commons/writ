@@ -265,6 +265,18 @@ report says so: `and no law tells it apart, even run there`. writ seeds
 the numbers in the code, the large ones too, so a threshold of 5000 is
 tried at 4999, 5000 and 5001.
 
+A spec may give examples beside its laws: `(example price [6000] 12000)`
+says `(price 6000)` is 12000. It is checked as a law, `example:price:1`.
+It also asks the other laws to pin `price` down there: a stand-in that
+agrees with `price` everywhere but at 6000 must break one of them, or the
+report says no law but the example says what `price` returns there. An
+example is checked against the laws, not the laws against code written
+by the same hand.
+
+The stand-ins that change the real result change it the ways a mistake
+keeps its type: a number one more or one less, a collection without its
+first or last element or with one added, a record with one field changed.
+
 Each law of the spec's own is also judged alone: one that tells none of
 the stand-ins of the fns it calls from the real ones, such as a law that
 says only `(every? nat-int? (isort xs))`, is named in the report. On its

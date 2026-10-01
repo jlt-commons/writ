@@ -748,6 +748,26 @@
    `(-register! '~(ns-name *ns*) :law '~(cond-> {:name nm :prop prop}
                                           (seq opts) (assoc :opts opts)))))
 
+(defmacro example
+  "An example of what fn f returns at given arguments:
+
+    (example price [6000] 12000)
+
+  It is checked as a law, (= (price 6000) 12000), named example:price:N.
+  It also asks of the other laws that they pin f down there: a stand-in
+  that agrees with f everywhere but at the example, where it answers
+  otherwise, must break one of them, or the report says no law says what
+  f returns there."
+  [f args out]
+  (when-not (and (simple-sym? f) (vector? args))
+    (fail! "`example` is (example f [arg ...] result), had " (pr-str (list 'example f args out))))
+  (let [spec-ns (ns-name *ns*)
+        n (inc (count (filter #(and (:example %) (= f (:fn (:example %))))
+                              (:laws (get @registry spec-ns)))))]
+    `(-register! '~spec-ns :law '~{:name (symbol (str "example:" f ":" n))
+                                   :prop (list '= (list* f args) out)
+                                   :example {:fn f :args args :out out}})))
+
 ;; --- propositions ----------------------------------------------------------
 
 (defn- head? [f s]
@@ -1520,16 +1540,36 @@
                          :kind :pass-through
                          :make (fn [_] (fn [& args] (nth args i)))}))
                     (:params sig))
-      (let [h (if (seq? ret) (first ret) ret)]
+      ;; the real result, changed a little: the mistakes that keep its
+      ;; type -- one off, an element dropped or added, a field changed
+      (let [h (if (seq? ret) (first ret) ret)
+            el (when (and (seq? ret) (contains? '#{List Vec Set} h))
+                 (try (gen/generate (type->gen (second ret) tenv) 3 seed) (catch Throwable _ nil)))]
         (case h
-          (Nat Int) [(wrap "returns one more than the real result" inc)]
+          Nat [(wrap "returns one more than the real result" inc)
+               (wrap "returns one less than the real result (one more at 0)" #(if (pos? %) (dec %) 1))]
+          Int [(wrap "returns one more than the real result" inc)
+               (wrap "returns one less than the real result" dec)]
           Bool [(wrap "returns the opposite of the real result" not)]
           String [(wrap "returns the real result with a character appended" #(str % "x"))]
-          List [(wrap "returns the real result reversed" reverse)
-                (wrap "returns the real result without its first element" rest)]
-          Vec [(wrap "returns the real result reversed" #(vec (reverse %)))
-               (wrap "returns the real result without its first element" #(vec (rest %)))]
-          (when other [(wrap "returns a different value than the real result" other)])))
+          List (cond-> [(wrap "returns the real result reversed" reverse)
+                        (wrap "returns the real result without its first element" rest)
+                        (wrap "returns the real result without its last element" #(or (butlast %) ()))]
+                 (some? el) (conj (wrap (str "returns the real result with " (pr-str el) " added") #(cons el %))))
+          Vec (cond-> [(wrap "returns the real result reversed" #(vec (reverse %)))
+                       (wrap "returns the real result without its first element" #(vec (rest %)))
+                       (wrap "returns the real result without its last element" #(vec (butlast %)))]
+                (some? el) (conj (wrap (str "returns the real result with " (pr-str el) " added") #(conj (vec %) el))))
+          Set (cond-> [(wrap "returns the real result without one of its elements" #(if (seq %) (disj % (first (sort-by pr-str %))) %))]
+                (some? el) (conj (wrap (str "returns the real result with " (pr-str el) " added") #(conj (set %) el))))
+          (if (and (map? ret) (seq ret) (every? keyword? (keys ret)))
+            ;; a record: each field, changed alone
+            (vec (for [[k kt] (sort-by (comp str key) ret)
+                       :let [o (other-value (plain kt) tenv seed)]
+                       :when o]
+                   (wrap (str "returns the real result with its " k " changed")
+                         #(if (map? %) (update % k o) %))))
+            (when other [(wrap "returns a different value than the real result" other)]))))
       (when other
         (for [[i vs] (sort-by key pins)
               :when (not (and (= 'Bool (plain (nth (:params sig) i nil)))
@@ -1717,16 +1757,33 @@
                    ;; the samples miss it, each law that calls the fn on its
                    ;; own variables is run there, so a survivor is a gap in
                    ;; the laws, not in the data
+                   ;; a stand-in off an example is judged by the other laws:
+                   ;; the example's own law rejects it, and says nothing of them
+                   judges (fn [imp] (if (= :off-example (:kind imp)) (remove #(::example (meta %)) props) props))
                    survives? (fn [imp]
                                (try
                                  (alter-var-root v (constantly ((:make imp) real)))
-                                 (and (every? #(holds-sampled? ctx % trials seed) props)
+                                 (and (every? #(holds-sampled? ctx % trials seed) (judges imp))
                                       (not (and (:args imp)
-                                                (some #(rejects-at? ctx % qnm (:args imp) 10 seed) props))))
+                                                (some #(rejects-at? ctx % qnm (:args imp) 10 seed) (judges imp)))))
                                  (catch Throwable _ false)
                                  (finally (alter-var-root v (constantly real)))))
+                   off-examples (let [ret (plain (:ret sig))
+                                      other (other-value ret (:tenv ctx) seed)]
+                                  (when other
+                                    (for [{:keys [args out]} (keep #(let [x (::example (meta %))]
+                                                                      (when (= nm (:fn x)) x))
+                                                                   props)
+                                          :let [args (vec args) wrong (other out)]
+                                          :when (not= wrong out)]
+                                      {:desc (str "agrees with the real fn except at " (pr-str (list* nm args))
+                                                  ", where it returns " (pr-str wrong) " -- the example says "
+                                                  (pr-str out) ", and no other law says what `" nm "` returns there")
+                                       :kind :off-example
+                                       :args args
+                                       :make (fn [real] (fn [& a] (if (= (vec a) args) wrong (apply real a))))})))
                    gap-desc (fn [imp]
-                              (if (:args imp)
+                              (if (and (:args imp) (not= :off-example (:kind imp)))
                                 (str (:desc imp)
                                      (if (some #(seq (calls-on-vars % qnm (count (:args imp)))) props)
                                        ", and no law tells it apart, even run there"
@@ -1735,6 +1792,7 @@
                    {survived true rejected false}
                    (group-by (comp boolean survives?)
                              (concat (impostors nm sig argn (:tenv ctx) seed pins)
+                                     off-examples
                                      (when extra (extra nm sig))))
                    ;; which laws, each on its own, tell some stand-in apart: a
                    ;; law that tells none says no more than the types do
@@ -5093,7 +5151,7 @@
                                               {:trials trials :seed seed :max-size max-size})
                           (catch Throwable ex (unwrap! wrapped) (throw ex)))
              results (try
-                       (vec (for [{:keys [name prop explain graph total lemma step-of witness guard-law]} laws
+                       (vec (for [{:keys [name prop explain graph total lemma step-of witness guard-law example]} laws
                                   :let [p (eliminate-exists (desugar prop) helpers)]]
                               (try
                                 (lw/check-prop-shape! p)
@@ -5121,6 +5179,7 @@
                                       graph (assoc :graph graph)
                                       step-of (assoc :step-of step-of)
                                       guard-law (assoc :guard-law true)
+                                      example (assoc :example example)
                                       total (assoc :total true)
                                       lemma (assoc :lemma true))))
                                 ;; a law that cannot be run (a malformed
@@ -5175,7 +5234,8 @@
                                                                          (when-not (or (:graph %) (:guard-law %)
                                                                                        (quant? (second (leading-foralls p)))
                                                                                        (head? p "exists"))
-                                                                           (:law %)))
+                                                                           (:law %))
+                                                                         ::example (:example %))
                                                         (:hypothesis-witness %)
                                                         (vary-meta assoc ::witness (:hypothesis-witness %))))
                                                    (remove #(or (:lemma %) (:step-of %)) results))

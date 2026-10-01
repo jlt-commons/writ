@@ -234,3 +234,17 @@
     (is (has? r "law `isort-gives-nats` tells none of"))
     (is (not (has? r "law `sorting:unsorted:isort` tells none of")) "a graph's own laws are not named"))
   (is (not (has? (spec/check 'writ.spec-demo.sort-spec {:seed 42}) "tells none of"))))
+
+;; --- examples beside the laws -----------------------------------------------------
+
+(deftest an-example-the-laws-do-not-pin-down-is-a-gap
+  (let [r (spec/check 'writ.spec-demo.bulk-example-spec {:seed 42})]
+    (is (not (:ok r)))
+    (is (= :evaluated (:status (law-result r 'example:price:1))))
+    (is (has? r "except at (price 6000)") (:message r)))
+  (let [r (spec/check 'writ.spec-demo.bulk-example-full-spec {:seed 42})]
+    (is (:ok r) (:message r))))
+
+(deftest an-example-checks-the-code
+  (let [r (spec/check 'writ.spec-demo.bulk-example-full-spec {:seed 42 :target 'writ.spec-demo.bulk-off})]
+    (is (= :failed (:status (law-result r 'example:price:1))))))

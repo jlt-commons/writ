@@ -443,6 +443,9 @@ of the algorithm (that is the code).
 - **Measure with the spec's own helpers.** Never use the implementation's
   fns to judge its results. A law that checks the code with the code is
   circular.
+- **Give an example or two.** `(example price [6000] 12000)` is checked as
+  a law, and the other laws must pin `price` down at 6000 as well: a
+  stand-in that agrees everywhere but there must break one of them.
 - **Reach for the strong kinds of law.** Hughes ("How to Specify It!",
   2019) planted eight bugs in a search tree: laws that only said the
   result was valid caught three; every bug was caught by each of these:

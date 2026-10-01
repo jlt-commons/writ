@@ -14,7 +14,7 @@
   (forall [x Any!] (same (wrap x) [:v x])))
 
 (law a-tag-keeps-its-value
-  (forall [k Keyword, x Any!] (same (second (tag k x)) x)))
+  (forall [k Keyword, x Any!] (same (tag k x) [k x])))
 
 (law a-wrapped-nan-is-the-same-as-one (same (wrap ##NaN) [:v ##NaN]))
 
