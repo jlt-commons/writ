@@ -504,6 +504,13 @@ for the hypothesis, and the stand-ins are judged at them too. Only when
 the solver finds none either does the law fail with "the hypothesis never
 held".
 
+A set of integers made by `range` is read as an interval: its members,
+its count, whether it is empty, and its intersection with another range
+come from its bounds, so a law like "two spans overlap when their unit
+sets meet", `(seq (set/intersection (set (range s1 e1)) (set (range s2
+e2))))`, is proved or refuted by the solver. A spec's alias of
+`clojure.set` is read as `clojure.set`.
+
 An `exists` over a `Nat` or `Int` whose body is bounds on it, with the
 spec's own one-expression helpers read through, means the bounds meet:
 `(exists [t Nat] (and (<= s1 t) (< t e1) (<= s2 t) (< t e2)))` holds

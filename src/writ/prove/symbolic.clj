@@ -929,6 +929,39 @@
       set (lift st (fn [x] (cond (:set x) {:set (assoc (:set x) :distinct true)}
                                  :else (finite-set st (map (fn [e] [true e]) (seq-of x)) true)))
                 a)
+      ;; the integers from a up to b: a set by membership, its bounds kept,
+      ;; so whether it is empty, its count, and its meeting with another
+      ;; range are read off them
+      range (if (<= 1 n 2)
+              (let [[lo hi] (if (= 1 n) [{:int 0} a] [a b])]
+                (lift2 st (fn [l h]
+                            (let [l (int-of l) h (int-of h)]
+                              {:set {:mem (fn [x] (if (contains? x :int) [:and [:<= l (int-of x)] [:< (int-of x) h]] false))
+                                     :interval [l h]
+                                     :distinct true}}))
+                       lo hi))
+              (give-up! "range with a step"))
+      set-intersection (if (= 2 n)
+                         (lift2 st (fn [x y]
+                                     (when-not (and (:set x) (:set y)) (give-up! "intersection of values that are not sets"))
+                                     (let [sx (:set x) sy (:set y)]
+                                       {:set (cond-> {:mem (fn [e] [:and ((:mem sx) e) ((:mem sy) e)]) :distinct true}
+                                               (and (:interval sx) (:interval sy))
+                                               (assoc :interval [[:max (first (:interval sx)) (first (:interval sy))]
+                                                                 [:min (second (:interval sx)) (second (:interval sy))]]))}))
+                                a b)
+                         (give-up! "intersection of other than two sets"))
+      (set-union set-difference)
+      (if (= 2 n)
+        (lift2 st (fn [x y]
+                    (when-not (and (:set x) (:set y)) (give-up! (str (name f) " of values that are not sets")))
+                    (let [sx (:set x) sy (:set y)]
+                      {:set {:mem (if (= 'set-union f)
+                                    (fn [e] [:or ((:mem sx) e) ((:mem sy) e)])
+                                    (fn [e] [:and ((:mem sx) e) [:not ((:mem sy) e)]]))
+                             :distinct true}}))
+               a b)
+        (give-up! (str (name f) " of other than two sets")))
       contains? (lift2 st (fn [sv x]
                             (cond (:set sv) {:bool ((:mem (:set sv)) x)}
                                   (:map sv) (do (named! sv x)
@@ -1136,14 +1169,19 @@
       ;; of an opaque value, what its count says: nil when it has none, some
       ;; other truthy value when it has some
       seq (lift st (fn [x]
+                     (if-let [[lo hi] (:interval (:set x))]
+                       (let [none [:<= hi lo]]
+                         (union-of st [[none {:nil true}]
+                                       [[:not none] {:opaque (unknown! st 'seq x :int)}]]))
                      (if (opaque? x)
                        (let [none [:= (opaque-count st x) 0]]
                          (union-of st [[none {:nil true}]
                                        [[:not none] {:opaque (unknown! st 'seq x :int)}]]))
-                       (if (seq (seq-of x)) {:vec (seq-of x) :kind :seq} {:nil true})))
+                       (if (seq (seq-of x)) {:vec (seq-of x) :kind :seq} {:nil true}))))
                 a)
       empty? (lift st (fn [x]
                         (cond
+                          (:interval (:set x)) (let [[lo hi] (:interval (:set x))] {:bool [:<= hi lo]})
                           (:set x)
                           (let [es (or (:elems (:set x)) (give-up! "whether a set of unknown size is empty"))]
                             {:bool [:not (into [:or false] (map first es))]})
@@ -1155,6 +1193,7 @@
                          (:map x) (do (open! x "the count")
                                       {:int (into [:+ 0] (map (fn [[p _ _]] [:ite p 1 0]) (:map x)))})
                          (opaque? x) {:int (opaque-count st x)}
+                         (:interval (:set x)) (let [[lo hi] (:interval (:set x))] {:int [:max 0 [:- hi lo]]})
                          (:set x)
                          (let [{:keys [elems distinct]} (:set x)]
                            (when-not elems (give-up! "the count of a set of unknown size"))

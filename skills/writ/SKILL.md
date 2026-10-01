@@ -472,9 +472,13 @@ of the algorithm (that is the code).
   model means with arithmetic, `and`/`or`, records and `exists` over
   bounds rather than building sets or ranges: "two spans overlap when some
   unit t is in both", `(exists [t Nat] (and (holds? a t) (holds? b t)))`,
-  is proved or refuted, where `(seq (set/intersection (units a) (units
-  b)))` is only tested. "tested, not proved" in a report is a prompt to
-  restate the law this way.
+  is proved or refuted. So is a set of integers made by `range`, and its
+  intersection, union and difference with another, its count and its
+  emptiness: `(seq (set/intersection (set (range s1 e1)) (set (range s2
+  e2))))` is read as two intervals meeting. `frequencies`, most string fns
+  and `conj` onto a value not known to be a vector are not read, and a law
+  through them is only tested. "tested, not proved" in a report is a
+  prompt to restate the law in what the prover reads.
 
 writ rejects a spec that does not do this:
 

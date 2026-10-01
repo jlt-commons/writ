@@ -51,19 +51,19 @@
 
 (deftest a-law-only-tested-gets-more-trials
   (doseq [seed (range 1 11)]
-    (let [r (spec/check 'writ.spec-demo.span-spec {:seed seed :target 'writ.spec-demo.span-naive})]
+    (let [r (spec/check 'writ.spec-demo.span-count-spec {:seed seed :target 'writ.spec-demo.span-naive :prove false})]
       (is (= :failed (:status (law-result r 'overlap-is-a-shared-unit))) (str "seed " seed))))
-  (let [l (law-result (spec/check 'writ.spec-demo.span-spec {:seed 1}) 'overlap-is-a-shared-unit)]
+  (let [l (law-result (spec/check 'writ.spec-demo.span-count-spec {:seed 1}) 'overlap-is-a-shared-unit)]
     (is (= :tested (:status l)))
     (is (< 100 (:trials l)))))
 
 (deftest a-failure-in-the-extra-trials-replays-from-its-seed
-  (let [miss? #(= :tested (:status (law-result (spec/check 'writ.spec-demo.span-spec
+  (let [miss? #(= :tested (:status (law-result (spec/check 'writ.spec-demo.span-count-spec
                                                              {:seed % :target 'writ.spec-demo.span-naive
                                                               :more-trials false})
                                                'overlap-is-a-shared-unit)))
         s (first (filter miss? (range 1 40)))
-        l (law-result (spec/check 'writ.spec-demo.span-spec {:seed s :target 'writ.spec-demo.span-naive})
+        l (law-result (spec/check 'writ.spec-demo.span-count-spec {:seed s :target 'writ.spec-demo.span-naive})
                       'overlap-is-a-shared-unit)]
     (is (some? s) "some seed misses it in the first hundred trials")
     (is (= :failed (:status l)))
@@ -278,3 +278,15 @@
   (let [r (spec/check 'writ.spec-demo.sort-held-spec {:seed 42})]
     (is (not (:ok r)))
     (is (has? r ":record"))))
+
+;; --- ranges as sets ---------------------------------------------------------------
+
+(deftest a-law-over-ranges-as-sets-is-proved
+  (let [r (spec/check 'writ.spec-demo.span-spec {:seed 1})]
+    (is (= :proved (:status (law-result r 'overlap-is-a-shared-unit))) (:message r)))
+  (doseq [seed [1 2 3]]
+    (let [l (law-result (spec/check 'writ.spec-demo.span-spec
+                                    {:seed seed :trials 1 :more-trials false :target 'writ.spec-demo.span-naive})
+                        'overlap-is-a-shared-unit)]
+      (is (= :failed (:status l)))
+      (is (= :solver (:found-by l))))))

@@ -1249,6 +1249,12 @@
                     (contains? target-publics f) (symbol (name target) (name f))
                     (contains? spec-interns f) (symbol (name spec-ns) (name f))
                     :else f)
+              ;; an alias of the spec's, set/intersection, by its namespace's
+              ;; own name, which the prover knows
+              (and (symbol? f) (namespace f))
+              (if-let [a (try (get (ns-aliases (the-ns spec-ns)) (symbol (namespace f))) (catch Throwable _ nil))]
+                (symbol (str (ns-name a)) (name f))
+                f)
               (and (seq? f) (= 'quote (first f))) f
               (and (seq? f) (quant? f))
               (let [[q [x t] body] f] (list q [x t] (walk body (conj bound x))))

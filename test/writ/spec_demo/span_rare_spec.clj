@@ -17,7 +17,10 @@
 
 (defn units [s] (set (range (:start s) (:end s))))
 
+(defn shared? [a b]
+  (boolean (some #(= 2 (val %)) (frequencies (concat (range (:start a) (:end a)) (range (:start b) (:end b)))))))
+
 (law back-to-back-spans-of-one-length-overlap-where-they-share-a-unit
   (forall [a Span, b Span]
     (=> (and (pos? (count (units a))) (= (count (units a)) (count (units b))) (= (:end a) (:start b)))
-        (= (overlaps? a b) (boolean (seq (set/intersection (units a) (units b))))))))
+        (= (overlaps? a b) (shared? a b)))))
