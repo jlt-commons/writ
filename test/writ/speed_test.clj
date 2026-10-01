@@ -77,3 +77,22 @@
         runs (repeatedly 5 #(spec/holds ctx p {}))]
     (is (= :fail (:result (first runs))))
     (is (apply = runs))))
+
+;; --- laws run in parallel ---------------------------------------------------------
+
+(def ^:private par-map @#'spec/par-map)
+
+(deftest a-parallel-map-keeps-order-and-rethrows
+  (is (= (map inc (range 100)) (par-map inc (range 100))))
+  (is (= [] (par-map inc [])))
+  (is (thrown-with-msg? Exception #"boom"
+        (par-map #(if (= 7 %) (throw (ex-info "boom" {})) %) (range 20)))))
+
+(deftest laws-checked-in-parallel-come-out-as-they-do-one-at-a-time
+  (doseq [s '[writ.spec-demo.sort-spec writ.spec-demo.total-spec writ.spec-demo.gap-spec]]
+    (let [view (fn [r] [(:ok r) (mapv #(select-keys % [:law :status :lemmas :proof :counterexample]) (:laws r))
+                        (:gaps r)])
+          par (spec/check s {:seed 42 :cache false})
+          one (spec/check s {:seed 42 :cache false :parallel false})]
+      (is (:ok par) (:message par))
+      (is (= (view one) (view par)) (str s)))))

@@ -1216,7 +1216,8 @@ stage, for example while a spec is still being written, and
 `:prove false` skips the prover. `:require` sets the evidence every law
 needs, in place of the spec's own. `:proof` names the proof namespace
 (`false` for none), and `:fuel` gives the prover more rewrites per
-attempt.
+attempt. The laws are tested, given more trials and proved over one thread
+a processor; `:parallel false` runs them one at a time.
 
 Proofs are cached in `.writ-cache/`, one file per spec. Each law's result
 is kept under a key of everything its proof can rest on: the law, its
@@ -1441,8 +1442,10 @@ a value of its return type. Then `(insert x t)` is known to be a `Tree`.
 A set, a map or a fn has no recognizer, and takes only a variable of its
 own type. An `Int` return is proved an integer, and a `Nat` return is then
 proved not negative, so `(size t)` is an integer term the arithmetic
-works with, known to be at least 0. The passes repeat until nothing new is proved, so a
-law may cite one that comes later in the spec. A law that is only tested
+works with, known to be at least 0. The laws are proved in passes, the
+laws of a pass at once, each citing the laws proved in the passes before
+it. The passes repeat until nothing new is proved, so a law may cite one
+that comes later in the spec. A law that is only tested
 is never cited. The report names what each proof used:
 
 ```

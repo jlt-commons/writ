@@ -1325,6 +1325,33 @@
   ([t tenv] (sample t tenv 10))
   ([t tenv n] (gen/sample (type->gen t tenv) n)))
 
+(def ^:dynamic *parallel*
+  "Whether par-map may spread its work over threads: false under a check
+  with {:parallel false}, and inside a par-map's own work, so a nested one
+  runs on the thread it is given."
+  true)
+
+(defn- par-map
+  "(mapv f xs), the calls spread over one thread a processor.  The results
+  keep the order of xs; the first exception a call threw, in that order,
+  is thrown again."
+  [f xs]
+  (let [xs (vec xs)
+        n (min (count xs) (.availableProcessors (Runtime/getRuntime)))]
+    (if (or (not *parallel*) (< n 2))
+      (mapv f xs)
+      (let [next-i (atom -1)
+            out (object-array (count xs))
+            work (fn []
+                   (binding [*parallel* false]
+                     (loop []
+                       (let [i (swap! next-i inc)]
+                         (when (< i (count xs))
+                           (aset out i (try {:ok (f (nth xs i))} (catch Throwable e {:thrown e})))
+                           (recur))))))]
+        (run! deref (doall (repeatedly n #(future (work)))))
+        (mapv #(if (contains? % :thrown) (throw (:thrown %)) (:ok %)) out)))))
+
 (defn- draw
   "The value of type t drawn at size and seed.  The draw is deterministic,
   so a check makes it once: (:draws ctx), an atom, keeps it for every
@@ -4706,11 +4733,12 @@
                         :else (recur more r)))))))
             open? (fn [r] (and (:prop r) (contains? #{:tested :failed} (:status r))
                                (not (:proof r)) (not (:unproved-final r))))
-            pass (fn [[rs lemmas]]
-                   (reduce
-                     (fn [[out lemmas] r]
+            ;; one law in a pass: its result, and the lemma it becomes
+            ;; when it is proved.  It cites only the laws proved before the
+            ;; pass began, so the laws of a pass are tried at once
+            step (fn [lemmas r]
                        (if-not (open? r)
-                         [(conj out r) lemmas]
+                         [r nil]
                          ;; a proved law that says the same is no proof of this one
                          ;; from the code, so it is left out of the search; when
                          ;; the search fails, that law is the proof
@@ -4725,18 +4753,18 @@
                                                      ", and it threw on no test (that it never throws is not proved)"))})]
                            (cond
                              (and (:proved pr) (= :tested (:status r)))
-                             [(conj out (cond-> (-> r (dissoc :unproved :stuck)
+                             [(cond-> (-> r (dissoc :unproved :stuck)
                                                     (cond-> (and (:explain opts) (:attempts pr)) (assoc :attempts (:attempts pr)))
                                                     (assoc :status :proved :proof (:summary pr)))
                                           (:cached pr) (assoc :cached true)
                                           (:replayed pr) (assoc :replayed true)
-                                          (seq (:lemmas pr)) (assoc :lemmas (:lemmas pr))))
-                              (conj lemmas {:name (:law r) :prop (:prop r)})]
+                                          (seq (:lemmas pr)) (assoc :lemmas (:lemmas pr)))
+                              {:name (:law r) :prop (:prop r)}]
 
                              ;; a hypothesis no test met: where the solver
                              ;; finds the law false, running it there says so
                              (and (:no-hypothesis r) (not (:proved pr)) (refuted ctx r (:counterexample pr)))
-                             [(conj out (dissoc (refuted ctx r (:counterexample pr)) :no-hypothesis)) lemmas]
+                             [(dissoc (refuted ctx r (:counterexample pr)) :no-hypothesis) nil]
 
                              ;; a law whose hypothesis never held would be
                              ;; true of every input and test nothing; the
@@ -4744,34 +4772,35 @@
                              ;; input that meets the hypothesis
                              (and (:proved pr) (:no-hypothesis r))
                              (if-let [w (hypothesis-witness r)]
-                               [(conj out (cond-> (-> r (dissoc :counterexample :detail :no-hypothesis)
+                               [(cond-> (-> r (dissoc :counterexample :detail :no-hypothesis)
                                                       (assoc :status :proved
                                                              :hypothesis-witness w
                                                              :proof (str (:summary pr) ", and its hypothesis held at "
                                                                          (str/join " and " (map pr-str w))
                                                                          ", which the solver found: no generated input met it")))
                                             (:cached pr) (assoc :cached true)
-                                            (seq (:lemmas pr)) (assoc :lemmas (:lemmas pr))))
-                                (conj lemmas {:name (:law r) :prop (:prop r)})]
-                               [(conj out r) lemmas])
+                                            (seq (:lemmas pr)) (assoc :lemmas (:lemmas pr)))
+                                {:name (:law r) :prop (:prop r)}]
+                               [r nil])
 
                              (and (:proved pr) (not (thrown? r)))
-                             [(conj out (assoc r :prover-bug true :proof (:summary pr))) lemmas]
+                             [(assoc r :prover-bug true :proof (:summary pr)) nil]
 
                              (and (= :tested (:status r)) (refuted ctx r (:counterexample pr)))
-                             [(conj out (refuted ctx r (:counterexample pr))) lemmas]
+                             [(refuted ctx r (:counterexample pr)) nil]
 
                              (= :tested (:status r))
-                             [(conj out (cond-> (assoc r :unproved (:reason pr))
+                             [(cond-> (assoc r :unproved (:reason pr))
                                           (seq (:stuck pr)) (assoc :stuck (:stuck pr))
                                           (and (:explain opts) (:attempts pr)) (assoc :attempts (:attempts pr))
                                           ;; outside the model: no lemma changes that
                                           (str/starts-with? (str (:reason pr)) "outside")
-                                          (assoc :unproved-final true)))
-                              lemmas]
-                             :else [(conj out (assoc r :unproved-final true)) lemmas]))))
-                     [[] lemmas]
-                     rs))]
+                                          (assoc :unproved-final true))
+                              nil]
+                             :else [(assoc r :unproved-final true) nil]))))
+            pass (fn [[rs lemmas]]
+                   (let [steps (par-map #(step lemmas %) rs)]
+                     [(mapv first steps) (into lemmas (keep second steps))]))]
         ;; the proved laws of the specs this one uses come first
         (loop [[rs lemmas] (pass [results (into (vec (::imports opts)) (:lemmas assumed))])]
           (let [[rs2 lemmas2] (pass [rs lemmas])]
@@ -4780,7 +4809,7 @@
                   (let [rs2 (mapv #(dissoc % :unproved-final) rs2)
                         rs2 (if (false? (:prove opts))
                               rs2
-                              (mapv #(or (when (and (= :tested (:status %)) (not (:lemma %)))
+                              (par-map #(or (when (and (= :tested (:status %)) (not (:lemma %)))
                                            (or (try (at-the-boundary %) (catch Throwable _ nil))
                                                (try (turn-clauses %) (catch Throwable _ nil))))
                                          %)
@@ -5319,6 +5348,8 @@
       (recur (into (vec (rest todo)) (remove seen (get g x))) (into seen (get g x)))
       seen)))
 
+(declare check*)
+
 (defn check
   "Check a spec namespace against its target (or opts :target).  Returns a
   report map; :ok says whether everything held and :message explains any
@@ -5332,9 +5363,15 @@
   the prover over writ.prove/default-config, for a bench to try) and
   :explain (true
   gives each law the prover tried its :attempts, and the report the
-  goals a tested law's proof got stuck on)."
+  goals a tested law's proof got stuck on) and :parallel (false runs the
+  laws one at a time, on the calling thread)."
   ([spec-ns] (check spec-ns {}))
   ([spec-ns opts]
+   (binding [*parallel* (and *parallel* (not (false? (:parallel opts))))]
+     (check* spec-ns opts))))
+
+(defn- check*
+  [spec-ns opts]
    (when (and (contains? opts :record) (not (string? (:record opts))))
      (fail! "`check` :record is a path to write the report to, had: " (pr-str (:record opts))))
    (let [{:keys [trials seed max-size] :or {trials 100 max-size 50}} opts
@@ -5395,8 +5432,9 @@
                                                       {:trials trials :seed seed :max-size max-size})
                                   (catch Throwable ex (unwrap! wrapped) (throw ex))))
              results (timed :tests #(try
-                       (vec (for [{:keys [name prop explain graph total lemma step-of witness guard-law example]} laws
-                                  :let [p (eliminate-exists (desugar prop) helpers)]]
+                       (par-map
+                         (fn [{:keys [name prop explain graph total lemma step-of witness guard-law example]}]
+                            (let [p (eliminate-exists (desugar prop) helpers)]
                               (try
                                 (lw/check-prop-shape! p)
                                 (let [qp (qualify p #{} publics interns target spec-ns
@@ -5433,6 +5471,7 @@
                                 (catch Throwable ex
                                   {:law name :status :failed :counterexample {} :detail []
                                    :error (or (ex-message ex) (str ex))}))))
+                         laws)
                        (finally (unwrap! wrapped))))
              level (or (:require opts) (:require e) :tested)
              _ (check-level! "`check`" level)
@@ -5452,7 +5491,7 @@
                          ;; tests alone, so it gets more of them
                          ((fn [rs] (timed :more-trials
                                           #(let [wrapped (wrap! e)]
-                                             (try (mapv (fn [r] (more-trials ctx r opts)) rs)
+                                             (try (par-map (fn [r] (more-trials ctx r opts)) rs)
                                                   (finally (unwrap! wrapped)))))))
                          (require-evidence
                            ;; a lemma is there to be cited, so it must be proved
@@ -5641,7 +5680,7 @@
              (assoc r :message (format-report (assoc r :machines machine-results
                                                      :graphs graph-results
                                                      ::explain (:explain opts)))
-                    :timings (timings))))))))
+                    :timings (timings)))))))
 (defn check!
   "`check`, throwing with the report's message when anything fails."
   ([spec-ns] (check! spec-ns {}))
