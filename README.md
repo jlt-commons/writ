@@ -939,6 +939,20 @@ the step's arguments in its order: `{[lend Nat Nat] {:to #{:lib} :when
 lendable?}}`. The laws then use the same `lendable?`, so the guard is
 said once, and each clause of its `and` still gets its own law.
 
+A step whose outcome depends on its inputs may give its cases, each with
+its own guard, targets and frame:
+
+```clojure
+:edges {:open {[withdraw Nat] [{:to #{:open} :when covered? :changes [:balance]}
+                               {:to #{:overdrawn} :when short? :changes [:status :fee]}]}}
+```
+
+Each case has its own laws, `bank:open:withdraw#1` and `#2` with their
+frames. Where no case holds the step is refused and keeps the state,
+`bank:open:withdraw:refused`. No two cases may hold at once,
+`bank:open:withdraw:cases`, so a spec that leaves a withdrawal of
+exactly the balance to both fails at that input.
+
 A graph may also give a model of its states: `:model {:view items
 :steps {enqueue put, dequeue take-one}}`, where `items` is a spec fn
 from a state to a simpler value, and each step fn named has a spec fn

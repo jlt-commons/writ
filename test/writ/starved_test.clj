@@ -290,3 +290,24 @@
                         'overlap-is-a-shared-unit)]
       (is (= :failed (:status l)))
       (is (= :solver (:found-by l))))))
+
+;; --- a step of several guarded cases ----------------------------------------------
+
+(deftest each-case-of-a-step-has-its-own-laws
+  (let [r (spec/check 'writ.spec-demo.bank-spec {:seed 1})
+        names (set (map :law (:laws r)))]
+    (is (:ok r) (:message r))
+    (is (every? names '[bank:open:withdraw#1 bank:open:withdraw#2
+                        bank:open:withdraw#1:frame bank:open:withdraw#2:frame
+                        bank:open:withdraw:cases])
+        (pr-str (sort names)))))
+
+(deftest a-case-is-held-to-its-own-frame
+  (let [r (spec/check 'writ.spec-demo.bank-spec {:seed 1 :target 'writ.spec-demo.bank-greedy})]
+    (is (= :failed (:status (law-result r 'bank:open:withdraw#1:frame))) (:message r))
+    (is (not= :failed (:status (law-result r 'bank:open:withdraw#2:frame))))))
+
+(deftest cases-that-overlap-are-shown-where
+  (let [r (spec/check 'writ.spec-demo.bank-overlap-spec {:seed 1})]
+    (is (= :failed (:status (law-result r 'bank:open:withdraw:cases))) (:message r))
+    (is (has? r "cases 1 and 2 of withdraw from open both hold"))))

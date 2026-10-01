@@ -450,8 +450,11 @@
   [where {:keys [actors edges] :as m}]
   (assoc m :edges
          (into {} (for [[from es] edges]
-                    [from (into {} (for [[k tos] es]
-                                     [k (if-not (and (map? tos) (contains? tos :by))
+                    [from (into {} (for [[k tos0] es]
+                                     [k (if (vector? tos0)
+                                          (mapv #(get-in (by->when where (assoc m :edges {from {k %}})) [:edges from k]) tos0)
+                                          (let [tos tos0]
+                                          (if-not (and (map? tos) (contains? tos :by))
                                           tos
                                           (let [edge (str where ": the edge " (pr-str from) " " (pr-str k))
                                                 by (:by tos)
@@ -479,7 +482,7 @@
                                                            (and (seq? own) (= 'and (first own))) (concat own [test])
                                                            :else (list 'and own test))]
                                             (cond-> (assoc tos :when (list 'fn ps body))
-                                              w (assoc :own-when w))))]))]))))
+                                              w (assoc :own-when w))))))]))]))))
 
 (def ^:private projections
   "clojure.core fns an edge may use to take a state out of a tuple state:
@@ -543,10 +546,11 @@
              (update m0 :edges
                      (fn [es] (into {} (for [[from e] es]
                                          [from (if (map? e)
-                                                 (into {} (for [[k tos] e]
-                                                            [k (if (and (map? tos) (symbol? (:when tos)))
-                                                                 (update tos :when #(named-when k %))
-                                                                 tos)]))
+                                                 (into {} (for [[k tos] e
+                                                                :let [named (fn [c] (if (and (map? c) (symbol? (:when c)))
+                                                                                      (update c :when #(named-when k %))
+                                                                                      c))]]
+                                                            [k (if (vector? tos) (mapv named tos) (named tos))]))
                                                  e)]))))
              m0)
         m (if (and (map? m0) (map? (:edges m0)) (every? map? (vals (:edges m0))))
@@ -595,7 +599,17 @@
         (known! "an edge" from)
         (when-not (map? es)
           (fail! where ": the edges from " (pr-str from) " must be a map of [fn ArgType ...] to states"))
-        (doseq [[k tos] es]
+        (doseq [[k tos0] es
+                ;; a step of cases, each a map with its own :when
+                :let [_ (when (vector? tos0)
+                          (when-not (and (seq tos0)
+                                         (every? #(and (map? %) (contains? % :when) (contains? % :to)
+                                                       (not (contains? % :else)))
+                                                 tos0))
+                            (fail! where ": the edge " (pr-str from) " " (pr-str k) " gives a vector of cases;"
+                                   " each is a map with its own :when and :to, and no :else -- where no case"
+                                   " holds the step is refused and keeps the state")))]
+                tos (if (vector? tos0) tos0 [tos0])]
           (when-not (and (vector? k) (simple-sym? (first k)))
             (fail! where ": an edge from " (pr-str from) " is keyed [fn ArgType ...], had " (pr-str k)))
           (when (< 1 (count (filter #{'_} (rest k))))
@@ -2503,14 +2517,20 @@
   parameters (where `_` marks it, else first), the edge's key as written,
   and its targets in the order the graph lists its states."
   [[_ m]]
-  (for [[from es] (:edges m), [[f & args :as k] v] es
-        :let [tos (if (map? v) (:to v) v)]]
+  ;; a step of several cases, [{:when ... :to ...} ...], is an edge per
+  ;; case, each knowing every case's guard and targets
+  (for [[from es] (:edges m), [[f & args :as k] v0] es
+        [i v] (if (vector? v0) (map-indexed vector v0) [[nil v0]])
+        :let [tos (if (map? v) (:to v) v)
+              in-order #(filterv (set %) (keys (:states m)))]]
     (cond-> {:from from :f f :args (vec (remove #{'_} args)) :key k
              :pos (or (first (keep-indexed #(when (= '_ %2) %1) args)) 0)
-             :tos (filterv (set tos) (keys (:states m)))}
+             :tos (in-order tos)}
       (and (map? v) (:when v)) (assoc :guard (:when v) :else (or (:else v) :keep)
                                       :by (:by v) :own-when (:own-when v))
-      (and (map? v) (:changes v)) (assoc :changes (:changes v)))))
+      (and (map? v) (:changes v)) (assoc :changes (:changes v))
+      i (assoc :case (inc i)
+               :cases (mapv (fn [c] {:guard (:when c) :tos (in-order (:to c))}) v0)))))
 
 (defn- insert-at [v i x] (vec (concat (take i v) [x] (drop i v))))
 
@@ -2591,7 +2611,7 @@
   test that is an `and`, one per clause says it fails while the others
   hold, so each clause rules out something of its own."
   [[gname m :as g] refs invs]
-  (vec (for [{:keys [from f args tos pos guard else changes by own-when]} (graph-edges g)
+  (vec (for [{:keys [from f args tos pos guard else changes by own-when case cases]} (graph-edges g)
              :let [ty #(get (:states m) %)
                    ref-of #(let [t (plain (ty %))] (when (symbol? t) (get refs t)))
                    refined? (every? ref-of tos)
@@ -2633,13 +2653,15 @@
                           (when (and entered? (seq hs)) (if (next hs) (cons 'and hs) (first hs))))
                    pre (cond (and held test) (list 'and held test) held held :else test)
                    under (fn [p] (if pre (list '=> pre p) p))
-                   edge (str gname ":" (name from) ":" f)
+                   step-name (str gname ":" (name from) ":" f)
+                   edge (str step-name (when case (str "#" case)))
+                   sfx (when case (str "#" case))
                    tested (get-in m [:tested from])
                    off-proof #(cond-> % tested (assoc :opts {:require :tested :because tested}))]
              law (concat
                    (when landing?
                      (cons (off-proof
-                             {:name (symbol edge) :oid (str "edge." gname "." (name from) "." f)
+                             {:name (symbol edge) :oid (str "edge." gname "." (name from) "." f sfx)
                               :prop (list 'forall binders (under (lands tos)))
                               :explain (str "a " f " from " (name from)
                                             (when test " that passes its guard")
@@ -2666,7 +2688,7 @@
                            paths (mapv #(if (vector? %) (mapv at %) %) changes)]
                        [(off-proof
                           {:name (symbol (str edge ":frame"))
-                           :oid (str "frame." gname "." (name from) "." f)
+                           :oid (str "frame." gname "." (name from) "." f sfx)
                            :prop (list 'forall binders
                                        (under (if (every? keyword? paths)
                                                 (list '= (list* 'dissoc call paths) (list* 'dissoc v paths))
@@ -2681,15 +2703,44 @@
                      (let [view (get-in m [:model :view])]
                        [(off-proof
                           {:name (symbol (str edge ":model"))
-                           :oid (str "model." gname "." (name from) "." f)
+                           :oid (str "model." gname "." (name from) "." f sfx)
                            :prop (list 'forall binders
                                        (under (list '= (list view call) (list* model-step (list view v) avs))))
                            :explain (str "a " f " from " (name from) " must do to its " view " what "
                                          model-step " does")
                            :graph gname})]))
+                   ;; a step of cases: once, that where no case holds it is
+                   ;; refused, and that no two cases hold at once
+                   (when (= 1 case)
+                     (let [tests (mapv #(guard-of (:guard %) call-args) cases)
+                           pairs (for [i (range (count tests)) j (range (inc i) (count tests))] [i j])]
+                       (cons (off-proof
+                               {:name (symbol (str step-name ":refused"))
+                                :oid (str "refused." gname "." (name from) "." f)
+                                ;; some case holds, or the state is kept: an
+                                ;; implication from "no case holds" starves
+                                ;; when the cases cover every input
+                                :prop (list 'forall binders
+                                            (let [p (list 'or (cons 'or tests) (list '= call v))]
+                                              (if held (list '=> held p) p)))
+                                :explain (str "when none of its cases holds, a " f " from " (name from)
+                                              " must leave it as it was")
+                                :graph gname
+                                :total true})
+                             (for [[i j] pairs]
+                               {:name (symbol (str step-name ":cases" (when (next pairs) (str "." (inc i) "." (inc j)))))
+                                :oid (str "cases." gname "." (name from) "." f "." (inc i) "." (inc j))
+                                :prop (list 'forall binders
+                                            (let [p (list 'not (list 'and (nth tests i) (nth tests j)))]
+                                              (if held (list '=> held p) p)))
+                                :explain (str "cases " (inc i) " and " (inc j) " of " f " from " (name from)
+                                              " both hold: a step is in one case at most, or which it takes is"
+                                              " left to the code")
+                                ;; about the spec's guards, not the code
+                                :graph gname :guard-law true}))))
                    (when guard
                      (concat
-                       (when (or (= :keep else) (ref-of else) (inv? else))
+                       (when (and (nil? case) (or (= :keep else) (ref-of else) (inv? else)))
                          [(off-proof
                             {:name (symbol (str edge ":refused"))
                              :oid (str "refused." gname "." (name from) "." f)
@@ -2708,7 +2759,7 @@
                              :graph gname
                              :total true})])
                        [{:name (symbol (str edge ":when"))
-                         :oid (str "guard." gname "." (name from) "." f)
+                         :oid (str "guard." gname "." (name from) "." f sfx)
                          :prop (list 'exists binders test)
                          :explain (str "the guard of " f " from " (name from) " never holds: no generated "
                                        (name from) " and arguments pass it, so the step can never be taken")
@@ -2716,7 +2767,7 @@
                        (let [cs (guard-clauses test)]
                          (for [[i c] (map-indexed vector cs)]
                            {:name (symbol (str edge ":when." (inc i)))
-                            :oid (str "guard." gname "." (name from) "." f "." (inc i))
+                            :oid (str "guard." gname "." (name from) "." f sfx "." (inc i))
                             :prop (list 'exists binders
                                         (list* 'and (list 'not c) (concat (take i cs) (drop (inc i) cs))))
                             :explain (str "clause " (pr-str (nth (guard-clauses (nth guard 2)) i))
@@ -2950,7 +3001,7 @@
                                               (gen/generate (gen/elements pool) 30 sd))]
                                       (if (and (some? x) (conforms? t x tenv)) x (gen/generate g 30 sd))))))
                           args))))
-          call-edge (fn [v {:keys [f args pos guard]} r search?]
+          call-edge (fn [v {:keys [f args pos guard cases]} r search?]
                       (let [ev #(binding [*ns* (the-ns spec-ns)] (eval %))
                             call-args (fn [avs] (insert-at avs pos (list 'quote v)))
                             passes? #(try (boolean (ev (qualify-form (guard-of guard (call-args %)))))
@@ -2963,7 +3014,13 @@
                                   (draw v args r 0))
                             call (qualify-form (apply list f (call-args avs)))]
                         (try (cond-> {:v (ev call)}
-                               guard (assoc :passes (passes? avs)))
+                               guard (assoc :passes (passes? avs))
+                               ;; a step of cases: the targets of whichever case holds
+                               cases (assoc :case-tos
+                                            (some (fn [c] (when (try (boolean (ev (qualify-form (guard-of (:guard c) (call-args avs)))))
+                                                                     (catch Throwable _ false))
+                                                            (:tos c)))
+                                                  cases)))
                              (catch Throwable ex {:thrown (ex-message ex)}))))
           conforms (fn [s v] (try (conforms? (get (:states m) s) v tenv) (catch Throwable _ false)))
           ;; how many steps each state is from s, by the graph's edges
@@ -2989,8 +3046,10 @@
                       {:path path}
                       (let [r (+ (or seed 0) (* 7919 i) (* 31 k))
                             {:keys [tos guard else] :as e} (nth es (pick (count es) r))
-                            {nv :v thrown :thrown passes :passes} (call-edge v e r (boolean toward))
-                            refused (and guard (not passes))
+                            {nv :v thrown :thrown passes :passes case-tos :case-tos} (call-edge v e r (boolean toward))
+                            ;; a case refused is no refusal when another case holds
+                            refused (and guard (not passes) (not case-tos))
+                            tos (if (and guard (not passes) case-tos) case-tos tos)
                             _ (when guard
                                 (swap! refusals update [state (:f e)]
                                        (fnil #(update % (if refused :refused :passed) inc)

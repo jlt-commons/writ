@@ -180,6 +180,10 @@ failures: a law over every input may already answer one.
   {:to #{:lib} :changes [[:copies (arg 2)] [:members (arg 1)]]}}` says
   `lend` touches only that copy and that member, in place of a law per
   step saying it.
+- A step of cases: `{[withdraw Nat] [{:to #{:open} :when covered?
+  :changes [:balance]} {:to #{:overdrawn} :when short?}]}`. Each case has
+  its own laws (`g:s:f#1`, `#2`); no case holding refuses the step; and
+  `g:s:f:cases` says no two cases hold at once.
 - `:model {:view f :steps {step model-step ...}}`: f takes a state to a
   simpler value, and each model-step does to that value what the step
   does, taking the step's other arguments. Each such edge gets the law
