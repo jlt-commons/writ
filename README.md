@@ -257,6 +257,14 @@ at positive and negative `n` but not at 0:
 the spec does not pin down `sign`: every law still holds when it has 1 for 0 in (cond (pos? n) 1 (neg? n) -1 :else 0), and it differs from the real fn on {n 0}
 ```
 
+A mutant the samples do not tell apart is run again at the input that
+shows it: each law that calls the fn on its own variables is run with
+them set to that input. If one fails there, the mutant is rejected, and
+the miss was the data's. A survivor is then a gap in the laws, and the
+report says so: `and no law tells it apart, even run there`. writ seeds
+the numbers in the code, the large ones too, so a threshold of 5000 is
+tried at 4999, 5000 and 5001.
+
 Passing this check is necessary for a good spec, not sufficient.
 
 ## Writing a spec

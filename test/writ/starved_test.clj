@@ -145,3 +145,20 @@
           l (law-result r 'owing-less-than-500-and-not-banned-may-borrow)]
       (is (= :failed (:status l)) (str "seed " seed ": " (:message r)))
       (is (= :solver (:found-by l))))))
+
+;; --- a mutant that survives: the data, or the laws -------------------------------
+
+(defn- mutants-of [r f]
+  (first (filter #(= f (:fn %)) (:rejected r))))
+
+(deftest a-mutant-told-apart-only-past-the-generators-reach-is-tried-there
+  (let [r (spec/check 'writ.spec-demo.bulk-spec {:seed 42 :cache false :adequacy :mutants})]
+    (is (:ok r) (:message r))
+    (is (some #(and (= :mutant (:kind %)) (str/includes? (:desc %) "5000"))
+              (:rejected (mutants-of r 'price)))
+        (pr-str (mutants-of r 'price)))))
+
+(deftest a-mutant-no-law-tells-apart-is-a-gap-in-the-laws
+  (let [r (spec/check 'writ.spec-demo.bulk-weak-spec {:seed 42 :cache false :adequacy :mutants})]
+    (is (not (:ok r)))
+    (is (has? r "no law tells it apart, even run there"))))

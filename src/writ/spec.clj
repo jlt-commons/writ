@@ -1541,10 +1541,11 @@
             run (fn [g args] (try {:ok (apply g args)} (catch Throwable _ ::threw)))
             differ (fn [g]
                      (when gens
-                       (first (for [i (range 60)
+                       (first (for [i (range 200)
                                     :let [args (map-indexed (fn [j gn] (gen/generate gn (mod i 20) (+ seed i (* 31 j)))) gens)]
                                     :when (not= (run real args) (run g args))]
-                                (zipmap (map-indexed (fn [i _] (nth params i (symbol (str "arg" i)))) (:params sig)) args)))))]
+                                (with-meta (zipmap (map-indexed (fn [i _] (nth params i (symbol (str "arg" i)))) (:params sig)) args)
+                                  {::args (vec args)})))))]
         (->> (mutation-sites (vec body))
              (take (* 4 budget))
              (keep (fn [[path x desc]]
@@ -1557,6 +1558,7 @@
                            (when d
                              {:desc (str desc ", and it differs from the real fn on " (pr-str d))
                               :kind :mutant
+                              :args (::args (meta d))
                               :make (fn [_] g)}))))))
              (take budget))))))
 
@@ -1590,6 +1592,49 @@
              ;; the inputs the solver found to meet a hypothesis no sample meets
              (every? #(not= :fail (:result (holds ctx* body %))) (::witness (meta prop))))))))
 
+(defn- calls-on-vars
+  "The calls of fn qnm in law prop whose arguments are each a variable
+  the law binds or an expression of none: where the law can be run at
+  given arguments of qnm.  Each as {var arg-position}."
+  [prop qnm n]
+  (let [[bs body] (leading-foralls prop)
+        vars (set (map first bs))
+        free? (fn [x] (not-any? vars (tree-seq coll? seq x)))]
+    (vec (distinct
+           (for [c (tree-seq coll? seq body)
+                 :when (and (seq? c) (= qnm (first c)) (= n (count (rest c))))
+                 :let [args (vec (rest c))]
+                 :when (every? #(or (contains? vars %) (free? %)) args)
+                 :let [pos (into {} (keep-indexed (fn [i a] (when (contains? vars a) [a i]))) args)]
+                 :when (seq pos)]
+             pos)))))
+
+(defn- rejects-at?
+  "Does law prop fail when run with fn qnm's arguments set to args, at a
+  call that takes them straight from the law's variables, the law's
+  other variables drawn n times?  A pinned value its variable's type
+  does not take is no input of the law."
+  [ctx prop qnm args n seed]
+  (let [[bs body] (leading-foralls prop)
+        vars (mapv first bs)
+        types (into {} bs)
+        ctx* (assoc ctx :vars vars)]
+    (boolean
+      (some (fn [pos]
+              (let [pinned (into {} (for [[v i] pos] [v (nth args i)]))]
+                (when (every? (fn [[v x]] (conforms? (get types v) x (:tenv ctx))) pinned)
+                  (let [rest-bs (remove #(contains? pinned (first %)) bs)
+                        gens (mapv #(type->gen (second %) (:tenv ctx)) rest-bs)]
+                    (some (fn [i]
+                            (= :fail (:result
+                                       (holds ctx* body
+                                              (merge (zipmap (map first rest-bs)
+                                                             (map-indexed (fn [j g] (gen/generate g (mod i 30) (+ seed i (* 7919 j))))
+                                                                          gens))
+                                                     pinned)))))
+                          (range n))))))
+            (calls-on-vars prop qnm (count args))))))
+
 (defn- adequacy
   "Swap each signed public fn for its impostors, one at a time, and run
   every law against each.  Returns, per fn, [{:fn f :laws n :rejected
@@ -1602,20 +1647,33 @@
                    argn (vec (take (count (:params sig)) (first (:arglists (meta v)))))
                    qnm (symbol (name target) (name nm))
                    pins (pinned-args props qnm (count (:params sig)))
+                   ;; a mutant is told apart at the input that shows it: when
+                   ;; the samples miss it, each law that calls the fn on its
+                   ;; own variables is run there, so a survivor is a gap in
+                   ;; the laws, not in the data
                    survives? (fn [imp]
                                (try
                                  (alter-var-root v (constantly ((:make imp) real)))
-                                 (every? #(holds-sampled? ctx % trials seed) props)
+                                 (and (every? #(holds-sampled? ctx % trials seed) props)
+                                      (not (and (:args imp)
+                                                (some #(rejects-at? ctx % qnm (:args imp) 10 seed) props))))
                                  (catch Throwable _ false)
                                  (finally (alter-var-root v (constantly real)))))
+                   gap-desc (fn [imp]
+                              (if (:args imp)
+                                (str (:desc imp)
+                                     (if (some #(seq (calls-on-vars % qnm (count (:args imp)))) props)
+                                       ", and no law tells it apart, even run there"
+                                       (str ", and no law calls `" nm "` on its own variables, so none could be run there")))
+                                (:desc imp)))
                    {survived true rejected false}
                    (group-by (comp boolean survives?)
                              (concat (impostors nm sig argn (:tenv ctx) seed pins)
                                      (when extra (extra nm sig))))]]
          {:fn nm
           :laws (count (filter #(some #{qnm} (tree-seq coll? seq %)) props))
-          :rejected (mapv #(dissoc % :make) rejected)
-          :survivors (mapv :desc survived)})))
+          :rejected (mapv #(dissoc % :make :args) rejected)
+          :survivors (mapv gap-desc survived)})))
 
 ;; --- the target's source -----------------------------------------------------
 
@@ -3132,7 +3190,7 @@
     (let [forms (remove #(head? % "ns") (mapcat second (lib-pairs target)))
           xs (tree-seq coll? seq forms)
           kws (set (filter #(and (keyword? %) (nil? (namespace %))) xs))
-          ints (set (filter #(and (integer? %) (<= -1000 % 1000)) xs))
+          ints (set (filter #(and (integer? %) (<= -1000000000 % 1000000000)) xs))
           near (set (mapcat (fn [n] [(dec n) n (inc n)]) ints))]
       {'Keyword kws
        'Int near
@@ -3165,7 +3223,21 @@
                         (range (- int-window) (inc int-window)))]
         (cond
           (empty? ok)
-          (fail! "refinement `" name "` has no value between " (- int-window) " and " int-window)
+          ;; none near 0: a range past the window, such as (<= 5000 q).
+          ;; Its values are found from one that is in it -- the spec's own
+          ;; numbers first, where such a range starts, then powers of ten
+          ;; and two -- and drawn around it
+          (let [cands (concat (::spec-ints tenv)
+                              (for [k (range 3 19), sgn [1 -1], d [0 1 -1]] (+ d (* sgn (long (Math/pow 10 k)))))
+                              (for [k (range 11 62), sgn [1 -1]] (* sgn (bit-shift-left 1 k))))
+                anchor (first (filter #(try (and (conforms? b % tenv) (pred %)) (catch Throwable _ false)) cands))]
+            (if-not anchor
+              (fail! "refinement `" name "` has no value between " (- int-window) " and " int-window
+                     ", nor at any number the spec names or any power of ten or two")
+              (gen/frequency [[1 (gen/return anchor)]
+                              [3 (gen/such-that #(try (and (conforms? b % tenv) (pred %)) (catch Throwable _ false))
+                                                (gen/fmap #(+ anchor %) gen/small-integer)
+                                                (such-that-opts name))]])))
           (or (= (first ok) (- int-window)) (= (peek ok) int-window))
           (gen/such-that pred (type->gen b tenv) (such-that-opts name))
           :else
