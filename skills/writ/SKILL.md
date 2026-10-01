@@ -443,6 +443,19 @@ of the algorithm (that is the code).
 - **Measure with the spec's own helpers.** Never use the implementation's
   fns to judge its results. A law that checks the code with the code is
   circular.
+- **Reach for the strong kinds of law.** Hughes ("How to Specify It!",
+  2019) planted eight bugs in a search tree: laws that only said the
+  result was valid caught three; every bug was caught by each of these:
+  - a postcondition: what the result is, `(= (lookup k (insert k v t)) v)`;
+  - a metamorphic law: how results of related inputs relate,
+    `(= (count (union a b)) (count (union b a)))`;
+  - a model: the code agrees with a simple reference,
+    `(= (to-list (insert k v t)) (sorted-insert k v (to-list t)))`;
+  - an inductive set: laws for each way a value is built, which together
+    leave one answer.
+  A law that says only what kind of value comes back, `(seqable? (isort
+  xs))`, is one the report names: it "tells none of `isort`'s stand-ins
+  from the real fn".
 - **Write the model so the prover can read it.** A proved law holds for
   every input; a tested one only for the inputs generated, and a bug on
   one input in a hundred gets past the tests now and then. Say what a

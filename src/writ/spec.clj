@@ -1735,9 +1735,28 @@
                    {survived true rejected false}
                    (group-by (comp boolean survives?)
                              (concat (impostors nm sig argn (:tenv ctx) seed pins)
-                                     (when extra (extra nm sig))))]]
+                                     (when extra (extra nm sig))))
+                   ;; which laws, each on its own, tell some stand-in apart: a
+                   ;; law that tells none says no more than the types do
+                   about (filter #(some #{qnm} (tree-seq coll? seq %)) props)
+                   credited (reduce (fn [done imp]
+                                      (let [open (remove #(or (nil? (::law (meta %))) (contains? done (::law (meta %))))
+                                                         about)]
+                                        (if (empty? open)
+                                          (reduced done)
+                                          (try
+                                            (alter-var-root v (constantly ((:make imp) real)))
+                                            (into done (keep #(when-not (holds-sampled? ctx % trials seed)
+                                                                (::law (meta %)))
+                                                             open))
+                                            (catch Throwable _ done)
+                                            (finally (alter-var-root v (constantly real)))))))
+                                    #{} rejected)]]
          {:fn nm
-          :laws (count (filter #(some #{qnm} (tree-seq coll? seq %)) props))
+          :laws (count about)
+          :about (set (keep #(::law (meta %)) about))
+          :credited credited
+          :impostors (+ (count rejected) (count survived))
           :rejected (mapv #(dissoc % :make :args) rejected)
           :survivors (mapv gap-desc survived)})))
 
@@ -3705,7 +3724,7 @@
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
   [{:keys [ok target spec static laws gaps unspecified rejected calls flows machines proof graphs graph-missing
-           lemmas off-graph uses problems questions]
+           lemmas off-graph uses problems questions silent]
     contras ::contradictions assumed ::assumed
     ambiguous ::ambiguous explain ::explain}]
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
@@ -3719,6 +3738,11 @@
                 (str "; tested, not proved: " (str/join ", " (map :law ts))
                      (when-let [n (some->> (seq (keep :trials ts)) (apply min))]
                        (str " (each on at least " n " inputs)"))))))
+       ;; a law that, on its own, tells no wrong answer from the right one
+       (apply str (for [{:keys [law fns]} silent]
+                    (str "\n  law `" law "` tells none of " (str/join ", " (map #(str "`" % "`'s") fns))
+                         " stand-ins from the real fn: on its own it holds of a constant or a"
+                         " truncated answer too. Say what the result must be")))
        ;; a clause a test saw come out one way only tests one side of it
        (apply str (for [{:keys [law one-sided trials evidence]} laws
                         :when (= :test evidence)
@@ -5146,7 +5170,13 @@
                                 ;; a step's witness is found by search, so a stand-in
                                 ;; that misses it may only be unlucky: it pins nothing
                                 anns (concat (keep #(when-let [p (:prop %)]
-                                                      (cond-> p (:hypothesis-witness %)
+                                                      (cond-> (vary-meta p assoc ::law
+                                                                         ;; an exists never rejects a stand-in
+                                                                         (when-not (or (:graph %) (:guard-law %)
+                                                                                       (quant? (second (leading-foralls p)))
+                                                                                       (head? p "exists"))
+                                                                           (:law %)))
+                                                        (:hypothesis-witness %)
                                                         (vary-meta assoc ::witness (:hypothesis-witness %))))
                                                    (remove #(or (:lemma %) (:step-of %)) results))
                                              (for [m (:machines e)]
@@ -5258,6 +5288,14 @@
                            :proof (proof-coverage results level)
                            :machines (mapv #(dissoc % :shown :step) machine-results)
                            :rejected (mapv #(select-keys % [:fn :laws :rejected]) per-fn)
+                           ;; a law of the spec's own that, on its own, tells no
+                           ;; stand-in of any fn it calls from the real one
+                           :silent (let [with (filter #(pos? (or (:impostors %) 0)) per-fn)
+                                         credited (set (mapcat :credited with))]
+                                     (vec (for [l (sort-by str (distinct (mapcat :about with)))
+                                                :when (not (contains? credited l))]
+                                            {:law l :fns (vec (sort-by str (keep #(when (contains? (:about %) l) (:fn %))
+                                                                                 with)))})))
                            :off-graph (vec (sort-by str (remove (step-fns e)
                                                                 (filter #(contains? publics %) (keys anns)))))
                            :ok (and sound? (empty? gaps) (empty? (:unspecified base))

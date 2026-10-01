@@ -265,6 +265,11 @@ report says so: `and no law tells it apart, even run there`. writ seeds
 the numbers in the code, the large ones too, so a threshold of 5000 is
 tried at 4999, 5000 and 5001.
 
+Each law of the spec's own is also judged alone: one that tells none of
+the stand-ins of the fns it calls from the real ones, such as a law that
+says only `(every? nat-int? (isort xs))`, is named in the report. On its
+own it holds of a constant answer too.
+
 Passing this check is necessary for a good spec, not sufficient.
 
 ## Writing a spec

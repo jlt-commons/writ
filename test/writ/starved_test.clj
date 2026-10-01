@@ -225,3 +225,12 @@
     (is (:ok r) (:message r))
     (is (contains? names 'desk:lib:lend:refused))
     (is (contains? names 'desk:lib:lend:when.1) "the helper's own clauses, each its own law")))
+
+;; --- a law that tells no stand-in apart -------------------------------------------
+
+(deftest a-law-that-rejects-no-stand-in-is-named
+  (let [r (spec/check 'writ.spec-demo.typey-spec {:seed 1})]
+    (is (has? r "law `isort-gives-a-seq` tells none of"))
+    (is (has? r "law `isort-gives-nats` tells none of"))
+    (is (not (has? r "law `sorting:unsorted:isort` tells none of")) "a graph's own laws are not named"))
+  (is (not (has? (spec/check 'writ.spec-demo.sort-spec {:seed 42}) "tells none of"))))
