@@ -1325,6 +1325,19 @@
   ([t tenv] (sample t tenv 10))
   ([t tenv n] (gen/sample (type->gen t tenv) n)))
 
+(defn- draw
+  "The value of type t drawn at size and seed.  The draw is deterministic,
+  so a check makes it once: (:draws ctx), an atom, keeps it for every
+  stand-in and law that asks for the same one."
+  [ctx t size seed]
+  (let [make #(gen/generate (type->gen t (:tenv ctx)) size seed)]
+    (if-let [cache (:draws ctx)]
+      (let [k [t size seed]]
+        (if-let [e (find @cache k)]
+          (val e)
+          (let [v (make)] (swap! cache assoc k v) v)))
+      (make))))
+
 ;; --- evaluating laws ---------------------------------------------------------
 
 (defn- qualify
@@ -1411,7 +1424,11 @@
   "A nested quantifier: sampled over a handful of generated values."
   [ctx [q [x t] body] env]
   (let [ctx* (update ctx :vars conj x)
-        vals (gen/sample (type->gen t (:tenv ctx)) 20)
+        g (type->gen t (:tenv ctx))
+        ;; drawn from the values around it, so a check with a seed
+        ;; replays the same samples
+        base (hash env)
+        vals (map #(gen/generate g % (+ base %)) (range 20))
         rs (map #(holds ctx* body (assoc env x %)) vals)]
     (if (= "forall" (name q))
       (or (first (filter #(= :fail (:result %)) rs)) {:result :pass})
@@ -1759,7 +1776,7 @@
             differ (fn [g]
                      (when gens
                        (first (for [i (range 200)
-                                    :let [args (map-indexed (fn [j gn] (gen/generate gn (mod i 20) (+ seed i (* 31 j)))) gens)]
+                                    :let [args (map-indexed (fn [j t] (draw ctx t (mod i 20) (+ seed i (* 31 j)))) (:params sig))]
                                     :when (not= (run real args) (run g args))]
                                 (with-meta (zipmap (map-indexed (fn [i _] (nth params i (symbol (str "arg" i)))) (:params sig)) args)
                                   {::args (vec args)})))))]
@@ -1794,17 +1811,16 @@
 
       :else
       (let [vars (mapv first bs)
-            ctx* (assoc ctx :vars vars)
-            gens (mapv #(type->gen (second %) (:tenv ctx)) bs)]
+            ctx* (assoc ctx :vars vars)]
         ;; each variable its own seed: with one seed, two variables of a
         ;; type get the same value every time, and a law relating them
         ;; never sees them differ
         (and (every? (fn [i]
                        (not= :fail (:result (holds ctx* body
                                                    (zipmap vars (map-indexed
-                                                                  (fn [j g] (gen/generate g (mod i 30)
+                                                                  (fn [j [_ t]] (draw ctx t (mod i 30)
                                                                                           (+ seed i (* 7919 j))))
-                                                                  gens))))))
+                                                                  bs))))))
                      (range n))
              ;; the inputs the solver found to meet a hypothesis no sample meets
              (every? #(not= :fail (:result (holds ctx* body %))) (::witness (meta prop))))))))
@@ -1840,14 +1856,13 @@
       (some (fn [pos]
               (let [pinned (into {} (for [[v i] pos] [v (nth args i)]))]
                 (when (every? (fn [[v x]] (conforms? (get types v) x (:tenv ctx))) pinned)
-                  (let [rest-bs (remove #(contains? pinned (first %)) bs)
-                        gens (mapv #(type->gen (second %) (:tenv ctx)) rest-bs)]
+                  (let [rest-bs (remove #(contains? pinned (first %)) bs)]
                     (some (fn [i]
                             (= :fail (:result
                                        (holds ctx* body
                                               (merge (zipmap (map first rest-bs)
-                                                             (map-indexed (fn [j g] (gen/generate g (mod i 30) (+ seed i (* 7919 j))))
-                                                                          gens))
+                                                             (map-indexed (fn [j [_ t]] (draw ctx t (mod i 30) (+ seed i (* 7919 j))))
+                                                                          rest-bs))
                                                      pinned)))))
                           (range n))))))
             (calls-on-vars prop qnm (count args))))))
@@ -5360,7 +5375,9 @@
                                                                       (plain (:ret s)))
                                                        k)))
                                anns)
-             ctx {:ev (evaluator spec-ns) :tenv (assoc tenv ::seeds (code-seeds target))}
+             ctx {:ev (evaluator spec-ns) :tenv (assoc tenv ::seeds (code-seeds target))
+                  ;; the values drawn with a fixed seed, made once a check
+                  :draws (atom {})}
              ;; the spec's own one-expression fns, which an exists over
              ;; an integer's bounds is read through
              helpers (into {} (for [f (book/read-forms (source-url spec-ns))

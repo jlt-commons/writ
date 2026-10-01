@@ -354,6 +354,13 @@ by default, and a `Nat` between 0 and `max-size`. A law quantified over
 matter, such as a return code's sentinels, anchor each one with a law that
 names it: `(law eof-sentinel (forall [e Bool] (= :eof (classify-read -127 e))))`.
 
+A collection is at most `max-size` long, and one inside another collection
+at most its square root, 7 by default, so a map of vectors stays near the
+size rather than its square; the numbers inside it still range over the
+whole size. A map, set or index whose key can take only a few values (a
+`Bool`, an integer refinement such as `(< t 3)`, a data type of constants)
+gets no more entries than its key can tell apart.
+
 ### Data
 
 A data value is a vector headed by its constructor keyword: `[:Leaf]`,

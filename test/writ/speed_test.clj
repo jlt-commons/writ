@@ -58,3 +58,22 @@
     (is (every? #(<= (count %) 7) qs))
     (is (some #(>= (count %) 5) qs))
     (is (some #(> % 20) (apply concat qs)))))
+
+;; --- draws made with a fixed seed are made once ----------------------------------
+
+(def ^:private draw @#'spec/draw)
+
+(deftest a-draw-with-the-same-type-size-and-seed-is-made-once
+  (let [tenv (spec/type-env 'writ.spec-demo.racks-spec)
+        ctx {:tenv tenv :draws (atom {})}
+        a (draw ctx 'Racks 30 7)]
+    (is (identical? a (draw ctx 'Racks 30 7)))
+    (is (= a (draw {:tenv tenv} 'Racks 30 7)))
+    (is (not= a (draw ctx 'Racks 30 8)))))
+
+(deftest a-nested-quantifier-draws-the-same-values-each-time
+  (let [ctx {:tenv {} :vars [] :ev (fn [vars term env] (apply (eval (list 'fn (vec vars) term)) (map env vars)))}
+        p '(forall [x Nat] (< x 3))
+        runs (repeatedly 5 #(spec/holds ctx p {}))]
+    (is (= :fail (:result (first runs))))
+    (is (apply = runs))))
