@@ -113,7 +113,7 @@
 ;; --- a hypothesis a test seldom meets ---------------------------------------------
 
 (deftest a-rare-hypothesis-gets-more-trials-before-it-fails
-  (let [law 'a-seven-unit-span-overlaps-what-it-shares-a-unit-with
+  (let [law 'back-to-back-spans-of-one-length-overlap-where-they-share-a-unit
         starved? #(:no-hypothesis (law-result (spec/check 'writ.spec-demo.span-rare-spec
                                                           {:seed % :more-trials false :adequacy false})
                                               law))
@@ -127,3 +127,21 @@
 (deftest a-law-whose-hypothesis-seldom-held-is-called-thin
   (let [r (spec/check 'writ.spec-demo.span-rare-spec {:seed 1 :adequacy false})]
     (is (has? r "is thinly tested: its hypothesis held in"))))
+
+;; --- the code's numbers, in a built value -----------------------------------------
+
+(deftest a-built-value-meets-the-codes-boundaries
+  (doseq [seed [1 2 3]]
+    (let [r (spec/check 'writ.spec-demo.lending-spec
+                        {:seed seed :target 'writ.spec-demo.lending-lax :more-trials false :prove false})
+          l (law-result r 'owing-less-than-the-block-may-borrow)]
+      (is (= :failed (:status l)) (str "seed " seed ": " (:message r)))
+      (is (= 500 (get-in l [:counterexample 'm :fines]))))))
+
+(deftest a-computed-term-is-tried-at-its-boundary
+  (doseq [seed [1 2 3]]
+    (let [r (spec/check 'writ.spec-demo.owing-spec
+                        {:seed seed :trials 1 :more-trials false :target 'writ.spec-demo.owing-lax})
+          l (law-result r 'owing-less-than-500-and-not-banned-may-borrow)]
+      (is (= :failed (:status l)) (str "seed " seed ": " (:message r)))
+      (is (= :solver (:found-by l))))))

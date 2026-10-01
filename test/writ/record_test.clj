@@ -203,7 +203,10 @@
     (is (= :tested (:status (law-result r 'an-award-is-its-keys))) (:message r))))
 
 (deftest the-solver-finds-a-record-no-test-does
-  (let [r (spec/check 'writ.spec-demo.member-spec {:seed 42 :target 'writ.spec-demo.member-big :cache false})]
+  ;; one trial: generation reaches the code's 1000 now and then, so the
+  ;; tests are kept from it and the solver must find it
+  (let [r (spec/check 'writ.spec-demo.member-spec {:seed 42 :target 'writ.spec-demo.member-big :cache false
+                                                   :trials 1 :more-trials false})]
     (is (not (:ok r)))
     (is (str/includes? (:message r) "found by the solver") (:message r))
     (is (some #(< 1000 (parse-long (second %))) (re-seq #":points (\d+)" (:message r))) (:message r))))

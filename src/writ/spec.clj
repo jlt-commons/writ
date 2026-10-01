@@ -3204,22 +3204,55 @@
           (gen/such-that ok? built (such-that-opts name)))
         (gen/such-that pred (type->gen base (assoc tenv ::bias (::bias-of-refine tenv))) (such-that-opts name))))))
 
+(defn- int-leaves
+  "Paths to the integers inside v, through maps and vectors: their
+  values, never a map's keys."
+  [v path]
+  (cond
+    (integer? v) [path]
+    (map? v) (mapcat (fn [[k x]] (int-leaves x (conj path k))) v)
+    (vector? v) (mapcat (fn [i x] (int-leaves x (conj path i))) (range) v)
+    :else []))
+
+(defn- at-boundaries
+  "Values of g, and a third of the time with one integer inside set to a
+  number the code or the spec compares against, or one either side of it:
+  the inputs that tell `<` from `<=`.  A refinement's own generator never
+  sees the law's seeds, and a value its :build makes is moved off them,
+  so they are put back here.  A change that takes the value out of the
+  refinement is undone."
+  [g nums ok?]
+  (if (empty? nums)
+    g
+    (gen/frequency
+      [[2 g]
+       [1 (gen/bind g (fn [v]
+                        (let [paths (vec (int-leaves v []))]
+                          (if (empty? paths)
+                            (gen/return v)
+                            (gen/fmap (fn [[p n]] (let [v2 (if (seq p) (assoc-in v p n) n)] (if (ok? v2) v2 v)))
+                                      (gen/tuple (gen/elements paths) (gen/elements nums)))))))]])))
+
 (defn- type-env-of
   "The data types and refinements of a spec entry.  Refinements sit under
   ::refines, apart from the data the prover and the static check read."
-  [{:keys [data refines laws]} spec-ns]
+  [{:keys [data refines laws] :as e} spec-ns]
   (let [bodies (delay (into {} (for [f (book/read-forms (source-url spec-ns))
                                      :when (and (seq? f) (contains? '#{defn defn-} (first f)))]
                                  [(second f) f])))
         spec-ints (delay (let [ns (filter integer? (literals (concat (map :prop laws) (map :pred refines)
                                                                      (vals @bodies))
                                                              spec-ns @bodies))]
-                           (vec (sort (distinct (mapcat (fn [n] [(dec n) n (inc n)]) ns))))))]
+                           (vec (sort (distinct (mapcat (fn [n] [(dec n) n (inc n)]) ns))))))
+        ;; the numbers the code and the spec mention, with their neighbours
+        boundary-nums (delay (vec (sort (into (set @spec-ints)
+                                              (get (code-seeds (:target e)) 'Int)))))]
     (reduce (fn [tenv {:keys [name pred-name] :as r}]
               (let [pred (deref (ns-resolve (the-ns spec-ns) pred-name))
                     tenv (assoc-in tenv [::refines name] (assoc r :pred pred))
                     bias (bias-of (literals (:pred r) spec-ns @bodies))]
                 (assoc-in tenv [::refines name :gen]
+                          (at-boundaries
                           (if-let [b (:build r)]
                             ;; built by the spec's own fn, then checked
                             (let [build (some-> (ns-resolve (the-ns spec-ns) b) deref)]
@@ -3231,7 +3264,10 @@
                                               :ex-fn (fn [_] (ex-info (str "the :build of refinement `" name "`, `" b
                                                                            "`, makes values its predicate rejects")
                                                                       {:writ/error true}))}))
-                            (refine-gen r pred (assoc tenv ::bias-of-refine bias ::spec-ints @spec-ints))))))
+                            (refine-gen r pred (assoc tenv ::bias-of-refine bias ::spec-ints @spec-ints)))
+                          @boundary-nums
+                          #(try (and (conforms? (:base r) % tenv) (boolean (pred %)))
+                                (catch Throwable _ false))))))
             (tenv-of data)
             refines)))
 
@@ -4020,30 +4056,60 @@
                               pr))))
             ;; an input that meets a law's hypotheses, from the solver: a
             ;; counterexample to their negation, run to confirm it
+            ;; an input of a law's bindings bs that meets h, from the solver:
+            ;; a counterexample to its negation, run to confirm it; one apart
+            ;; from each input in seen
+            meeting
+            (fn [r bs h seen]
+              (let [vars (mapv first bs)
+                    apart (for [w seen] (cons 'or (for [x vars] (list 'not= x (get w x)))))
+                    h* (if (seq apart) (list* 'and h apart) h)
+                    none (reduce (fn [p [x t]] (list 'forall [x t] p)) (list 'not h*) (reverse bs))
+                    cex (:counterexample (attempt** {:law (:law r) :prop none} [] nil))]
+                (when (and cex (every? #(contains? cex %) vars)
+                           (every? (fn [[x t]] (conforms? t (get cex x) (:tenv ctx))) bs)
+                           (= :pass (:result (try (holds (assoc ctx :vars vars) h* cex)
+                                                  (catch Throwable _ nil)))))
+                  (select-keys cex vars))))
+            hyps-of (fn [body] (loop [p body, hs []]
+                                 (if (head? p "=>") (recur (nth p 2) (conj hs (nth p 1))) hs)))
             hypothesis-witness
             (fn [r]
               (let [[bs body] (leading-foralls (:prop r))
-                    hyps (loop [p body, hs []]
-                           (if (head? p "=>") (recur (nth p 2) (conj hs (nth p 1))) hs))
-                    h (if (= 1 (count hyps)) (first hyps) (cons 'and hyps))
-                    vars (mapv first bs)
-                    ;; one found input, and then others apart from it: a
-                    ;; stand-in that agrees with the code at one input is
-                    ;; told apart at another
-                    found (fn [seen]
-                            (let [apart (for [w seen] (cons 'or (for [x vars] (list 'not= x (get w x)))))
-                                  h* (if (seq apart) (list* 'and h apart) h)
-                                  none (reduce (fn [p [x t]] (list 'forall [x t] p)) (list 'not h*) (reverse bs))
-                                  cex (:counterexample (attempt** {:law (:law r) :prop none} [] nil))]
-                              (when (and cex (every? #(contains? cex %) vars)
-                                         (every? (fn [[x t]] (conforms? t (get cex x) (:tenv ctx))) bs)
-                                         (= :pass (:result (try (holds (assoc ctx :vars vars) h* cex)
-                                                                (catch Throwable _ nil)))))
-                                (select-keys cex vars))))]
+                    hyps (hyps-of body)
+                    h (if (= 1 (count hyps)) (first hyps) (cons 'and hyps))]
+                ;; one found input, and then others apart from it: a
+                ;; stand-in that agrees with the code at one input is told
+                ;; apart at another
                 (when (seq hyps)
                   (loop [seen []]
-                    (let [w (when (< (count seen) 3) (found seen))]
+                    (let [w (when (< (count seen) 3) (meeting r bs h seen))]
                       (if w (recur (conj seen w)) (not-empty seen)))))))
+            ;; a law only tested, run where a computed term it compares with
+            ;; a number is that number or one either side: the inputs that
+            ;; tell < from <=, which a generator reaches only by chance
+            at-the-boundary
+            (fn [r]
+              (let [[bs body] (leading-foralls (:prop r))
+                    vars (set (map first bs))
+                    hyps (hyps-of body)
+                    number (fn [x] (cond (integer? x) x
+                                         (and (symbol? x) (namespace x))
+                                         (let [v (try (some-> (resolve x) deref) (catch Throwable _ nil))]
+                                           (when (integer? v) v))))
+                    uses-var? (fn [x] (and (coll? x) (some vars (tree-seq coll? seq x))))
+                    atoms (->> (tree-seq coll? seq body)
+                               (keep (fn [f]
+                                       (when (and (seq? f) (contains? '#{< <= > >= =} (first f)) (= 3 (count f)))
+                                         (let [[_ a b] f]
+                                           (cond (and (number a) (uses-var? b)) [b (number a)]
+                                                 (and (number b) (uses-var? a)) [a (number b)])))))
+                               distinct (take 3))]
+                (first (for [[t c] atoms, n [(dec c) c (inc c)]
+                             :let [w (meeting r bs (cons 'and (conj (vec hyps) (list '= t n))) [])
+                                   bad (when w (refuted ctx r w))]
+                             :when bad]
+                         (assoc bad :boundary (list '= t n))))))
             open? (fn [r] (and (:prop r) (contains? #{:tested :failed} (:status r))
                                (not (:proof r)) (not (:unproved-final r))))
             pass (fn [[rs lemmas]]
@@ -4117,7 +4183,13 @@
           (let [[rs2 lemmas2] (pass [rs lemmas])]
             (if (= (count lemmas2) (count lemmas))
               (do (when (and cache-dir @fresh) (save-proofs! cache-dir [spec-ns target] @writ-version @cached))
-                  (let [rs2 (mapv #(dissoc % :unproved-final) rs2)]
+                  (let [rs2 (mapv #(dissoc % :unproved-final) rs2)
+                        rs2 (if (false? (:prove opts))
+                              rs2
+                              (mapv #(or (when (and (= :tested (:status %)) (not (:lemma %)))
+                                           (try (at-the-boundary %) (catch Throwable _ nil)))
+                                         %)
+                                    rs2))]
                     (if (:suggest opts)
                       (mapv #(if (and (= :tested (:status %)) (:unproved %)
                                       (not (str/starts-with? (str (:unproved %)) "outside")))

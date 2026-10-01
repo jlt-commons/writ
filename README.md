@@ -684,6 +684,14 @@ and its values are drawn through it:
 The predicate still decides: a built value it rejects is a mistake in
 the builder, and the check says so.
 
+Whichever way a refinement's values are made, writ sets one of their
+integers, now and then, to a number the code or the spec mentions, or
+one either side of it, and keeps the change when the value is still one
+of the refinement. Those are the inputs that tell `<` from `<=`: a
+member owing exactly the 500 at which borrowing stops. A law that is only
+tested is also run where a sum or other computed term it compares with a
+number equals that number or one either side, at inputs the solver finds.
+
 ### The state graph
 
 Every spec declares its graph, and it comes first. Its states are types;

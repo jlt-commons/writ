@@ -1,7 +1,8 @@
 (ns writ.spec-demo.span-rare-spec
-  "A hypothesis that holds in a trial or two in a hundred -- a span of
-  exactly seven units -- in a law the prover does not read. A hundred
-  trials may meet it never, and then more are run."
+  "A hypothesis that holds in about one trial in five hundred -- two spans
+  of one length, back to back -- in a law the prover does not read. A
+  hundred trials may meet it never, and then more are run. It names no
+  number, so writ's seeding of the spec's numbers does not make it common."
   (:require [clojure.set :as set]
             [writ.spec :refer [spec ann refine graph law]]))
 
@@ -16,7 +17,7 @@
 
 (defn units [s] (set (range (:start s) (:end s))))
 
-(law a-seven-unit-span-overlaps-what-it-shares-a-unit-with
+(law back-to-back-spans-of-one-length-overlap-where-they-share-a-unit
   (forall [a Span, b Span]
-    (=> (= 7 (count (units a)))
+    (=> (and (pos? (count (units a))) (= (count (units a)) (count (units b))) (= (:end a) (:start b)))
         (= (overlaps? a b) (boolean (seq (set/intersection (units a) (units b))))))))

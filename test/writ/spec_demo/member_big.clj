@@ -1,6 +1,6 @@
 (ns writ.spec-demo.member-big
-  "award resets a member with more than a thousand points: no generated
-  member has that many.")
+  "award resets a member with more than a thousand points: few generated
+  members have that many.")
 
 (defn join [id email]
   {:id id :email email :points 0})
