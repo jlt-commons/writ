@@ -216,3 +216,12 @@
 (deftest a-path-frame-names-only-the-steps-arguments
   (is (thrown-with-msg? Exception #"\(arg i\)"
         (macroexpand-1 '(writ.spec/graph g {:states {:a A} :edges {:a {[f Nat] {:to #{:a} :changes [[:k (arg 3)]]}}}})))))
+
+;; --- a guard named once, for the graph and the laws -------------------------------
+
+(deftest a-guard-may-name-a-spec-fn-the-laws-use-too
+  (let [r (spec/check 'writ.spec-demo.shelf-q-guard-spec {:seed 1})
+        names (set (map :law (:laws r)))]
+    (is (:ok r) (:message r))
+    (is (contains? names 'desk:lib:lend:refused))
+    (is (contains? names 'desk:lib:lend:when.1) "the helper's own clauses, each its own law")))

@@ -425,12 +425,15 @@
 
 (declare guard-of)
 
+(declare one-line-helpers)
+
 (defn- when-shape!
   "An edge's :when must be (fn [state arg ...] test), taking the edge fn's
   n arguments."
   [edge w n]
   (when-not (and (seq? w) (= 'fn (first w)) (vector? (second w)) (= 3 (count w)))
-    (fail! edge " needs :when (fn [state arg ...] test), had " (pr-str w)))
+    (fail! edge " needs :when (fn [state arg ...] test), or the name of a fn of the spec, of one"
+           " expression, that takes the step's arguments in its order; had " (pr-str w)))
   (when-not (= n (count (second w)))
     (fail! edge ": its :when takes the fn's " n " argument(s), in the fn's order, had "
            (pr-str (second w)))))
@@ -520,6 +523,28 @@
   is refused, and the state stays as it was."
   [nm m0]
   (let [where (str "`graph " nm "`")
+        ;; a :when that names a spec fn of the edge fn's arguments, as
+        ;; :when may-borrow?, is that fn's own (fn [params] body), so the
+        ;; graph and the laws share one guard and its clauses are each seen
+        named-when (fn [k w]
+                     (let [n (inc (count (remove #{'_} (rest k))))
+                           [ps body] (get (one-line-helpers (ns-name *ns*)) w)]
+                       (cond
+                         (and ps (= n (count ps))) (list 'fn ps body)
+                         ps (fail! where ": the edge " (pr-str k) " names :when " w ", which takes "
+                                   (count ps) " argument(s); the step's fn takes " n)
+                         ;; not the spec's: the shape check says what a :when is
+                         :else w)))
+        m0 (if (and (map? m0) (map? (:edges m0)))
+             (update m0 :edges
+                     (fn [es] (into {} (for [[from e] es]
+                                         [from (if (map? e)
+                                                 (into {} (for [[k tos] e]
+                                                            [k (if (and (map? tos) (symbol? (:when tos)))
+                                                                 (update tos :when #(named-when k %))
+                                                                 tos)]))
+                                                 e)]))))
+             m0)
         m (if (and (map? m0) (map? (:edges m0)) (every? map? (vals (:edges m0))))
             (by->when where m0)
             m0)]
@@ -3412,17 +3437,17 @@
 
 ;; --- why a value is not of its type ----------------------------------------------
 
-(def ^:private one-line-helpers
-  (memoize
-    (fn [spec-ns]
-      (try
-        (into {} (for [f (book/read-forms (source-url spec-ns))
-                       :when (and (seq? f) (contains? '#{defn defn-} (first f)))
-                       :let [{:keys [name params body]} (defn-parts f)]
-                       :when (and (vector? params) (every? symbol? params) (not-any? #{'&} params)
-                                  (= 1 (count body)))]
-                   [name [params (first body)]]))
-        (catch Throwable _ {})))))
+(defn- one-line-helpers
+  "name -> [params body] for the spec's defns of one expression."
+  [spec-ns]
+  (try
+    (into {} (for [f (book/read-forms (source-url spec-ns))
+                   :when (and (seq? f) (contains? '#{defn defn-} (first f)))
+                   :let [{:keys [name params body]} (defn-parts f)]
+                   :when (and (vector? params) (every? symbol? params) (not-any? #{'&} params)
+                              (= 1 (count body)))]
+               [name [params (first body)]]))
+    (catch Throwable _ {})))
 
 (defn- broken-rule
   "Where in predicate form, with env binding its names, the value breaks

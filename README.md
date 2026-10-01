@@ -910,6 +910,11 @@ says `lend` changes only the copy it lends and the member it lends to.
 Everything else in the library, the other copies and members included,
 stays as it was.
 
+A `:when` may also name a fn of the spec, of one expression, that takes
+the step's arguments in its order: `{[lend Nat Nat] {:to #{:lib} :when
+lendable?}}`. The laws then use the same `lendable?`, so the guard is
+said once, and each clause of its `and` still gets its own law.
+
 `:changes` goes with `:when` too, and then the frame holds under the
 guard. It needs a record state and names only the record's keys.
 

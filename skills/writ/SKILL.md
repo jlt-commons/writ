@@ -161,6 +161,9 @@ failures: a law over every input may already answer one.
   passes the guard; for an `and` test, `g:s:f:when.N` says clause N fails
   while the others hold. Guard what the problem refuses, rather than
   folding the refusal into the targets.
+  A `:when` may name a spec fn of one expression that takes the step's
+  arguments in order, `:when may-withdraw?`, so the laws use the same
+  predicate instead of restating the guard.
 - Who may act: `:actors {:type User :role :role}` on the graph names the
   argument that acts and the key holding its role, and `:by #{:owner}` on
   an edge the roles that may take it. It is a guard, joined after the
