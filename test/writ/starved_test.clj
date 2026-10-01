@@ -203,3 +203,16 @@
     (is (< i (or (str/index-of m "law `") Long/MAX_VALUE)) "before any law's own failure")
     (is (has? r "laws that fail because of it: desk:lib:lend, lending-marks-the-copy") m)
     (is (= 1 (count (re-seq #"it breaks \(= \(:loans m\)" m))) "the broken rule once")))
+
+;; --- frames on paths named by the step's arguments --------------------------------
+
+(deftest a-path-frame-keeps-everything-but-the-paths-it-names
+  (let [r (spec/check 'writ.spec-demo.shelf-q-frame-spec {:seed 1})]
+    (is (:ok r) (:message r)))
+  (let [r (spec/check 'writ.spec-demo.shelf-q-frame-spec {:seed 1 :target 'writ.spec-demo.shelf-q-meddle})]
+    (is (not (:ok r)))
+    (is (= :failed (:status (law-result r 'desk:lib:lend:frame))) (:message r))))
+
+(deftest a-path-frame-names-only-the-steps-arguments
+  (is (thrown-with-msg? Exception #"\(arg i\)"
+        (macroexpand-1 '(writ.spec/graph g {:states {:a A} :edges {:a {[f Nat] {:to #{:a} :changes [[:k (arg 3)]]}}}})))))

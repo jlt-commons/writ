@@ -169,7 +169,11 @@ failures: a law over every input may already answer one.
 - A frame, on a record state: `{[award Nat] {:to #{:active} :changes
   [:points]}}`. `g:s:f:frame` says the step changes only those keys and
   keeps every other one, named by the record or not, as it was. It can go
-  with `:when`, and then holds under the guard.
+  with `:when`, and then holds under the guard. An entry may be a path
+  into the state, its parts the step's own arguments: `{[lend Nat Nat]
+  {:to #{:lib} :changes [[:copies (arg 2)] [:members (arg 1)]]}}` says
+  `lend` touches only that copy and that member, in place of a law per
+  step saying it.
 - `:runs N` (with `:depth D`, default 20) walks N seeded runs from a
   `[state value]` start through the real fns: every landing must be in an
   allowed state and hold its invariants, and every final state the graph

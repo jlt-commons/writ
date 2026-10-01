@@ -574,8 +574,17 @@
               (when-let [bad (seq (remove #{:to :when :else :changes :by :own-when} (keys tos)))]
                 (fail! edge " has unknown keys " (pr-str bad) "; an edge map takes :to, :when, :else, :changes and :by"))
               (when (contains? tos :changes)
-                (when-not (and (vector? ch) (seq ch) (every? keyword? ch))
-                  (fail! edge ": :changes is a vector of the keys the step may change, had " (pr-str ch))))
+                (when-not (and (vector? ch) (seq ch)
+                               (every? #(or (keyword? %)
+                                            (and (vector? %) (keyword? (first %))
+                                                 (every? (fn [x] (or (keyword? x) (number? x) (string? x)
+                                                                     (and (seq? x) (= 'arg (first x)) (= 2 (count x))
+                                                                          (integer? (second x)) (<= 1 (second x) (dec n)))))
+                                                         (rest %))))
+                                       ch))
+                  (fail! edge ": :changes is a vector of the keys the step may change, or of paths into the"
+                         " state such as [:copies (arg i)], where (arg i) is the step's i-th argument after the"
+                         " state, 1 to " (dec n) "; had " (pr-str ch))))
               (when (or (contains? tos :when) (not (contains? tos :changes)))
                 (when-shape! edge w n))
               (when (and el (not (contains? tos :when)))
@@ -2532,14 +2541,21 @@
                    ;; a frame: the keys the step may change, and every other
                    ;; key, named by the record or not, as it was
                    (when (seq changes)
-                     [(off-proof
-                        {:name (symbol (str edge ":frame"))
-                         :oid (str "frame." gname "." (name from) "." f)
-                         :prop (list 'forall binders
-                                     (under (list '= (list* 'dissoc call changes) (list* 'dissoc v changes))))
-                         :explain (str "a " f " from " (name from) " may change only "
-                                       (str/join ", " changes) ", and must keep every other key as it was")
-                         :graph gname})])
+                     (let [;; (arg i), the step's i-th argument after the state
+                           at (fn [x] (if (and (seq? x) (= 'arg (first x))) (nth avs (dec (second x))) x))
+                           paths (mapv #(if (vector? %) (mapv at %) %) changes)]
+                       [(off-proof
+                          {:name (symbol (str edge ":frame"))
+                           :oid (str "frame." gname "." (name from) "." f)
+                           :prop (list 'forall binders
+                                       (under (if (every? keyword? paths)
+                                                (list '= (list* 'dissoc call paths) (list* 'dissoc v paths))
+                                                (list '= (list 'writ.spec/without call paths)
+                                                      (list 'writ.spec/without v paths)))))
+                           :explain (str "a " f " from " (name from) " may change only "
+                                         (str/join ", " (map pr-str changes))
+                                         ", and must keep everything else as it was")
+                           :graph gname})]))
                    (when guard
                      (concat
                        (when (or (= :keep else) (ref-of else) (inv? else))
@@ -2618,6 +2634,18 @@
            ", so nothing tells them apart and a step between them checks only the type;"
            " make each a refinement that says what sets it apart"))))
 
+(defn without
+  "m with each of paths taken out: a key, or a path to an entry, which is
+  left out of the map that holds it.  What a frame compares."
+  [m paths]
+  (reduce (fn [m p]
+            (cond
+              (keyword? p) (dissoc m p)
+              (= 1 (count p)) (dissoc m (first p))
+              (map? (get-in m (pop p))) (update-in m (pop p) dissoc (peek p))
+              :else m))
+          m paths))
+
 (defn- graph-flow-errors
   "Each edge's fn must take its state's type, and return its targets'."
   [[gname m :as g] anns refs]
@@ -2629,7 +2657,7 @@
                :let [t (base (ty from))
                      edge (str "graph `" gname "`: the edge " (pr-str from) " " (pr-str key))]
                err (if (kind/record-type? t)
-                     (for [k changes :when (not (contains? t k))]
+                     (for [c changes :let [k (if (vector? c) (first c) c)] :when (not (contains? t k))]
                        (str edge ": :changes names " k ", which the record of " (pr-str from)
                             " does not have; name only its keys"))
                      [(str edge ": :changes needs a record state, but " (pr-str from) " is a " (pr-str t)

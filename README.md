@@ -899,6 +899,17 @@ law `membership:fresh:award:frame` fails for
   (dissoc m :points) => {:email "", :id 0, :nick ""}
 ```
 
+An entry of `:changes` may also be a path into the state, whose parts
+can be the step's own arguments, `(arg 1)` the first after the state:
+
+```clojure
+:edges {:lib {[lend Nat Nat] {:to #{:lib} :changes [[:copies (arg 2)] [:members (arg 1)]]}}}
+```
+
+says `lend` changes only the copy it lends and the member it lends to.
+Everything else in the library, the other copies and members included,
+stays as it was.
+
 `:changes` goes with `:when` too, and then the frame holds under the
 guard. It needs a record state and names only the record's keys.
 
