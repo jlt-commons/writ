@@ -421,7 +421,8 @@
   ([id text] (question* id text {}))
   ([id text opts] (question* id text opts)))
 
-(def ^:private graph-keys #{:states :edges :start :never :before :final :tested :witnesses :runs :depth :actors})
+(def ^:private graph-keys #{:states :edges :start :never :before :final :tested :witnesses :runs :depth :actors
+                             :model})
 
 (declare guard-of)
 
@@ -559,6 +560,13 @@
                      (or (nil? (:role a)) (keyword? (:role a))))
         (fail! where ": :actors is {:type T :role :key}: the type of the argument that acts, and the key"
                " of it that holds the role (none when the value is the role), had " (pr-str a))))
+    (when-let [md (:model m)]
+      (when-not (and (map? md) (simple-sym? (:view md)) (map? (:steps md))
+                     (every? (fn [[k v]] (and (simple-sym? k) (simple-sym? v))) (:steps md))
+                     (every? #{:view :steps} (keys md)))
+        (fail! where ": :model is {:view f :steps {step model-step ...}}: the spec's fn from a state to"
+               " its model, and for each step fn of the graph the spec's fn that does the same to the"
+               " model, taking the model and the step's other arguments; had " (pr-str md))))
     (when (and (contains? m :runs) (not (pos-int? (:runs m))))
       (fail! where ": :runs is how many runs to walk from :start, a positive integer, had "
              (pr-str (:runs m))))
@@ -2583,7 +2591,8 @@
                    ;; assume them
                    inv? #(seq (invariants-of invs gname %))
                    landing? (or refined? (some inv? tos))]
-             :when (or landing? guard (seq changes))
+             :let [model-step (get-in m [:model :steps f])]
+             :when (or landing? guard (seq changes) model-step)
              :let [v (or (:var (ref-of from)) 's)
                    avs (reduce (fn [acc [i t]]
                                  (conj acc (if (fixed-arg? t) (second t) (arg-var t i (set (conj acc v))))))
@@ -2657,6 +2666,17 @@
                            :explain (str "a " f " from " (name from) " may change only "
                                          (str/join ", " (map pr-str changes))
                                          ", and must keep everything else as it was")
+                           :graph gname})]))
+                   ;; the step does to the model what the model's own step does
+                   (when model-step
+                     (let [view (get-in m [:model :view])]
+                       [(off-proof
+                          {:name (symbol (str edge ":model"))
+                           :oid (str "model." gname "." (name from) "." f)
+                           :prop (list 'forall binders
+                                       (under (list '= (list view call) (list* model-step (list view v) avs))))
+                           :explain (str "a " f " from " (name from) " must do to its " view " what "
+                                         model-step " does")
                            :graph gname})]))
                    (when guard
                      (concat

@@ -177,6 +177,10 @@ failures: a law over every input may already answer one.
   {:to #{:lib} :changes [[:copies (arg 2)] [:members (arg 1)]]}}` says
   `lend` touches only that copy and that member, in place of a law per
   step saying it.
+- `:model {:view f :steps {step model-step ...}}`: f takes a state to a
+  simpler value, and each model-step does to that value what the step
+  does, taking the step's other arguments. Each such edge gets the law
+  `g:s:step:model`, `(= (f (step s ...)) (model-step (f s) ...))`.
 - `:runs N` (with `:depth D`, default 20) walks N seeded runs from a
   `[state value]` start through the real fns: every landing must be in an
   allowed state and hold its invariants, and every final state the graph

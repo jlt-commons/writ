@@ -248,3 +248,13 @@
 (deftest an-example-checks-the-code
   (let [r (spec/check 'writ.spec-demo.bulk-example-full-spec {:seed 42 :target 'writ.spec-demo.bulk-off})]
     (is (= :failed (:status (law-result r 'example:price:1))))))
+
+;; --- a model of the state, one law per edge ---------------------------------------
+
+(deftest each-edge-commutes-with-the-model
+  (let [r (spec/check 'writ.spec-demo.twolist-spec {:seed 1})]
+    (is (:ok r) (:message r))
+    (is (law-result r 'queue:q:enqueue:model))
+    (is (law-result r 'queue:q:dequeue:model)))
+  (let [r (spec/check 'writ.spec-demo.twolist-spec {:seed 1 :target 'writ.spec-demo.twolist-wrong-end})]
+    (is (= :failed (:status (law-result r 'queue:q:dequeue:model))) (:message r))))
