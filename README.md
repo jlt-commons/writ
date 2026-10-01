@@ -1751,8 +1751,20 @@ a new or changed assumption, or a check that passed and now fails.
 ;; => {:ok false :weakened [{:law sorted :what :require-lowered}]}
 ```
 
+A record also holds each `ann` and each refinement as written, so a
+signature loosened or a refinement rewritten shows as `:changed`.
+
 Changing the code never weakens the spec; a restated law its owner agreed
 to is accepted by writing a new record.
+
+A spec can hold itself to a record: `(spec my.sort {:baseline
+"spec-record.edn"})`. Its check, and the test it defines, then fails
+whenever the spec is weaker than the record, naming each way: `law
+`permutation` is removed`, `the ann of `insert` is changed: was ...,
+now ...`. An agent that edits the contract to get the code through is
+stopped by its own test run. The owner writes the record, and writes a
+new one to accept a change: `(spec/check 'my.sort-spec {:record
+"spec-record.edn"})`.
 
 ### Laws that contradict
 

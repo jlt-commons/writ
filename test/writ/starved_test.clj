@@ -258,3 +258,23 @@
     (is (law-result r 'queue:q:dequeue:model)))
   (let [r (spec/check 'writ.spec-demo.twolist-spec {:seed 1 :target 'writ.spec-demo.twolist-wrong-end})]
     (is (= :failed (:status (law-result r 'queue:q:dequeue:model))) (:message r))))
+
+;; --- a spec held to a baseline ----------------------------------------------------
+
+(deftest a-spec-weaker-than-its-baseline-fails
+  (let [path "test/writ/spec_demo/sort_baseline.edn"]
+    (try
+      (spec/check 'writ.spec-demo.sort-held-spec {:seed 42 :record path})
+      (let [r (spec/check 'writ.spec-demo.sort-held-spec {:seed 42})]
+        (is (:ok r) (:message r)))
+      (let [r (spec/check 'writ.spec-demo.sort-loosened-spec {:seed 42})]
+        (is (not (:ok r)))
+        (is (has? r "weaker than its baseline"))
+        (is (has? r "law `permutation` is removed"))
+        (is (has? r "the ann of `insert` is changed")))
+      (finally (clojure.java.io/delete-file path true)))))
+
+(deftest a-missing-baseline-fails-and-says-how-to-make-one
+  (let [r (spec/check 'writ.spec-demo.sort-held-spec {:seed 42})]
+    (is (not (:ok r)))
+    (is (has? r ":record"))))

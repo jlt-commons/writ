@@ -32,6 +32,9 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
   downgrade a blocking `question` yourself. `(spec/attest record 'my.spec)`
   compares a recorded check with the spec now and names every way it got
   weaker.
+  A spec may hold itself to a record, `(spec my.ns {:baseline "path"})`:
+  the check then fails on any weakening. Never write a new record to get
+  a check through; that is the owner's call.
 - The implementation is yours. Change it until `check` reports `:ok`.
 - If you are asked to write the spec, write the intent: see
   [What a spec should say](#what-a-spec-should-say).

@@ -158,8 +158,11 @@
      (fail! "`spec` names a namespace symbol, had: `" (pr-str target) "`"))
    (when-not (map? opts)
      (fail! "`spec " target "` takes an options map after the namespace, had: " (pr-str opts)))
-   (when-let [bad (seq (remove #{:require :uses :test} (keys opts)))]
-     (fail! "`spec " target "` has unknown options: " (pr-str bad) "; it takes :require, :uses and :test"))
+   (when-let [bad (seq (remove #{:require :uses :test :baseline} (keys opts)))]
+     (fail! "`spec " target "` has unknown options: " (pr-str bad) "; it takes :require, :uses, :test and :baseline"))
+   (when (and (contains? opts :baseline) (not (string? (:baseline opts))))
+     (fail! "`spec " target "` :baseline is the path of a record the check compares the spec with, had: "
+            (pr-str (:baseline opts))))
    (when (contains? opts :require) (check-level! (str "`spec " target "`") (:require opts)))
    (when (and (contains? opts :uses) (not (and (vector? (:uses opts)) (every? simple-sym? (:uses opts)))))
      (fail! "`spec " target "` :uses takes a vector of spec namespaces, had: " (pr-str (:uses opts))))
@@ -3802,10 +3805,11 @@
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
   [{:keys [ok target spec static laws gaps unspecified rejected calls flows machines proof graphs graph-missing
-           lemmas off-graph uses problems questions silent]
+           lemmas off-graph uses problems questions silent baseline-problems]
     contras ::contradictions assumed ::assumed
     ambiguous ::ambiguous explain ::explain}]
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
+       (when (seq baseline-problems) (str "\n\n" (str/join "\n" baseline-problems) "\n"))
        (when (and proof (pos? (:laws proof)))
          (str "\n  " (:proved proof) " of " (:laws proof) " laws proved"
               (when (and (:general proof) (pos? (:proved proof)))
@@ -4910,7 +4914,13 @@
                            (if (:fn a)
                              {:fn (:fn a) :sig (:sig a)}
                              {:assumption (:assumption a) :prop (get props (:assumption a))}))))
-     :obligations (:obligations r)}))
+     :obligations (:obligations r)
+     ;; each signature and refinement as written, so one loosened shows
+     :anns (into (sorted-map) (for [[f sig] (:anns e)]
+                                [f (cond-> {:params (:params sig) :ret (:ret sig)}
+                                     (get (:contracts e) f) (assoc :contract (get (:contracts e) f)))]))
+     :refines (into (sorted-map) (for [{:keys [name base pred]} (:refines e)]
+                                   [name {:base base :pred pred}]))}))
 
 (declare check)
 
@@ -4984,8 +4994,34 @@
                (let [now-blocking (into {} (map (juxt :id :blocking)) (:questions new))]
                  (for [{:keys [id blocking]} (:questions old)
                        :when (and blocking (false? (get now-blocking id)))]
-                   {:question id :what :no-longer-blocking}))))]
+                   {:question id :what :no-longer-blocking}))
+               ;; a signature or a refinement gone, or written otherwise:
+               ;; looser, as far as writ can tell, until its owner agrees
+               (for [[f sig] (:anns old)
+                     :let [n (get (:anns new) f)]
+                     :when (not= sig n)]
+                 (cond-> {:ann f :what (if n :changed :removed) :was sig}
+                   n (assoc :now n)))
+               (for [[nm r] (:refines old)
+                     :let [n (get (:refines new) nm)]
+                     :when (not= r n)]
+                 (cond-> {:refinement nm :what (if n :changed :removed) :was r}
+                   n (assoc :now n)))))]
     {:ok (empty? weakened) :weakened weakened}))
+
+(defn- weakening-text
+  "One line of what attest found weaker."
+  [{:keys [law obligation question fn assumption ann refinement what was now]}]
+  (str (cond law (str "law `" law "`")
+             obligation (str "obligation " obligation)
+             question (str "question `" question "`")
+             ann (str "the ann of `" ann "`")
+             refinement (str "refinement `" refinement "`")
+             fn (str "the assumed signature of `" fn "`")
+             assumption (str "assumption `" assumption "`")
+             :else "the check")
+       " is " (str/replace (name what) "-" " ")
+       (when (and was now) (str ": was " (pr-str was) ", now " (pr-str now)))))
 
 (declare reachable-from)
 
@@ -5390,7 +5426,26 @@
                                     (every? #(= :held (:status %)) assumed)
                                     (not graphless)))
                  r (assoc r :obligations (obligation-status (obligations* e) r))
-                 r (assoc r ::record (record-of e spec-ns laws r level))]
+                 r (assoc r ::record (record-of e spec-ns laws r level))
+                 ;; a spec held to a baseline fails when it is weaker than it
+                 baseline (:baseline e)
+                 r (if (and baseline (not= baseline (:record opts)))
+                     (let [f (io/file baseline)]
+                       (if-not (.exists f)
+                         (assoc r :ok false
+                                :baseline-problems [(str "the spec is held to the baseline " baseline
+                                                         ", which does not exist; write it from a check its owner"
+                                                         " agrees with: (writ.spec/check '" spec-ns " {:record \""
+                                                         baseline "\"})")])
+                         (let [weak (remove #(= :claimed-pass (:what %))
+                                            (:weakened (attest (edn/read-string (slurp f)) (::record r))))]
+                           (if (seq weak)
+                             (assoc r :ok false
+                                    :baseline-problems (into [(str "the spec is weaker than its baseline " baseline
+                                                                   "; its owner takes a new record to accept a change:")]
+                                                             (map #(str "  " (weakening-text %)) weak)))
+                             r))))
+                     r)]
          (do (when-let [path (:record opts)]
                (spit path (pr-str (::record r))))
              (assoc r :message (format-report (assoc r :machines machine-results
