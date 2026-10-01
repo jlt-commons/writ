@@ -1403,6 +1403,12 @@ as a hypothesis:
   a recursion of the code climbs on a law's integer. A scan that resumes
   from `start` is proved this way.
 
+An integer is inducted on only where the code recurses on it: where it
+reaches an argument of a fn that calls itself (a loop is one), or of a
+core fn that counts, such as `range`. Elsewhere the step case is the law
+again, so a day or an id passed to code that never recurses on it is
+not tried; a hint's `:induct` still is.
+
 Within a case, the prover:
 
 - splits an open integer comparison into its two outcomes, and

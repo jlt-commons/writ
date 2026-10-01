@@ -132,3 +132,15 @@
 (deftest a-spec-of-fitted-states-passes
   (let [r (spec/check 'writ.spec-demo.parcel-spec {:seed 1})]
     (is (:ok r) (:message r))))
+
+;; --- the prover inducts where the code recurses -----------------------------------
+
+(deftest no-induction-on-a-number-no-code-recurses-on
+  (let [r (spec/check 'writ.spec-demo.racks-spec {:seed 1 :cache false :explain true :adequacy false})
+        names (set (mapcat #(map :name (:attempts %)) (:laws r)))]
+    (is (seq names))
+    (is (not-any? #(and (vector? %) (#{:induct :climb} (first %)) (#{'s 'n} (second %))) names) (pr-str names))))
+
+(deftest induction-on-a-number-a-loop-counts-down-is-still-tried
+  (let [r (spec/check 'writ.spec-demo.climb-spec {:seed 1 :cache false})]
+    (is (:ok r) (:message r))))

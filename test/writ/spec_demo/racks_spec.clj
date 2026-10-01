@@ -22,4 +22,4 @@
 (law a-put-fills-an-empty-slot
   (forall [r Racks, s Slot, n Nat]
     (=> (not (contains? (:items r) s))
-        (= n (get-in (put r s n) [:items s :n])))))
+        (= n (:n (get (:items (put r s n)) s))))))
