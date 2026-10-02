@@ -628,7 +628,7 @@
   Returns {:proved true :trace :summary :lemmas} or {:proved false :reason
   :stuck}, and :attempts, what each strategy tried did: {:name :outcome
   :fuel :ms}, the outcome :proved, :failed, :fuel or :rejected."
-  [{:keys [prop defs tenv target own fuel lemmas rets total hint lemma sigs contracts replay prover]}]
+  [{:keys [prop defs tenv target own fuel lemmas rets total hint lemma sigs contracts replay prover guards sym-budget]}]
   (try
     (let [cfg (merge default-config prover)
           [bs0 body] (split-foralls prop)
@@ -642,6 +642,13 @@
           defs (merge defs (:defs recs))
           opts {:defs defs :tenv tenv :types (into {} (map (fn [[x ty]] [x (plain ty)])) bs)
                 :total total :vary (:vary hint) :recognizers recs
+                ;; the refinements' predicates, as hypotheses a proof may
+                ;; try without first
+                :guards (or guards #{})
+                ;; the symbolic proofs tried, so two strategies that run the
+                ;; same goal whole ask the solver once
+                :sym-memo (atom {})
+                :sym-budget sym-budget
                 :unfolded unfolded :fuel (or fuel (:fuel cfg)) :lemmas-used lemmas-used
                 :depth (:depth cfg) :enum-limit (:enum-limit cfg) :plausible-samples (:plausible-samples cfg)
                 :rets (or rets {}) :burned burned

@@ -82,3 +82,19 @@
 (law an-overdraft-changes-nothing
   (forall [l Ledger, a Nat, n Int]
     (=> (< (balance l a) n) (= l (withdraw l a n)))))
+
+(law opening-adds-one-account
+  (forall [l Ledger, a Nat]
+    (=> (not (contains? (:accts l) a))
+        (= (inc (count (:accts l))) (count (:accts (open-acct l a)))))))
+
+(law closing-takes-one-account-away
+  (forall [l Ledger, a Nat]
+    (=> (contains? (:accts l) a)
+        (= (dec (count (:accts l))) (count (:accts (close-acct l a)))))))
+
+(law a-deposit-keeps-the-count-of-accounts-in-credit
+  (forall [l Ledger, a Nat, n Nat]
+    (=> (and (contains? (:accts l) a) (pos? (balance l a)))
+        (= (count (filter #(pos? (:balance %)) (vals (:accts l))))
+           (count (filter #(pos? (:balance %)) (vals (:accts (deposit l a n)))))))))

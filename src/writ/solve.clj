@@ -75,8 +75,17 @@
   (let [{:keys [clauses apps]} (pre/preprocess f decls {:congruence false})
         apps (vec apps)
         budget (or (:budget opts) default-budget)
-        sopts {:budget budget :max-pivots (* 100 (max budget 100))}
-        run (fn [cls] (if (= :dpll (:engine opts)) (search/solve cls sopts) (cdcl/solve cls sopts)))]
+        ;; one budget for every round: a round that finds a model spends
+        ;; what it searched, and the next has what is left
+        left (atom budget)
+        run (fn [cls]
+              (let [b (max 1 @left)
+                    sopts {:budget b :max-pivots (* 100 (max b 100))}
+                    r (if (= :dpll (:engine opts)) (search/solve cls sopts) (cdcl/solve cls sopts))]
+                ;; each round costs at least a fortieth: a search from the
+                ;; start, so a run of cheap rounds ends too
+                (swap! left - (max (quot budget 40) (:spent r 0)))
+                r))]
     (try
       ;; congruence on demand, as SMT solvers add Ackermann's constraints
       ;; dynamically: search without them, and where the model gives two
@@ -92,10 +101,11 @@
                 ;; results at equal arguments: for a caller that wants only
                 ;; to hear :unsat, which holds of the full formula too
                 (empty? broken) {:result :sat :model (model f decls apps r)}
-                (> rounds 200) {:result :unknown :reason "congruence kept breaking"}
+                (<= @left 0) {:result :unknown :reason "the budget ran out adding congruence"}
                 :else (recur (into cls (mapcat (fn [[i j]] (pre/congruence-clauses (apps i) (apps j))) broken))
                              (into pairs broken) (into seen broken) (inc rounds))))
-            {:result :unsat :certificate {:claim :unsat
+            {:result :unsat :spent (+ (- budget @left) (:spent r 0))
+             :certificate {:claim :unsat
                                           :congruence pairs
                                           :proof (if (:lemmas r) {:lemmas (:lemmas r)} (:proof r))}})))
       (catch clojure.lang.ExceptionInfo e

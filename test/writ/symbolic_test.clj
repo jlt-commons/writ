@@ -206,7 +206,8 @@
     (is (not (:ok r)))
     (is (not-any? :prover-bug (:laws r)))
     (doseq [l '[a-deposit-to-no-account-changes-nothing a-closed-account-is-gone
-                a-withdrawal-keeps-every-balance-whole an-overdraft-changes-nothing]]
+                a-withdrawal-keeps-every-balance-whole an-overdraft-changes-nothing
+                closing-takes-one-account-away]]
       (is (= :failed (get st l)) (str l)))
     (testing "the laws the wrong code still keeps are proved of it"
       (doseq [l '[a-deposit-adds-to-the-balance a-tag-reads-back closing-leaves-the-others]]

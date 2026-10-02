@@ -1658,8 +1658,24 @@ to keep it: "a withdrawal leaves every balance whole" holds of ledgers of
 any size. Two filters of one vector are equal when the filters agree at a
 fresh index, which is what "cancelling leaves the others in order" needs.
 A hypothesis evaluation cannot read at all is left out of the proof,
-which only makes the proof hold under less. Counting a filtered map or
-vector is not read yet.
+which only makes the proof hold under less.
+
+`count` of a map of unknown size, or of a filter of its entries, keys or
+vals, is the count over the map it was changed from -- a fn of that map
+and of what the filter closes over, so the same filter of the same
+member counts the same -- plus one at each key the code put in it that
+was not there before, less one at each it took out. A count is never
+negative, and at least 1 where the formula reads a key the filter keeps.
+So "opening an account adds one" and "a loan counts against its member"
+are read as arithmetic.
+
+A law is tried first without the refinements of its variables -- the
+rule a whole library keeps, say -- since most laws need none of it and
+reading it costs; when that fails, with them. The certificate names what
+it was made without. The solver adds congruence on demand, within one
+decision budget for all its rounds (5000 for a goal evaluated whole), and
+a law a test already refuted is tried only briefly, to catch a prover
+that would prove it.
 
 ### Which fns qualify
 

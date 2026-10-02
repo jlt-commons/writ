@@ -1066,6 +1066,60 @@
       (union-of st [[ex {:bool true}] [[:not ex] {:nil true}]])
       :else (give-up! "some over a collection of unknown size, of a fn that gives other than booleans"))))
 
+(defn- canon
+  "Term t with each fn's parameters renamed by position and depth, so two
+  copies of one fn literal, #(pos? %) read twice, are one term."
+  [t]
+  ((fn walk [t depth]
+     (cond
+       (and (vector? t) (= :fn (head t)))
+       (let [[_ ps body] t
+             qs (mapv #(symbol (str "%" depth "_" %)) (range (count ps)))]
+         [:fn qs (walk (t/subst body (zipmap ps qs)) (inc depth))])
+       (and (vector? t) (not= :lit (head t))) (mapv #(walk % depth) t)
+       :else t))
+   t 0))
+
+(defn- view-sig
+  "[id captured-terms]: what a view's filters and maps are -- their code and
+  the integer terms of the values they close over -- or nil when one is a
+  fn whose identity is unknown or closes over a value of no integer terms."
+  [v]
+  (let [parts (for [[kind f] (:steps (:view v))]
+                (cond (:named f) [[kind (:named f)] []]
+                      (:term f) (let [ts (map flat (vals (:env f)))]
+                                  (when (every? some? ts) [[kind (canon (:term f)) (keys (:env f))] (vec (apply concat ts))]))
+                      :else nil))]
+    (when (every? some? parts)
+      [(mapv first parts) (vec (mapcat second parts))])))
+
+(defn- view-count
+  "The count of a view of a map of unknown size: the count over its base,
+  an uninterpreted fn of the base and of what the view's fns close over,
+  never negative; plus, at each key the map stores, one if the view has an
+  element there now and the base does not, minus one the other way, each
+  key once (a newer store at an equal key shadows an older one).  Each key
+  the formula reads that the base's view holds makes its count at least 1."
+  [st v]
+  (let [src (:src (:view v))
+        {:keys [base stores]} (:amap src)
+        base-view (assoc-in v [:view :src] (assoc-in src [:amap :stores] []))
+        cB (if-let [[id captured] (view-sig v)]
+             (let [args (into (vec (:args base)) captured)]
+               (into [:app (uf! st base [:count id] :fn (count args))] args))
+             (fresh! st :int))
+        ks (vec (distinct (map second (reverse stores))))
+        one (fn [c] [:ite c 1 0])
+        deltas (for [i (range (count ks))
+                     :let [k (nth ks i)
+                           fresh (reduce conj-f true (for [j (range i)] [:not (same-key st k (nth ks j))]))
+                           now (first (view-at st v k))
+                           was (first (view-at st base-view k))]]
+                 [:ite fresh [:- (one now) (one was)] 0])]
+    (swap! st #(-> % (update :defs conj [:<= 0 cB])
+                   (update :counts (fnil conj []) {:c cB :view base-view})))
+    (fold (into [:+ cB] deltas))))
+
 (def ^:private max-instances
   "The most instances of quantified facts one goal's formula is given."
   200)
@@ -1089,6 +1143,16 @@
                          x keys
                          :when (not (contains? (get-in @st [:instanced i]) x))]
                      [i q x])]
+          ;; a count is at least 1 where its view has an element
+          (doseq [[i {:keys [c view]}] (map-indexed vector (:counts @st))
+                  :let [[base] (view-base view)]
+                  x (get-in @st [:ground (:id base) (:args base)])
+                  :when (not (contains? (get-in @st [:counted i]) x))]
+            (swap! st update-in [:counted i] (fnil conj #{}) x)
+            (try (let [[in] (view-at st view x)]
+                   (swap! st update :defs conj [:=> in [:<= 1 c]]))
+                 (catch clojure.lang.ExceptionInfo ex
+                   (when-not (or (::outside (ex-data ex)) (::throws (ex-data ex))) (throw ex)))))
           (when (and (seq todo) (< round 6) (< (:instances @st 0) max-instances))
             (doseq [[i q x] todo :while (< (:instances @st 0) max-instances)]
               (swap! st #(-> % (update-in [:instanced i] (fnil conj #{}) x) (update :instances (fnil inc 0))))
@@ -1829,6 +1893,11 @@
       count (lift st (fn [x]
                        (cond
                          (:seqv x) {:int (seq-count x)}
+                         (:amap x) {:int (view-count st (view-of x :entries))}
+                         (and (:view x) (:amap (:src (:view x)))) {:int (view-count st x)}
+                         ;; a vector's elements, mapped: as many as it has
+                         (and (:view x) (:seqv (:src (:view x))) (every? #(= :map (first %)) (:steps (:view x))))
+                         {:int (seq-count (:src (:view x)))}
                          (:map x) (do (open! x "the count")
                                       {:int (into [:+ 0] (map (fn [[p _ _]] [:ite p 1 0]) (:map x)))})
                          (opaque? x) {:int (opaque-count st x)}
@@ -2096,7 +2165,10 @@
       :call (folded (core st (second x) (mapv #(ev st env %) (drop 2 x))))
       :app (let [[_ f & args] x] (app st f (mapv #(ev st env %) args)))
       :fn (let [[_ ps body] x]
-            {:fn (fn [vs] (ev st (merge env (zipmap ps vs)) body))})
+            {:fn (fn [vs] (ev st (merge env (zipmap ps vs)) body))
+             ;; which fn it is: its code and the values it closes over
+             :term x
+             :env (into (sorted-map) (for [v (t/vars x) :when (contains? env v)] [v (get env v)]))})
       :cfn (let [f (second x)] {:fn (fn [vs] (folded (core st f vs))) :named x})
       :dfn (let [f (second x)] {:fn (fn [vs] (app st f vs)) :named x})
       :ap (let [[_ f & args] x]
@@ -2214,7 +2286,7 @@
 
 (def budget
   "Decisions the solver may make on a goal evaluated whole."
-  20000)
+  5000)
 
 (defn- key-of
   "[key rest-of-ints]: the value of key type kt the integers ints begin with."
@@ -2295,7 +2367,7 @@
   the solver's counter-model, or nil."
   [opts hyps g]
   (when-let [{:keys [formula decls env codes st]} (formula (assoc opts :lenient true) hyps g)]
-    (let [r (try (solve/valid? formula decls {:budget budget})
+    (let [r (try (solve/valid? formula decls {:budget (or (:sym-budget opts) budget)})
                  (catch clojure.lang.ExceptionInfo _ nil))]
       (when (= :invalid (:result r))
         (let [by-code (into {} (map (fn [[c k]] [k c])) codes)
@@ -2314,20 +2386,79 @@
           (when-not (some #{::none} (vals values))
             values))))))
 
-(defn prove
-  "[certificate fns-it-unfolded] proving goal g holds under hyps, or nil."
+(defn- prove-under
   [opts hyps g]
   (when-let [{:keys [formula decls used]} (formula opts hyps g)]
-    (let [r (try (solve/valid? formula decls {:budget budget})
+    (let [r (try (solve/valid? formula decls {:budget (or (:sym-budget opts) budget)})
                  (catch clojure.lang.ExceptionInfo _ nil))]
       (when (and *why* (not= :valid (:result r)))
         (swap! *why* conj (str "solver: " (:result r) " " (pr-str (select-keys r [:reason :model])))))
       (when (= :valid (:result r)) [(:certificate r) used]))))
 
+(defn- and-form?
+  "Is term h an (and a b), as it is read: (if a b false), or (if a b a)
+  where and's local was put back in place?"
+  [h]
+  (and (= :if (head h)) (or (= [:lit false] (nth h 3)) (= (nth h 1) (nth h 3)))))
+
+(defn- guard?
+  "Is hypothesis h a refinement's predicate of a law's variable, which
+  opts :guards names?"
+  [opts h]
+  (and (= :app (head h)) (contains? (:guards opts #{}) (second h))))
+
+(defn- without [hyps is]
+  (let [is (set is)] (vec (keep-indexed (fn [i h] (when-not (contains? is i) h)) hyps))))
+
+(declare prove*)
+
+(defn prove
+  "prove*, once per goal and hypotheses within one law's search: two
+  strategies that run the same goal whole ask the solver once.  opts
+  :sym-memo, an atom, holds the answers."
+  [opts hyps g]
+  (if-let [memo (:sym-memo opts)]
+    (let [k [hyps g (:types opts) (:total opts)]]
+      (if-let [e (find @memo k)]
+        (val e)
+        (let [r (prove* opts hyps g)] (swap! memo assoc k r) r)))
+    (prove* opts hyps g)))
+
+(defn prove*
+  "[certificate fns-it-unfolded] proving goal g holds under hyps, or nil.
+  Without the refinements of the law's variables first: a rule over a
+  whole library is costly to read and most laws do not need it, and a
+  proof under fewer hypotheses holds under all of them.  The certificate
+  names the hypotheses it was made without."
+  [opts hyps g]
+  (let [;; (and a b), read as (if a b false), is a and b apart
+        conjuncts (fn conjuncts [h]
+                    (if (and-form? h)
+                      (concat (conjuncts (nth h 1)) (conjuncts (nth h 2)))
+                      [h]))
+        ;; split only to leave guards out; otherwise the hypotheses as
+        ;; they are, which a certificate without :without-hyps is replayed under
+        split (if (seq (:guards opts)) (vec (mapcat conjuncts hyps)) hyps)
+        gs (vec (keep-indexed (fn [i h] (when (guard? opts h) i)) split))]
+    (or (when (seq gs)
+          (when-let [[c used] (prove-under opts (without split gs) g)]
+            [(assoc c :without-hyps gs) used]))
+        (prove-under opts hyps g))))
+
 (defn verify
-  "Does certificate c prove goal g under hyps?"
+  "Does certificate c prove goal g under hyps (less the ones it names as
+  made without)?"
   [opts hyps g c]
-  (if-let [{:keys [formula decls used]} (formula opts hyps g)]
+  (if-let [{:keys [formula decls used]}
+           (formula opts (if-let [w (:without-hyps c)]
+                           (without (vec (mapcat (fn conjuncts [h]
+                                                   (if (and-form? h)
+                                                     (concat (conjuncts (nth h 1)) (conjuncts (nth h 2)))
+                                                     [h]))
+                                                 hyps))
+                                    w)
+                           hyps)
+                    g)]
     (let [ok (try (solve/verify formula decls c)
                   (catch clojure.lang.ExceptionInfo _ false))]
       ;; what a replay unfolds is what the proof reads of the code

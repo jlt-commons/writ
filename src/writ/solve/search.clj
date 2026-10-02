@@ -133,7 +133,7 @@
                  (if (and terms (not (assign (cert/cut assign terms))))
                    (add-cut st assign cuts terms tab)
                    (split st assign cuts [:le {x 1} (simplex/floor-value v)] tab)))
-               {:sat true :assign assign :values (:sat t)}))))))))
+               {:sat true :assign assign :values (:sat t) :spent (:decisions @st)}))))))))
 
 (defn solve
   "Search clauses for a model.  {:sat true :assign #{literal} :values

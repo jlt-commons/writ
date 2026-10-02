@@ -4832,7 +4832,11 @@
                                                 ;; a lemma's types erased as the law's are, so a
                                                 ;; refinement in both is the same base type
                                                 :lemmas (mapv #(update % :prop erase-law refs spec-ns) lemmas)
-                                                :rets (into {} (for [[f sig] sigs] [f (:ret sig)]))}))
+                                                :rets (into {} (for [[f sig] sigs] [f (:ret sig)]))
+                                                :guards (set (for [[_ r] refs] (symbol (str spec-ns) (str (:pred-name r)))))
+                                                ;; a law a test refuted is tried only to catch a
+                                                ;; prover that would prove it: briefly
+                                                :sym-budget (when (= :failed (:status r)) 500)}))
                            (catch Throwable e
                              {:proved false :reason (str "the prover failed: " (ex-message e))})))
             ;; that a step never throws is proved only by running it

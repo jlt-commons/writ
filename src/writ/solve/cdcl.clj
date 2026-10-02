@@ -268,12 +268,12 @@
         (budget! st)
         (let [st (propagate st)]
           (cond
-            (:unsat st) {:lemmas (:lemmas (:unsat st))}
+            (:unsat st) {:lemmas (:lemmas (:unsat st)) :spent (+ (:conflicts st 0) (:decisions st 0))}
 
             (:conflict st)
             (let [r (conflict-step st (:conflict st))]
               (if (:unsat r)
-                {:lemmas (:lemmas (:unsat r))}
+                {:lemmas (:lemmas (:unsat r)) :spent (+ (:conflicts r 0) (:decisions r 0))}
                 (recur r restarts until)))
 
             :else
@@ -286,7 +286,7 @@
                       [st i] (add-clause st c {:farkas fk})
                       r (conflict-step st i)]
                   (if (:unsat r)
-                    {:lemmas (:lemmas (:unsat r))}
+                    {:lemmas (:lemmas (:unsat r)) :spent (+ (:conflicts r 0) (:decisions r 0))}
                     (recur r restarts until)))
                 (let [st (assoc st :tabs (conj (pop (:tabs st)) (:tableau t)))]
                   (cond
@@ -322,7 +322,8 @@
                                          (update :tabs conj (peek (:tabs st)))
                                          (assign b nil))
                                      restarts until))))
-                        {:sat true :assign (set (:trail st)) :values (:sat t)}))))))))))))
+                        {:sat true :assign (set (:trail st)) :values (:sat t)
+                         :spent (+ (:conflicts st 0) (:decisions st 0))}))))))))))))
 
 ;; --- constraint independence -------------------------------------------------------
 
@@ -354,6 +355,7 @@
         (if-let [p (first parts)]
           (let [r (search (vec p) opts)]
             (if (:sat r)
-              (recur (rest parts) (-> acc (update :assign into (:assign r)) (update :values merge (:values r))))
+              (recur (rest parts) (-> acc (update :assign into (:assign r)) (update :values merge (:values r))
+                                      (update :spent (fnil + 0) (:spent r 0))))
               r))
           acc)))))
