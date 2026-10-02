@@ -32,7 +32,7 @@
 
 (defn- tighter? [side v old] (or (nil? old) (if (= side :hi) (< v (first old)) (> v (first old)))))
 
-(defn- value [st x] (get-in st [:val x] 0))
+(defn- value [st x] (get (:val st) x 0))
 
 (defn- violation [st x]
   (let [v (value st x) lo (get-in st [:bounds x :lo]) hi (get-in st [:bounds x :hi])]
@@ -118,7 +118,8 @@
                   (let [d (- target v)]
                     (reduce-kv (fn [st b r] (if-let [c (r x)] (update-in st [:val b] (fnil + 0) (* c d)) st))
                                (assoc-in st [:val x] target) (:rows st)))))))
-          st (keys (:idx st))))
+          ;; only a bounded variable can be out of its bounds
+          st (keys (:bounds st))))
 
 (defn empty-tableau []
   {:slacks #{} :rows {} :bounds {} :idx {} :val {}})
@@ -143,10 +144,19 @@
          (loop [st (repair-nonbasic st) n 0]
           (when (> n max-pivots)
             (throw (ex-info "simplex pivot budget exhausted" {::budget true})))
-          (let [bad (first (sort-by order (filter #(violation st %) (keys (:rows st)))))]
+          ;; the violated basic variable first in order (Bland's rule): only
+          ;; a bounded one can be, so the bounds are walked, not the rows
+          (let [rows (:rows st)
+                bad (reduce (fn [best x]
+                              (if (and (contains? rows x) (violation st x)
+                                       (or (nil? best) (< (order x) (order best))))
+                                x best))
+                            nil (keys (:bounds st)))]
             (if-not bad
-              {:sat (into {} (for [x (keys (:idx st)) :when (not (and (vector? x) (= :slack (first x))))]
-                               [x (value st x)]))
+              ;; the values, made when a caller wants them: most checks only
+              ;; need to hear they are consistent
+              {:sat (delay (into {} (for [x (keys (:idx st)) :when (not (and (vector? x) (= :slack (first x))))]
+                                      [x (value st x)])))
                :tableau st}
               (let [side (violation st bad)
                     target (first (get-in st [:bounds bad side]))
