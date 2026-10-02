@@ -98,3 +98,9 @@
     (=> (and (contains? (:accts l) a) (pos? (balance l a)))
         (= (count (filter #(pos? (:balance %)) (vals (:accts l))))
            (count (filter #(pos? (:balance %)) (vals (:accts (deposit l a n)))))))))
+
+(law a-deposit-adds-to-the-total
+  (forall [l Ledger, a Nat, n Int]
+    (=> (contains? (:accts l) a)
+        (= (+ n (reduce + 0 (map :balance (vals (:accts l)))))
+           (reduce + 0 (map :balance (vals (:accts (deposit l a n)))))))))

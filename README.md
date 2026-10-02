@@ -1667,7 +1667,16 @@ member counts the same -- plus one at each key the code put in it that
 was not there before, less one at each it took out. A count is never
 negative, and at least 1 where the formula reads a key the filter keeps.
 So "opening an account adds one" and "a loan counts against its member"
-are read as arithmetic.
+are read as arithmetic. A sum, `(reduce + 0 xs)` or `(apply + xs)` of
+such a map's (mapped) vals, is read the same way. Over a vector of unknown
+length, a count of a filter or a sum is a prefix aggregate of the array:
+0 at the start, and at each index the formula reads, what that element
+adds to the one before; a slice is the difference at its ends. Two
+aggregates over one map or vector, of different fns, are equal when what
+they add agrees at a fresh key or index, so "a cancel leaves the count of
+the others" holds however the filters are written. A set, a keyword,
+`complement`, `comp` and `remove`'s negation are fns of known identity
+for this; a fn literal is known by its code, its parameters' names aside.
 
 A law is tried first without the refinements of its variables -- the
 rule a whole library keeps, say -- since most laws need none of it and

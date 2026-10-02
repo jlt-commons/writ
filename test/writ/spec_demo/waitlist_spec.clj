@@ -53,3 +53,14 @@
 (law a-cancelled-member-is-out
   (forall [w Waits, t Nat, m Nat]
     (not (some #{m} (get (cancel w t m) t [])))))
+
+(law cancelling-leaves-the-others-counted
+  (forall [w Waits, t Nat, m Nat]
+    (= (count (filter #(not= m %) (get w t [])))
+       (count (filter #(not= m %) (get (cancel w t m) t []))))))
+
+(law serving-counts-one-fewer-of-those-waiting
+  (forall [w Waits, t Nat, m Nat]
+    (=> (and (seq (get w t [])) (not= m (first (get w t []))))
+        (= (dec (count (filter #(not= m %) (get w t []))))
+           (count (filter #(not= m %) (get (serve w t) t [])))))))

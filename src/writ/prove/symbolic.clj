@@ -1041,7 +1041,7 @@
       (conj-f b extra))))
 
 (defn- negated [st f]
-  {:fn (fn [vs] {:bool [:not (truth (apply-fn st f vs))]})})
+  {:fn (fn [vs] {:bool [:not (truth (apply-fn st f vs))]}) :derived [:not f]})
 
 (defn- exists!
   "The formula for 'f holds of some element of view v'."
@@ -1080,45 +1080,117 @@
        :else t))
    t 0))
 
+(defn- fn-sig
+  "[id captured-terms] of fn value f: which fn it is -- a core or spec fn
+  by name, a literal by its code, a set or a keyword used as a fn, a
+  negation or composition of such -- and the integer terms of the values
+  it closes over; nil when that is unknown."
+  [f]
+  (cond
+    (:named f) [(:named f) []]
+    (:term f) (let [ts (map flat (vals (:env f)))]
+                (when (every? some? ts) [[(canon (:term f)) (keys (:env f))] (vec (apply concat ts))]))
+    (:derived f) (let [[op & parts] (:derived f)
+                       ps (map fn-sig parts)]
+                   (when (every? some? ps) [(into [op] (map first ps)) (vec (mapcat second ps))]))
+    (and (:set f) (:elems (:set f)) (every? (comp true? first) (:elems (:set f))))
+    (let [ts (map (comp flat second) (:elems (:set f)))]
+      (when (every? some? ts) [[:set (count ts)] (vec (apply concat ts))]))
+    (and (contains? f :const) (= :keyword (:ctype f)) (integer? (:const f))) [[:keyword (:const f)] []]
+    :else nil))
+
 (defn- view-sig
-  "[id captured-terms]: what a view's filters and maps are -- their code and
-  the integer terms of the values they close over -- or nil when one is a
-  fn whose identity is unknown or closes over a value of no integer terms."
+  "[id captured-terms]: what a view's filters and maps are, as fn-sig says
+  of each, or nil when one is unknown."
   [v]
   (let [parts (for [[kind f] (:steps (:view v))]
-                (cond (:named f) [[kind (:named f)] []]
-                      (:term f) (let [ts (map flat (vals (:env f)))]
-                                  (when (every? some? ts) [[kind (canon (:term f)) (keys (:env f))] (vec (apply concat ts))]))
-                      :else nil))]
+                (when-let [[id ts] (fn-sig f)] [[kind id] ts]))]
     (when (every? some? parts)
       [(mapv first parts) (vec (mapcat second parts))])))
 
-(defn- view-count
-  "The count of a view of a map of unknown size: the count over its base,
-  an uninterpreted fn of the base and of what the view's fns close over,
-  never negative; plus, at each key the map stores, one if the view has an
-  element there now and the base does not, minus one the other way, each
-  key once (a newer store at an equal key shadows an older one).  Each key
-  the formula reads that the base's view holds makes its count at least 1."
-  [st v]
+(defn- one [c] [:ite c 1 0])
+
+(defn- contribution
+  "What element e, there when c holds, adds to an aggregate: 1 to a count,
+  its value to a sum."
+  [kind c e]
+  (if (= :count kind) (one c) [:ite c (int-of e) 0]))
+
+(declare witness-key)
+
+(defn- agree!
+  "Two aggregates of one kind over one base, of different fns, are equal
+  when what they add agrees at a fresh key or index -- enough, since if
+  they disagreed anywhere the solver could choose that place.  Noted for
+  the new aggregate a against each one before it."
+  [st a]
+  (doseq [b (:aggs @st)
+          ;; the same fn closing over other values is related by congruence
+          ;; already; only different fns need agreeing
+          :when (and (= (:kind a) (:kind b)) (= (:base a) (:base b))
+                     (not= (first (:sig a)) (first (:sig b)))
+                     (not (contains? (:agreed @st) [(first (:sig a)) (first (:sig b))])))]
+    (let [w (witness-key st (:kt a))
+          agree [:= ((:adds a) w) ((:adds b) w)]
+          points (distinct (concat (:points a) (:points b)))
+          same (if (seq points)
+                 (into [:and true] (for [t points] [:= ((:at a) t) ((:at b) t)]))
+                 [:= (first ((:at a) nil)) (first ((:at b) nil))])]
+      (swap! st #(-> % (update :defs conj [:=> agree same])
+                     (update :agreed (fnil conj #{}) [(first (:sig a)) (first (:sig b))])))))
+  (swap! st update :aggs (fnil conj []) a))
+
+(defn- view-agg
+  "The count (kind :count) or the sum (:sum) of view v's elements.
+
+  Over a map of unknown size: the aggregate over the map it was changed
+  from, an uninterpreted fn of that map and of what the view's fns close
+  over, plus at each key the map stores what the element there adds now
+  less what it added before, each key once (a newer store at an equal key
+  shadows an older one).  A count is never negative, and at least 1 where
+  a key the formula reads is kept.
+
+  Over a vector of unknown length: prefix aggregates of its base, P(0) = 0
+  and P(j+1) = P(j) plus what index j adds, the latter at each index the
+  formula reads; a slice is P(off+len) - P(off), and the known elements
+  after it add their own."
+  [st v kind]
   (let [src (:src (:view v))
-        {:keys [base stores]} (:amap src)
-        base-view (assoc-in v [:view :src] (assoc-in src [:amap :stores] []))
-        cB (if-let [[id captured] (view-sig v)]
-             (let [args (into (vec (:args base)) captured)]
-               (into [:app (uf! st base [:count id] :fn (count args))] args))
-             (fresh! st :int))
-        ks (vec (distinct (map second (reverse stores))))
-        one (fn [c] [:ite c 1 0])
-        deltas (for [i (range (count ks))
-                     :let [k (nth ks i)
-                           fresh (reduce conj-f true (for [j (range i)] [:not (same-key st k (nth ks j))]))
-                           now (first (view-at st v k))
-                           was (first (view-at st base-view k))]]
-                 [:ite fresh [:- (one now) (one was)] 0])]
-    (swap! st #(-> % (update :defs conj [:<= 0 cB])
-                   (update :counts (fnil conj []) {:c cB :view base-view})))
-    (fold (into [:+ cB] deltas))))
+        [id captured] (or (view-sig v) (give-up! "an aggregate over a fn of unknown identity"))]
+    (if (:amap src)
+      (let [{:keys [base stores]} (:amap src)
+            base-view (assoc-in v [:view :src] (assoc-in src [:amap :stores] []))
+            args (into (vec (:args base)) captured)
+            cB (into [:app (uf! st base [kind id] :fn (count args))] args)
+            ks (vec (distinct (map second (reverse stores))))
+            add (fn [view k] (let [[c e] (view-at st view k)] (contribution kind c e)))
+            deltas (for [i (range (count ks))
+                         :let [k (nth ks i)
+                               fresh (reduce conj-f true (for [j (range i)] [:not (same-key st k (nth ks j))]))]]
+                     [:ite fresh [:- (add v k) (add base-view k)] 0])]
+        (when (= :count kind)
+          (swap! st #(-> % (update :defs conj [:<= 0 cB])
+                         (update :counts (fnil conj []) {:c cB :view base-view}))))
+        (agree! st {:kind kind :base base :sig [id captured] :at (fn [x] [cB])
+                    :adds (fn [k] (add base-view k)) :kt (:kt (:amap src))})
+        (fold (into [:+ cB] deltas)))
+      (let [{:keys [base off len sfx]} (:seqv src)
+            steps (:steps (:view v))
+            args (into (vec (:args base)) captured)
+            P (fn [j] (into [:app (uf! st base [:prefix kind id] :fn (inc (count args)))] (conj args j)))
+            add (fn [e] (let [[c e] (run-steps st steps true e)] (contribution kind c e)))]
+        (swap! st #(-> % (update :defs conj [:= (P 0) 0])
+                       (update :prefixes (fnil conj []) {:base base :fact (fn [j] [:= (P [:+ j 1]) [:+ (P j) (add (seq-elem st src j))]])})
+                       ;; where the slice starts: its first element's share
+                       (update-in [:ground (:id base) (:args base)] (fnil conj []) {:int off})))
+        (agree! st {:kind kind :base base :sig [id captured] :at P :points [off [:+ off len]]
+                    :adds (fn [i] (add (seq-elem st src (:int i)))) :kt 'Int})
+        (fold (into [:+ [:- (P [:+ off len]) (P off)]] (map add sfx)))))))
+
+(defn- view-count [st v] (view-agg st v :count))
+
+(defn- plus? [f]
+  (and (:named f) (= '+ (some-> (second (:named f)) name symbol))))
 
 (def ^:private max-instances
   "The most instances of quantified facts one goal's formula is given."
@@ -1143,6 +1215,14 @@
                          x keys
                          :when (not (contains? (get-in @st [:instanced i]) x))]
                      [i q x])]
+          ;; a prefix aggregate's step at each index its vector is read at
+          (doseq [[i {:keys [base fact]}] (map-indexed vector (:prefixes @st))
+                  x (get-in @st [:ground (:id base) (:args base)])
+                  :when (and (contains? x :int) (not (contains? (get-in @st [:prefixed i]) x)))]
+            (swap! st update-in [:prefixed i] (fnil conj #{}) x)
+            (try (let [f (fact (:int x))] (swap! st update :defs conj f))
+                 (catch clojure.lang.ExceptionInfo ex
+                   (when-not (or (::outside (ex-data ex)) (::throws (ex-data ex))) (throw ex)))))
           ;; a count is at least 1 where its view has an element
           (doseq [[i {:keys [c view]}] (map-indexed vector (:counts @st))
                   :let [[base] (view-base view)]
@@ -1623,12 +1703,13 @@
                                  :elem (:elem sx)}})))
                 b)
       remove (core* st 'filter [(negated st a) b])
-      complement {:fn (fn [vs] {:bool [:not (truth (apply-fn st a vs))]})}
+      complement {:fn (fn [vs] {:bool [:not (truth (apply-fn st a vs))]}) :derived [:not a]}
       comp (if (empty? args)
              {:fn (fn [vs] (first vs))}
              {:fn (fn [vs] (reduce (fn [acc h] (apply-fn st h [acc]))
                                    (apply-fn st (last args) vs)
-                                   (rest (reverse args))))})
+                                   (rest (reverse args))))
+              :derived (into [:comp] args)})
       key (lift st (fn [e] (if (and (:vec e) (= 2 (count (:vec e)))) (first (:vec e)) (give-up! "key of a value that is not a map entry"))) a)
       val (lift st (fn [e] (if (and (:vec e) (= 2 (count (:vec e)))) (second (:vec e)) (give-up! "val of a value that is not a map entry"))) a)
       ;; keep over a seq of known length: f's values, each there when it is
@@ -1796,17 +1877,27 @@
       reduce (if (= 3 n)
                (lift st (fn [xs]
                           (cond (:nil xs) b
+                                (and (plus? a) (as-view xs) (not (:vec xs)))
+                                {:int [:+ (int-of b) (view-agg st (as-view xs) :sum)]}
                                 (:vec xs) (reduce (fn [acc x] (apply-fn st a [acc x])) b (:vec xs))
                                 :else (give-up! "reduce over a collection of unknown order")))
                      c)
                ;; with no initial value: the first element starts it, and
                ;; over a single element f is not called; over none, (f)
                (lift st (fn [xs]
-                          (cond (:nil xs) (give-up! "reduce with no initial value over nothing")
+                          (cond (and (plus? a) (as-view xs)) {:int (view-agg st (as-view xs) :sum)}
+                                (:nil xs) (give-up! "reduce with no initial value over nothing")
                                 (and (:vec xs) (seq (:vec xs)))
                                 (reduce (fn [acc x] (apply-fn st a [acc x])) (first (:vec xs)) (rest (:vec xs)))
                                 :else (give-up! "reduce with no initial value over a collection of unknown order")))
                      b))
+      ;; (apply + xs): the sum of xs
+      apply (if (and (= 2 n) (plus? a))
+              (lift st (fn [xs] (cond (as-view xs) {:int (view-agg st (as-view xs) :sum)}
+                                      (:nil xs) {:int 0}
+                                      :else (core* st '+ (seq-of xs))))
+                    b)
+              (give-up! "apply of other than + to one collection"))
       ;; the vector forms, as the seq forms: vector? of them is not decided
       mapv (core* st 'map args)
       filterv (core* st 'filter args)
@@ -1898,6 +1989,7 @@
                          ;; a vector's elements, mapped: as many as it has
                          (and (:view x) (:seqv (:src (:view x))) (every? #(= :map (first %)) (:steps (:view x))))
                          {:int (seq-count (:src (:view x)))}
+                         (and (:view x) (:seqv (:src (:view x)))) {:int (view-agg st x :count)}
                          (:map x) (do (open! x "the count")
                                       {:int (into [:+ 0] (map (fn [[p _ _]] [:ite p 1 0]) (:map x)))})
                          (opaque? x) {:int (opaque-count st x)}
@@ -2039,6 +2131,9 @@
     ;; a map is a fn of its keys
     (and (:map fv) (<= 1 (count vs) 2)) (map-lookup st fv (first vs) (if (next vs) (second vs) {:nil true}))
     (and (:amap fv) (<= 1 (count vs) 2)) (amap-get st fv (first vs) (if (next vs) (second vs) {:nil true}))
+    ;; a keyword is a fn of maps: the lookup
+    (and (contains? fv :const) (= :keyword (:ctype fv)) (<= 1 (count vs) 2))
+    (core* st 'get (into [(first vs) fv] (rest vs)))
     ;; a set is a fn of its elements: the element when it holds it
     (and (:set fv) (= 1 (count vs)))
     (let [in (define! st :bool ((:mem (:set fv)) (first vs)))]
