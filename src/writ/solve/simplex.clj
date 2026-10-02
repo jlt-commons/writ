@@ -99,27 +99,30 @@
         [x side v] (bound-of (:slacks st) l)
         st (register st x)]
     (if (tighter? side v (get-in st [:bounds x side]))
-      (assoc-in st [:bounds x side] [v l])
+      (-> st (assoc-in [:bounds x side] [v l]) (update ::touched (fnil conj #{}) x))
       st)))
 
 (defn- repair-nonbasic
-  "Move each nonbasic variable out of bounds to the bound it breaks, and
-  the basic variables with it."
-  [st]
-  (reduce (fn [st x]
+  "Move each nonbasic variable of xs out of bounds to the bound it breaks,
+  and the basic variables with it.  [st moved]: the basic variables whose
+  values changed."
+  [st xs]
+  (reduce (fn [[st moved] x]
             (if (contains? (:rows st) x)
-              st
+              [st moved]
               (let [v (value st x)
                     {:keys [lo hi]} (get-in st [:bounds x])
                     target (cond (and lo (< v (first lo))) (first lo)
                                  (and hi (> v (first hi))) (first hi))]
                 (if (nil? target)
-                  st
+                  [st moved]
                   (let [d (- target v)]
-                    (reduce-kv (fn [st b r] (if-let [c (r x)] (update-in st [:val b] (fnil + 0) (* c d)) st))
-                               (assoc-in st [:val x] target) (:rows st)))))))
-          ;; only a bounded variable can be out of its bounds
-          st (keys (:bounds st))))
+                    (reduce-kv (fn [[st moved] b r]
+                                 (if-let [c (r x)]
+                                   [(update-in st [:val b] (fnil + 0) (* c d)) (conj moved b)]
+                                   [st moved]))
+                               [(assoc-in st [:val x] target) moved] (:rows st)))))))
+          [st #{}] xs))
 
 (defn empty-tableau []
   {:slacks #{} :rows {} :bounds {} :idx {} :val {}})
@@ -132,26 +135,34 @@
   repairing."
   ([lits max-pivots] (check lits max-pivots nil))
   ([lits max-pivots from]
+   ;; A tableau a check returned is feasible: every variable within its
+   ;; bounds.  So only the variables the new literals bound, and the basic
+   ;; ones those move, can be out of bounds now, and only they are looked at
    (let [base (or from (empty-tableau))
-         st (reduce assert-lit base (remove (or (:asserted base) #{}) lits))
-         st (assoc st :asserted (into (or (:asserted base) #{}) lits))
-         clash (some (fn [[x {:keys [lo hi]}]] (when (and lo hi (> (first lo) (first hi))) x))
-                     (:bounds st))]
+         asserted (or (:asserted base) #{})
+         new (remove asserted lits)
+         st (reduce assert-lit (dissoc base ::touched) new)
+         touched (or (::touched st) #{})
+         st (-> st (dissoc ::touched) (assoc :asserted (into asserted new)))
+         order #(get-in st [:idx %])
+         clash (first (sort-by order (filter (fn [x] (let [{:keys [lo hi]} (get-in st [:bounds x])]
+                                                       (and lo hi (> (first lo) (first hi)))))
+                                             touched)))]
      (if clash
        {:conflict [[(second (get-in st [:bounds clash :lo])) 1]
                    [(second (get-in st [:bounds clash :hi])) 1]]}
-       (let [order #(get-in st [:idx %])]
-         (loop [st (repair-nonbasic st) n 0]
+       (let [[st moved] (repair-nonbasic st (sort-by order touched))]
+         (loop [st st, candidates (into moved touched), n 0]
           (when (> n max-pivots)
             (throw (ex-info "simplex pivot budget exhausted" {::budget true})))
-          ;; the violated basic variable first in order (Bland's rule): only
-          ;; a bounded one can be, so the bounds are walked, not the rows
+          ;; the violated basic variable first in order (Bland's rule), among
+          ;; the candidates: the rest are as the last feasible tableau left them
           (let [rows (:rows st)
                 bad (reduce (fn [best x]
                               (if (and (contains? rows x) (violation st x)
                                        (or (nil? best) (< (order x) (order best))))
                                 x best))
-                            nil (keys (:bounds st)))]
+                            nil candidates)]
             (if-not bad
               ;; the values, made when a caller wants them: most checks only
               ;; need to hear they are consistent
@@ -167,7 +178,12 @@
                              (or (nil? b) (if up (< (value st y) (first b)) (> (value st y) (first b))))))
                     y (first (sort-by order (map first (filter can? (get-in st [:rows bad])))))]
                 (if y
-                  (recur (pivot-and-update st bad y target) (inc n))
+                  ;; the rows holding y move with it, and y, now basic, may
+                  ;; leave its own bounds
+                  (recur (pivot-and-update st bad y target)
+                         (-> candidates (disj bad) (conj y)
+                             (into (keep (fn [[k r]] (when (r y) k))) rows))
+                         (inc n))
                   {:conflict (explain st bad side)}))))))))))
 
 (defn gomory

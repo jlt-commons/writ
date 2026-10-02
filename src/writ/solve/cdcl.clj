@@ -221,8 +221,10 @@
 (defn- theory
   "The simplex over the inequalities that hold, from the level's tableau."
   [st]
-  (let [lits (filter #(= :le (first %)) (:trail st))
-        from (peek (:tabs st))]
+  (let [from (peek (:tabs st))
+        ;; the level's tableau holds the inequalities of the trail up to the
+        ;; place it was made at: only those after are new
+        lits (filter #(= :le (first %)) (subvec (:trail st) (or (:pos from) 0)))]
     (simplex/check lits (:max-pivots st) from)))
 
 ;; --- the search -------------------------------------------------------------------
@@ -313,8 +315,9 @@
                   (if (:unsat r)
                     {:lemmas (:lemmas (:unsat r)) :spent (+ (:conflicts r 0) (:decisions r 0))}
                     (recur r restarts until)))
-                (let [st (assoc st :tabs (conj (pop (:tabs st)) (:tableau t)))]
+                (let [st (assoc st :tabs (conj (pop (:tabs st)) (assoc (:tableau t) :pos (count (:trail st)))))]
                   (cond
+
                     ;; restart: back to level 0, keeping what was learned
                     (>= (:conflicts st) until)
                     (let [restarts (inc restarts)]
