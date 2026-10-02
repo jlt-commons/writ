@@ -49,6 +49,15 @@
                 :when (not (contains? fns x))]
             [x (if (bool? x) (contains? assign [:bool x true]) (value-of x))]))))
 
+(def ^:private max-clauses
+  "The most clauses a check searches; past it, :unknown at once.  Every
+  formula the benches prove has under 6000."
+  15000)
+
+(def ^:private max-rounds
+  "The most searches one check makes, adding congruence between them."
+  6)
+
 (defn- broken-pairs
   "[i j] of the applications of one fn that solver result r gives equal
   arguments and different results, i < j, none of them in seen."
@@ -64,6 +73,8 @@
                  :when (and (not= (result a) (result b)) (not (contains? seen [i j])))]
              [i j])))))
 
+(declare check-clauses)
+
 (defn check
   "Is formula f satisfiable?  {:result :sat :model m}, {:result :unsat
   :certificate c} or {:result :unknown :reason s}.  opts: :budget, the
@@ -72,8 +83,14 @@
   and :congruence false, which leaves out that equal arguments give
   equal results: its :unsat holds of the formula, its :sat may not."
   [f decls opts]
-  (let [{:keys [clauses apps]} (pre/preprocess f decls {:congruence false})
-        apps (vec apps)
+  (let [{:keys [clauses] :as pp} (pre/preprocess f decls {:congruence false})]
+    (if (> (count clauses) (or (:max-clauses opts) max-clauses))
+      {:result :unknown :reason (str (count clauses) " clauses, past the most a check searches")}
+      (check-clauses f decls opts pp))))
+
+(defn- check-clauses
+  [f decls opts {:keys [clauses apps]}]
+  (let [apps (vec apps)
         budget (or (:budget opts) default-budget)
         ;; one budget for every round: a round that finds a model spends
         ;; what it searched, and the next has what is left
@@ -101,7 +118,9 @@
                 ;; results at equal arguments: for a caller that wants only
                 ;; to hear :unsat, which holds of the full formula too
                 (empty? broken) {:result :sat :model (model f decls apps r)}
-                (<= @left 0) {:result :unknown :reason "the budget ran out adding congruence"}
+                ;; every proof of the benches takes one round; a model that
+                ;; keeps breaking congruence is left unknown
+                (or (<= @left 0) (>= rounds max-rounds)) {:result :unknown :reason "the budget ran out adding congruence"}
                 :else (recur (into cls (mapcat (fn [[i j]] (pre/congruence-clauses (apps i) (apps j))) broken))
                              (into pairs broken) (into seen broken) (inc rounds))))
             {:result :unsat :spent (+ (- budget @left) (:spent r 0))

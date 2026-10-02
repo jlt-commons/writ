@@ -1620,7 +1620,14 @@ Symbolic evaluation covers the non-recursive code: arithmetic, `if`,
 records, sets
 built from literals and sets of unknown size filtered, mapped by a
 translation, or tested for membership, and calls of pure core fns on
-literal data. Recursion is left to rewriting and induction.
+literal data. A recursive fn is unrolled while a literal drives it; past
+that bound, or where it would walk a value of unknown shape, the call is
+left uninterpreted, as Suter, Koksal and Kuncak do: some value of its
+signature's return type, made of fns of its arguments the solver knows
+nothing about, so equal arguments give equal results. That proves what
+follows from the type alone, such as a `Nat` result being at least 0;
+the rest is left to rewriting and induction. A fn with no signature, or
+a law that must show nothing throws, still gives up there.
 
 A map of unknown size, a variable of type `(Map K V)` or `(Index :k R)`,
 is read as the theory of arrays is reduced in an SMT solver: a predicate

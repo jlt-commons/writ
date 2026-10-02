@@ -120,8 +120,9 @@
     (testing "seq, empty?, first and rest of a value of unknown shape agree"
       (is (= :proved (get status 'a-pair-binds-its-second)) (:message r))
       (is (= :proved (get status 'the-first-matching-clause-wins)) (:message r)))
-    (testing "a recursion into a form of any depth gives up, and soon"
-      (is (= :tested (get status 'a-depth-is-never-negative)) (:message r))
+    (testing "a recursion into a form of any depth: past the unrolling, the call is
+              some Nat, as depth's signature says, which is all the law needs"
+      (is (= :proved (get status 'a-depth-is-never-negative)) (:message r))
       (is (< (- (System/currentTimeMillis) t0) 120000)))))
 
 (deftest some-over-a-seq-of-known-length-is-its-first-truthy-value
@@ -242,3 +243,16 @@
       (is (= :failed (get st l)) (str l)))
     (doseq [l '[the-first-in-line-is-next]]
       (is (= :proved (get st l)) (str l)))))
+
+(deftest a-call-past-the-unrolling-is-some-value-of-its-type
+  (let [defs (defs-of 'writ.spec-demo.walk "writ/spec_demo/walk.clj")
+        q 'writ.spec-demo.walk/depth
+        opts {:types '{f Any} :defs defs :tenv {} :rets {q 'Nat}}]
+    (testing "proved from the signature's type"
+      (is (some? (sym/prove opts [] [:call '<= [:lit 0] [:app q 'f]]))))
+    (testing "but nothing more: the depth is not known to be small"
+      (is (nil? (sym/prove opts [] [:call '<= [:app q 'f] [:lit 3]]))))
+    (testing "with no signature, the evaluation gives up"
+      (is (nil? (sym/formula (dissoc opts :rets) [] [:call '<= [:lit 0] [:app q 'f]]))))
+    (testing "nor where a throw must be ruled out"
+      (is (nil? (sym/formula (assoc opts :total true) [] [:call '<= [:lit 0] [:app q 'f]]))))))

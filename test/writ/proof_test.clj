@@ -194,6 +194,6 @@
     (testing "an imported law judges no stand-in and counts toward nothing"
       (is (= 2 (:laws (:proof uses)))))
     (testing "a law of a used spec that is only tested is not imported, and the report says why"
-      (is (some #(= 'a-depth-is-never-negative (first %))
+      (is (some #(= 'a-depth-is-at-most-the-printed-length (first %))
                 (:skipped (first (filter #(= 'writ.spec-demo.walk-spec (:spec %)) (:uses uses))))))
-      (is (str/includes? (:message uses) "law `a-depth-is-never-negative` of writ.spec-demo.walk-spec is not imported")))))
+      (is (str/includes? (:message uses) "law `a-depth-is-at-most-the-printed-length` of writ.spec-demo.walk-spec is not imported")))))

@@ -1156,7 +1156,9 @@
   after it add their own."
   [st v kind]
   (let [src (:src (:view v))
-        [id captured] (or (view-sig v) (give-up! "an aggregate over a fn of unknown identity"))]
+        ;; a fn of unknown identity -- one closing over a map -- gets an
+        ;; aggregate of its own, related to no other
+        [id captured] (or (view-sig v) [[:unknown (:n (swap! st update :n inc))] []])]
     (if (:amap src)
       (let [{:keys [base stores]} (:amap src)
             base-view (assoc-in v [:view :src] (assoc-in src [:amap :stores] []))
@@ -2073,27 +2075,58 @@
 
 (defn- opaque-in? [g] (boolean (some #{:opaque} (tree-seq coll? seq g))))
 
+(declare app-body)
+
+(defn- uninterpreted-call
+  "The value of a call of recursive f the evaluation will not unfold: some
+  value of f's return type, as Suter, Koksal and Kuncak leave a call past
+  the unrolling bound uninterpreted.  Its parts are uninterpreted fns of
+  the arguments' integer terms, so equal arguments give equal results;
+  arguments with none give one value per distinct argument list.  Every
+  value f returns is among them, so a formula valid over them holds of
+  the code.  Where a throw must be ruled out, or f has no signature to
+  say its type, the evaluation gives up, as why says."
+  [st f vs why]
+  (let [ret (get-in @st [:rets f])]
+    (when (or (nil? ret) (:total @st))
+      (give-up! why))
+    (let [ts (map flat vs)
+          base (if (every? some? ts)
+                 {:id [:call f] :args (vec (apply concat ts))}
+                 (or (get-in @st [:call-bases [f vs]])
+                     (let [b {:id [:call f (:n (swap! st update :n inc))] :args []}]
+                       (swap! st assoc-in [:call-bases [f vs]] b)
+                       b)))]
+      (template st base [:ret] ret (:args base)))))
+
 (defn- app
   "A defn of the target or the spec applied to values: its body, run on
   them.  A recursive definition is unfolded like any other -- bounded
   unrolling: exact, since each unfolding is the code's own body -- while
   the recursion stays within max-unfold-depth and the goal within
   max-unfolds calls, which is enough when a literal drives it (a pattern
-  walked down to its end) and not otherwise."
+  walked down to its end); past that, the call's value is uninterpreted."
   [st f vs]
   (let [d (get-in @st [:defs-of f])]
     (when (or (nil? d) (:outside d))
       (give-up! (str "the call of `" f "`")))
-    (when (:recursive? d)
-      (let [{:keys [depth unfolds calls] :or {depth 0 unfolds 0}} @st
-            g (mapv sig vs)]
-        (when (or (>= depth max-unfold-depth) (>= unfolds max-unfolds))
-          (give-up! (str "the recursion of `" f "`, unfolded as far as it may be")))
-        ;; a call on values of unknown shape that has the shape of a call
-        ;; around it walks into more of the same: it never bottoms out
-        (when (and (opaque-in? g) (some #{[f g]} calls))
-          (give-up! (str "the recursion of `" f "` over a value of unknown shape")))
-        (swap! st assoc :unfolds (inc unfolds))))
+    (if-let [why (when (:recursive? d)
+                   (let [{:keys [depth unfolds calls] :or {depth 0 unfolds 0}} @st
+                         g (mapv sig vs)]
+                     (cond
+                       (or (>= depth max-unfold-depth) (>= unfolds max-unfolds))
+                       (str "the recursion of `" f "`, unfolded as far as it may be")
+                       ;; a call on values of unknown shape that has the shape of a
+                       ;; call around it walks into more of the same: it never ends
+                       (and (opaque-in? g) (some #{[f g]} calls))
+                       (str "the recursion of `" f "` over a value of unknown shape")
+                       :else (do (swap! st assoc :unfolds (inc unfolds)) nil))))]
+      (do (swap! st update :used (fnil conj #{}) f)
+          (uninterpreted-call st f vs why))
+      (app-body st f vs d))))
+
+(defn- app-body
+  [st f vs d]
     (swap! st update :used (fnil conj #{}) f)
     (let [k [f vs]
           [r tau] (or (get-in @st [:memo k])
@@ -2123,7 +2156,7 @@
                         (swap! st assoc-in [:memo k] [r tau])
                         [r tau]))]
       (record-throw! st tau)
-      r)))
+      r))
 
 (defn- apply-fn [st fv vs]
   (cond
@@ -2280,11 +2313,11 @@
   "{:formula :decls} saying that under hyps, goal g is truthy, for every
   value of the typed variables -- and, when opts has :total, that its
   evaluation never throws; nil when some part is outside."
-  [{:keys [types defs tenv total lenient]} hyps g]
+  [{:keys [types defs tenv total lenient rets]} hyps g]
   (try
     (let [st (state)
           facts (atom [])
-          _ (swap! st assoc :defs-of defs :tenv tenv :total total)
+          _ (swap! st assoc :defs-of defs :tenv tenv :total total :rets (or rets {}))
           occurs (reduce into (t/vars g) (map t/vars hyps))
           env (into {} (for [v (sort-by str (keys types)) :when (contains? occurs v)]
                          [v (var-value st facts (get types v) tenv v)]))

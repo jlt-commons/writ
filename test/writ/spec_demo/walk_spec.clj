@@ -26,5 +26,8 @@
        (if (some? (capture pair m)) [:Hit 0 (capture pair m)] [:Hit 1 {}]))))
 
 (law a-depth-is-never-negative
-  {:require :tested :because "depth recurses into a form of any depth"}
   (forall [f Any] (<= 0 (depth f))))
+
+(law a-depth-is-at-most-the-printed-length
+  {:require :tested :because "pr-str is not modelled by the prover"}
+  (forall [f Any] (<= (depth f) (count (pr-str f)))))
