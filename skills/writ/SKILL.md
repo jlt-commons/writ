@@ -319,6 +319,19 @@ dependency documents, not whatever closes a proof.
 - ``assumes a signature for `ns/f`, which does not resolve`` - require
   the namespace in the spec and name the fn through its alias.
 
+A pure static member of a host class is assumed the same way, and the
+code may then call it, which the static check otherwise rejects:
+
+```clojure
+(assume Math/sqrt [Double -> Double])   ; java.lang.Math/sqrt is the same member
+```
+
+The signature types the calls, and the laws run against the real member,
+but what it returns is not checked (a member has no var to wrap). Assume
+only pure members. Members of `System`, `Runtime` and `Thread` and the
+random sources are refused: they are effects, which belong in the shell.
+Prefer the core fn where there is one (`abs`, not `Math/abs`).
+
 ## The proof namespace
 
 When a law holds but isn't proved, add what the prover needs in
@@ -361,11 +374,26 @@ When a law holds but isn't proved, add what the prover needs in
 - Maps are modelled: literals, `assoc`, `dissoc`, `merge`, `get`, `(:k m)`,
   `(m k)`, `contains?`, `count` and equality by entries, keys symbolic or
   not; `keys` and `vals` are unordered, so `every?` over them works and an
-  order-sensitive use gives up. A map of unknown size (a `(Map K V)`
-  variable) is outside.
+  order-sensitive use gives up.
+- A map of unknown size (a `(Map K V)` or `(Index :k R)` variable) and a
+  vector of unknown length (a `(Vec T)`) are read as arrays: `assoc`,
+  `dissoc`, `assoc-in`, `update`, `update-in`, `get`, `get-in`,
+  `contains?`, `conj`, `first`, `rest`, `nth` and `count` on them, and
+  equality of two maps changed from one, are proved for any size.
+  `every?`, `some`, `not-any?`, `filter`, `remove`, `map`, `seq` and
+  `empty?` over a map's entries, keys or vals, or over such a vector, are
+  read as quantified tests, so a refinement's rule over every member is
+  used where a step touches it. `count` of such a map or of a filter of it,
+  and `(reduce + 0 xs)` or `(apply + xs)` of its vals, are arithmetic:
+  "opening an account adds one" is proved. State laws over a whole store
+  with these forms and they are likely to be proved.
 - A recursive definition is unfolded, exactly, while a literal drives it --
   a pattern walked to its end, a vector of known length -- up to a depth
-  and a count; past them the law is left to testing.
+  and a count. Past them, a fn with a signature is left uninterpreted: some
+  value of its return type, equal for equal arguments, so what follows
+  from the type alone (a `Nat` result is at least 0) is still proved; the
+  rest needs a lemma or induction.
+- Induction on an integer is tried only where the code recurses on it.
 - A branch that gives up is dropped when the solver shows its path cannot
   be taken under the law's hypothesis, so `(=> (not (vector? x)) ...)`
   proves even though the code's vector branch walks elements the prover
@@ -508,7 +536,9 @@ Plain Clojure, with no writ require and no annotations. writ rejects:
 
 - Effects and interop: I/O, atoms and refs, futures, `eval`, `throw`,
   `new`, `.method`, `reify`, static members such as `System/getenv` or
-  `Math/abs` (use `abs`), reflection.
+  `Math/abs` (use `abs`), reflection. A pure static member the spec
+  assumes a signature for, `(assume Math/sqrt [Double -> Double])`, may be
+  called; see [Assumptions](#assumptions).
 - Top-level forms other than `ns`, `comment`, `def` and `defn`: no
   `defmulti`, `defrecord`, `defmacro`, `declare` or bare expressions.
   Each fn has one arity.
@@ -617,8 +647,13 @@ By hand: `(let [r (spec/check 'my.sort-spec)] (is (:ok r) (:message r)))`.
 Other options are `:trials`, the test.check runs per law (default 100;
 a law the prover does not prove gets up to 900 more, within 20s,
 `:more-trials false` turns that off),
-`:max-size`, the largest generated size (default 50), and
+`:max-size`, the largest generated size (default 50; a collection inside
+another gets its square root), `:parallel false`, which runs the laws one
+at a time instead of a thread per processor, and
 `:adequacy false`, which skips the gap check while a spec is being drafted.
+A report's `:timings` says where the time went, in milliseconds
+(`:static :tests :prover :more-trials :adequacy :graphs :total`), and each
+tested law carries `:test-ms`.
 
 ## Reading a report
 
@@ -737,6 +772,18 @@ confirm it, then without one.
   nothing. Tell the spec's owner: the premise may be unsatisfiable, or
   its inputs need building to fit (a refinement, or values folded into
   range in the law).
+- ``writ could not generate a value of refinement `R` `` - its predicate
+  rejects nearly every candidate, so its values would be the few small
+  ones a draw happens on. Refine its parts so values are built to fit, or
+  give it `{:build f}`.
+- ``` `f` returns values outside R: fix it first ``` - the laws listed
+  fail because `f` broke its return refinement; the message names the
+  clause of the predicate it breaks and the part of the value that breaks
+  it. Fix `f`, and the other failures often go with it.
+- ``law `x`: (<= a b) was never false in N trials, nor at an input the
+  solver found`` - a clause of the law that only ever went one way tests
+  one side only. Build inputs that turn it (a refinement, a value in the
+  law), or drop it if it always holds. Tell the spec's owner.
 - ``no witness among N generated values`` - the `exists` law found no
   value. Either the implementation is wrong, or the witness is too rare to
   generate.
@@ -829,6 +876,9 @@ confirm it, then without one.
   exactly its frame: the loop's slots or the defn's parameters. Match the count.
 - ``` `throw`/`new`/`.foo` is host interop or effect code ``` - writ checks
   pure data-and-functions code only; no host calls, no mutation, no effects.
+- ``` `Math/sqrt` is host interop or effect code ... (assume Math/sqrt [A -> R]) ```
+  - a static member. Use a core fn if there is one; if the member is pure,
+  the spec may assume its signature (see [Assumptions](#assumptions)).
 - ``` duplicate parameter in `f` ``` - parameters are binders: rename one, or
   use `_` for a parameter you ignore (it may repeat).
 - ``` def `x` must carry a value ``` - a book is never evaluated, so a def
