@@ -4848,7 +4848,8 @@
                                                 ;; a law its tests passed, which the
                                                 ;; solver's counterexample may refute
                                                 :refutes? (when (= :tested (:status r))
-                                                            #(some? (refuted ctx r %)))}))
+                                                            #(some? (refuted ctx r %)))
+                                                :counterexample-only (:counterexample-only r)}))
                            (catch Throwable e
                              {:proved false :reason (str "the prover failed: " (ex-message e))})))
             ;; that a step never throws is proved only by running it
@@ -4890,7 +4891,7 @@
                     apart (for [w seen] (cons 'or (for [x vars] (list 'not= x (get w x)))))
                     h* (if (seq apart) (list* 'and h apart) h)
                     none (reduce (fn [p [x t]] (list 'forall [x t] p)) (list 'not h*) (reverse bs))
-                    cex (completed ctx bs (:counterexample (attempt** {:law (:law r) :prop none} [] nil)))]
+                    cex (completed ctx bs (:counterexample (attempt** {:law (:law r) :prop none :counterexample-only true} [] nil)))]
                 (when (and cex (every? #(contains? cex %) vars)
                            (every? (fn [[x t]] (conforms? t (get cex x) (:tenv ctx))) bs)
                            (= :pass (:result (try (holds (assoc ctx :vars vars) h* cex)
@@ -5025,12 +5026,26 @@
                                           (assoc :unproved-final true))
                               nil]
                              :else [(assoc r :unproved-final true) nil]))))
-            pass (fn [[rs lemmas]]
-                   (let [steps (par-map #(step lemmas %) rs)]
-                     [(mapv first steps) (into lemmas (keep second steps))]))]
+            ;; the definitions a law or lemma reaches, by name
+            fns-of (memoize (fn [prop] (set (map first (first (reach (first @defs) prop))))))
+            ;; can one of the lemmas fresh help prove law r?  A lemma is a
+            ;; rewrite rule whose left side must match a term of the proof,
+            ;; so one that reaches none of the definitions r reaches never
+            ;; applies; one about clojure.core alone might
+            helps? (fn [fresh r]
+                     (let [mine (fns-of (:prop r))]
+                       (some (fn [l] (let [theirs (fns-of (:prop l))]
+                                       (or (empty? theirs) (some mine theirs))))
+                             fresh)))
+            ;; a later pass tries again only the laws a lemma proved in the
+            ;; pass before it might help: the rest would search as before
+            pass (fn [[rs lemmas] fresh]
+                   (let [steps (par-map #(if (and fresh (not (helps? fresh %))) [% nil] (step lemmas %)) rs)]
+                     [(mapv first steps) (into lemmas (keep second steps))]))
+            init (into (vec (::imports opts)) (:lemmas assumed))]
         ;; the proved laws of the specs this one uses come first
-        (loop [[rs lemmas] (pass [results (into (vec (::imports opts)) (:lemmas assumed))])]
-          (let [[rs2 lemmas2] (pass [rs lemmas])]
+        (loop [[rs lemmas] (pass [results init] nil), before (count init)]
+          (let [[rs2 lemmas2] (pass [rs lemmas] (subvec lemmas before))]
             (if (= (count lemmas2) (count lemmas))
               (do (when (and cache-dir @fresh) (save-proofs! cache-dir [spec-ns target] @writ-version @cached))
                   (let [rs2 (mapv #(dissoc % :unproved-final) rs2)
@@ -5053,7 +5068,7 @@
                                %)
                             rs2)
                       rs2)))
-              (recur [rs2 lemmas2]))))))))
+              (recur [rs2 lemmas2] (count lemmas)))))))))
 
 (def ^:private evidence-of
   {:proved :proof, :evaluated :proof, :witnessed :proof, :tested :test})

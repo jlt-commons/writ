@@ -646,11 +646,12 @@
   sigs, the target's signatures, {name {:params :ret}}; contracts, the
   rules prove-contracts gave for them; refutes?, when given, says whether
   a counterexample (values of the law's variables) is one running the code
-  confirms.
+  confirms; counterexample-only, true when only the solver's
+  counterexample is wanted, and no proof.
   Returns {:proved true :trace :summary :lemmas} or {:proved false :reason
   :stuck}, and :attempts, what each strategy tried did: {:name :outcome
   :fuel :ms}, the outcome :proved, :failed, :fuel or :rejected."
-  [{:keys [prop defs tenv target own fuel lemmas rets total hint lemma sigs contracts replay prover guards sym-budget refutes?]}]
+  [{:keys [prop defs tenv target own fuel lemmas rets total hint lemma sigs contracts replay prover guards sym-budget refutes? counterexample-only]}]
   (try
     (let [cfg (merge default-config prover)
           [bs0 body] (split-foralls prop)
@@ -726,7 +727,8 @@
           ;; a loop of the code that climbs on a law's integer names the
           ;; induction its recursion follows: that one goes first, before
           ;; rewriting unrolls the loop a split at a time
-          loop-climbs? (and (some (fn [[_ ty]] (contains? '#{Nat Int} ty)) bs)
+          loop-climbs? (and (not counterexample-only)
+                            (some (fn [[_ ty]] (contains? '#{Nat Int} ty)) bs)
                             (reaches-recursion? (:defs opts) (:lemmas opts) (concat (:hyps g) (:goals g)))
                             (some (fn [[v ty]] (and (contains? '#{Nat Int} ty)
                                                     (seq (fuelled #(climbing-bounds opts @terms v :loops-only true)))))
@@ -773,11 +775,12 @@
                        (when (:ok c)
                          (reset! lemmas-used (:lemmas-used c))
                          c)))
-          [trace used] (if replayed
-                         [replay (:unfolded replayed)]
-                         (or (first-proof tries) [nil #{}]))
+          [trace used] (cond
+                         replayed [replay (:unfolded replayed)]
+                         counterexample-only [nil #{}]
+                         :else (or (first-proof tries) [nil #{}]))
           ;; a fold into an accumulator: prove it adds, then try again with that
-          [trace used] (if (or trace @refuted)
+          [trace used] (if (or trace counterexample-only @refuted)
                          [trace used]
                          (or (first
                                (for [cand (accumulators opts (fuelled

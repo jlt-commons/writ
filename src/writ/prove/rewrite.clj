@@ -370,6 +370,12 @@
   Fourier-Motzkin elimination, tightened at each step for integers: a
   true answer is a proof, a false one only means no proof was found."
   [cs]
+  ;; an atom is a term, and equal terms made apart are apart objects: each
+  ;; is put in once, so a map holding it finds it by identity, not by
+  ;; comparing the terms.  The keys are the same, so is everything else
+  (let [canon (volatile! {})
+        one (fn [k] (or (get @canon k) (do (vswap! canon assoc k k) k)))
+        cs (map (fn [c] (update c :m #(into {} (map (fn [[k v]] [(one k) v])) %))) cs)]
   (loop [cs (map tighten cs), budget 400]
     (let [cs (distinct cs)]
       (cond
@@ -383,7 +389,7 @@
                                :let [a (get-in p [:m x]) b (- (get-in q [:m x]))]]
                            (tighten (lin+ (lin* b p) (lin* a q))))]
             (recur (concat rest combined) budget))
-          false)))))
+          false))))))
 
 (defn- division-bounds
   "What is known of a division atom, as constraints c + sum k*x >= 0.
@@ -417,8 +423,25 @@
             (for [a atoms :when (nat-atom? ctx a)] {:c 0 :m {a 1}})
             (mapcat #(division-bounds ctx %) atoms))))
 
+(declare ^:dynamic *provisional*)
+
+(declare decide-le*)
+
 (defn decide-le
-  "true / false / nil for 0 <= d, from its form, Nat atoms and the facts."
+  "true / false / nil for 0 <= d, from its form, Nat atoms and the facts.
+  Kept in the context's :int-memo, but not while an answer it rests on is
+  provisional."
+  [ctx d]
+  (let [memo (:int-memo ctx)
+        k [:le d]
+        hit (some-> memo deref (find k))]
+    (if hit
+      (val hit)
+      (let [r (decide-le* ctx d)]
+        (when (and memo (not *provisional*)) (swap! memo assoc k r))
+        r))))
+
+(defn- decide-le*
   [ctx d]
   (let [lf (lin-of ctx d)]
     (when lf
