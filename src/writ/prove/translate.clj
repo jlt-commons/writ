@@ -22,8 +22,9 @@
      sort sort-by distinct reverse last butlast take drop str name keyword
      vector? sequential? map? get nil? some?
      keyword? symbol? string? char? boolean?
-     hash-map assoc dissoc merge keys vals
-     subvec mapv filterv keep remove not-any? range conj number? fn?})
+     hash-map assoc dissoc merge keys vals get-in assoc-in update update-in
+     subvec mapv filterv keep remove not-any? range conj number? fn?
+     complement comp key val})
 
 (def ^:private vector-fns
   "The clojure.core fns whose value is always a vector."
@@ -100,6 +101,9 @@
     (contains? '#{same writ.spec/same writ.prove.term/same} s) [:core 'writ.prove.term/same]
     (and (contains? #{nil "clojure.core"} (namespace s))
          (contains? core-fns (symbol (name s)))) [:core (symbol (name s))]
+    ;; the set operations, as the prover reads sets: by membership
+    (and (= "clojure.set" (namespace s)) (contains? '#{intersection union difference} (symbol (name s))))
+    [:core (symbol (str "set-" (name s)))]
     :else nil))
 
 (defn- case-term [ctx env {:keys [scrut clauses default]}]

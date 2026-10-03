@@ -585,6 +585,39 @@
                   :facts (vec (take 8 (for [[f v] (t/sort-printed key facts)]
                                         (show (if (false? v) [:call 'not f] f)))))})))))
 
+(def ^:private counting-core
+  "The core fns that recurse on an integer argument."
+  '#{range repeat take drop nth take-last drop-last repeatedly iterate subvec nthrest nthnext})
+
+(defn- counts-on?
+  "Does variable v of terms reach an argument of a fn that calls itself, or
+  of a core fn that recurses on a count?  Followed through the
+  definitions the terms call, as the parameters v is passed in."
+  [defs terms v]
+  (let [mentions? (fn [taint x] (some taint (t/subterms x)))]
+    (loop [todo (mapv (fn [t] [t #{v}]) terms), seen #{}]
+      (if (empty? todo)
+        false
+        (let [[t taint] (peek todo), todo (pop todo)
+              subs (t/subterms t)]
+          (if (some #(and (= :call (head %)) (symbol? (second %))
+                          (contains? counting-core (symbol (name (second %))))
+                          (some (partial mentions? taint) (drop 2 %)))
+                    subs)
+            true
+            (let [calls (for [x subs
+                              :when (= :app (head x))
+                              :let [q (second x)
+                                    d (get defs q)
+                                    at (keep-indexed (fn [i a] (when (mentions? taint a) i)) (drop 2 x))]
+                              :when (and d (seq at))]
+                          [q d (set (keep #(nth (:params d) % nil) at))])]
+              (if (some (fn [[_ d]] (:recursive? d)) calls)
+                true
+                (let [fresh (remove #(contains? seen [(first %) (nth % 2)]) calls)]
+                  (recur (into todo (keep (fn [[_ d ps]] (when (:body d) [(:body d) ps])) fresh))
+                         (into seen (map (fn [[q _ ps]] [q ps]) fresh))))))))))))
+
 (defn prove-law
   "Try to prove a law.  prop is the desugared law, its names qualified;
   defs are the translated definitions; target the implementation's ns;
@@ -595,7 +628,7 @@
   Returns {:proved true :trace :summary :lemmas} or {:proved false :reason
   :stuck}, and :attempts, what each strategy tried did: {:name :outcome
   :fuel :ms}, the outcome :proved, :failed, :fuel or :rejected."
-  [{:keys [prop defs tenv target own fuel lemmas rets total hint lemma sigs contracts replay prover]}]
+  [{:keys [prop defs tenv target own fuel lemmas rets total hint lemma sigs contracts replay prover guards sym-budget]}]
   (try
     (let [cfg (merge default-config prover)
           [bs0 body] (split-foralls prop)
@@ -609,6 +642,13 @@
           defs (merge defs (:defs recs))
           opts {:defs defs :tenv tenv :types (into {} (map (fn [[x ty]] [x (plain ty)])) bs)
                 :total total :vary (:vary hint) :recognizers recs
+                ;; the refinements' predicates, as hypotheses a proof may
+                ;; try without first
+                :guards (or guards #{})
+                ;; the symbolic proofs tried, so two strategies that run the
+                ;; same goal whole ask the solver once
+                :sym-memo (atom {})
+                :sym-budget sym-budget
                 :unfolded unfolded :fuel (or fuel (:fuel cfg)) :lemmas-used lemmas-used
                 :depth (:depth cfg) :enum-limit (:enum-limit cfg) :plausible-samples (:plausible-samples cfg)
                 :rets (or rets {}) :burned burned
@@ -649,10 +689,16 @@
           terms (delay (let [raw (concat (:hyps g) (:goals g))]
                          (vec (keep (fn [x] (fuelled #(rw/normalize (rw/context opts) x)))
                                     (distinct (concat raw (filter #(= :app (head %)) (mapcat t/subterms raw))))))))
+          ;; induction on an integer helps only where the code recurses on
+          ;; it: where it reaches an argument of a fn that calls itself (a
+          ;; loop is one), or of a core fn that counts, such as range.
+          ;; Elsewhere, the step case is the law again, and the search a waste
+          on-int? (fn [v ty] (or (not (contains? '#{Nat Int} ty)) (= v (:induct hint))
+                                 (counts-on? defs (concat (:hyps g) (:goals g)) v)))
           ;; an integer that a loop counts up to a bound, by induction on
           ;; the distance left
           climbing (for [[v ty] bs-order
-                         :when (contains? '#{Nat Int} ty)
+                         :when (and (contains? '#{Nat Int} ty) (on-int? v ty))
                          e (or (fuelled #(climbing-bounds opts @terms v)) [])]
                      [[:climb v (t/show e)] #(by-climbing opts g v ty e)])
           ;; a loop of the code that climbs on a law's integer names the
@@ -661,7 +707,7 @@
           loop-climbs? (some (fn [[v ty]] (and (contains? '#{Nat Int} ty)
                                                 (seq (fuelled #(climbing-bounds opts @terms v :loops-only true)))))
                              bs)
-          structural (for [[v ty] bs-order] [[:induct v] #(by-induction opts g v ty)])
+          structural (for [[v ty] bs-order :when (on-int? v ty)] [[:induct v] #(by-induction opts g v ty)])
           induction (concat climbing structural)
           groups {:symbolic-cases [(first symbolic)] :symbolic [(second symbolic)] :rewriting rewriting
                   :climbing climbing :structural structural :induction induction}

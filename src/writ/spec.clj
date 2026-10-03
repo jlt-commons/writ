@@ -59,6 +59,7 @@
             [clojure.test.check :as tc]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
+            [clojure.test.check.random :as random]
             [clojure.test.check.rose-tree :as rose]))
 
 (defn- fail! [& msg]
@@ -158,8 +159,11 @@
      (fail! "`spec` names a namespace symbol, had: `" (pr-str target) "`"))
    (when-not (map? opts)
      (fail! "`spec " target "` takes an options map after the namespace, had: " (pr-str opts)))
-   (when-let [bad (seq (remove #{:require :uses :test} (keys opts)))]
-     (fail! "`spec " target "` has unknown options: " (pr-str bad) "; it takes :require, :uses and :test"))
+   (when-let [bad (seq (remove #{:require :uses :test :baseline} (keys opts)))]
+     (fail! "`spec " target "` has unknown options: " (pr-str bad) "; it takes :require, :uses, :test and :baseline"))
+   (when (and (contains? opts :baseline) (not (string? (:baseline opts))))
+     (fail! "`spec " target "` :baseline is the path of a record the check compares the spec with, had: "
+            (pr-str (:baseline opts))))
    (when (contains? opts :require) (check-level! (str "`spec " target "`") (:require opts)))
    (when (and (contains? opts :uses) (not (and (vector? (:uses opts)) (every? simple-sym? (:uses opts)))))
      (fail! "`spec " target "` :uses takes a vector of spec namespaces, had: " (pr-str (:uses opts))))
@@ -224,8 +228,9 @@
   of another namespace, whose alias in the spec namespace is resolved."
   [g]
   (if-let [n (namespace g)]
-    (let [a (get (ns-aliases *ns*) (symbol n))]
-      (symbol (if a (str (ns-name a)) n) (name g)))
+    (if-let [a (get (ns-aliases *ns*) (symbol n))]
+      (symbol (str (ns-name a)) (name g))
+      (l/host-name g))
     g))
 
 (defmacro calls
@@ -302,6 +307,10 @@
   proofs rest on."
   [nm x]
   (cond
+    (and (symbol? nm) (l/host-member? nm) (l/effect-member? (resolve-callee nm)))
+    (fail! "`assume " nm "`: `" nm "` is effect code (the clock, the environment, threads or "
+           "randomness), which no signature makes pure; keep it in the effect shell")
+
     (and (symbol? nm) (namespace nm) (vector? x))
     `(-register! '~(ns-name *ns*) :assume-fn '~[(resolve-callee nm) (parse-sig (str "`assume " nm "`") x)])
 
@@ -349,11 +358,19 @@
   A refinement can go wherever a type goes: in `ann`, in `forall`, as a
   graph's state.  Its values are generated to satisfy the predicate, the
   prover takes the predicate as a hypothesis, and the static check sees
-  the base type.  It also defines the predicate as a fn, `Row?`."
-  [nm binder pred]
+  the base type.  It also defines the predicate as a fn, `Row?`.
+
+  A value a random one of the base type rarely meets -- a receipt whose
+  total is the sum of its items -- is built rather than filtered for:
+  (refine Receipt [r ...] pred {:build settle}) generates base values and
+  hands each to the spec's fn `settle`, which makes it one that meets pred."
+  [nm binder pred & [opts]]
   (when-not (and (simple-sym? nm) (vector? binder) (= 2 (count binder)) (simple-sym? (first binder)))
     (fail! "`refine` is (refine Name [x BaseType] predicate), had: "
            (pr-str (list 'refine nm binder '...))))
+  (when (and (some? opts) (not (and (map? opts) (= #{:build} (set (keys opts))) (simple-sym? (:build opts)))))
+    (fail! "`refine " nm "` takes one option, {:build f}: f names the spec's fn that makes a base"
+           " value one of the refinement, had: " (pr-str opts)))
   (let [[v base] binder
         pred-name (symbol (str nm "?"))
         ;; an Index's keys and unique fields are part of what a value of it
@@ -364,8 +381,9 @@
                  (if (true? pred) own (list 'and own pred)))
                pred)]
     `(do (defn ~pred-name ~(str "Is `" v "` a " nm "?") [~v] ~pred)
-         (-register! '~(ns-name *ns*) :refine '~{:name nm :var v :base base :pred pred
-                                                 :pred-name pred-name}))))
+         (-register! '~(ns-name *ns*) :refine '~(cond-> {:name nm :var v :base base :pred pred
+                                                         :pred-name pred-name}
+                                                  opts (assoc :build (:build opts)))))))
 
 (defmacro invariant
   "State what always holds of a graph state's values, wherever they come
@@ -412,16 +430,20 @@
   ([id text] (question* id text {}))
   ([id text opts] (question* id text opts)))
 
-(def ^:private graph-keys #{:states :edges :start :never :before :final :tested :witnesses :runs :depth :actors})
+(def ^:private graph-keys #{:states :edges :start :never :before :final :tested :witnesses :runs :depth :actors
+                             :model})
 
 (declare guard-of)
+
+(declare one-line-helpers)
 
 (defn- when-shape!
   "An edge's :when must be (fn [state arg ...] test), taking the edge fn's
   n arguments."
   [edge w n]
   (when-not (and (seq? w) (= 'fn (first w)) (vector? (second w)) (= 3 (count w)))
-    (fail! edge " needs :when (fn [state arg ...] test), had " (pr-str w)))
+    (fail! edge " needs :when (fn [state arg ...] test), or the name of a fn of the spec, of one"
+           " expression, that takes the step's arguments in its order; had " (pr-str w)))
   (when-not (= n (count (second w)))
     (fail! edge ": its :when takes the fn's " n " argument(s), in the fn's order, had "
            (pr-str (second w)))))
@@ -434,8 +456,11 @@
   [where {:keys [actors edges] :as m}]
   (assoc m :edges
          (into {} (for [[from es] edges]
-                    [from (into {} (for [[k tos] es]
-                                     [k (if-not (and (map? tos) (contains? tos :by))
+                    [from (into {} (for [[k tos0] es]
+                                     [k (if (vector? tos0)
+                                          (mapv #(get-in (by->when where (assoc m :edges {from {k %}})) [:edges from k]) tos0)
+                                          (let [tos tos0]
+                                          (if-not (and (map? tos) (contains? tos :by))
                                           tos
                                           (let [edge (str where ": the edge " (pr-str from) " " (pr-str k))
                                                 by (:by tos)
@@ -463,7 +488,7 @@
                                                            (and (seq? own) (= 'and (first own))) (concat own [test])
                                                            :else (list 'and own test))]
                                             (cond-> (assoc tos :when (list 'fn ps body))
-                                              w (assoc :own-when w))))]))]))))
+                                              w (assoc :own-when w))))))]))]))))
 
 (def ^:private projections
   "clojure.core fns an edge may use to take a state out of a tuple state:
@@ -511,6 +536,29 @@
   is refused, and the state stays as it was."
   [nm m0]
   (let [where (str "`graph " nm "`")
+        ;; a :when that names a spec fn of the edge fn's arguments, as
+        ;; :when may-borrow?, is that fn's own (fn [params] body), so the
+        ;; graph and the laws share one guard and its clauses are each seen
+        named-when (fn [k w]
+                     (let [n (inc (count (remove #{'_} (rest k))))
+                           [ps body] (get (one-line-helpers (ns-name *ns*)) w)]
+                       (cond
+                         (and ps (= n (count ps))) (list 'fn ps body)
+                         ps (fail! where ": the edge " (pr-str k) " names :when " w ", which takes "
+                                   (count ps) " argument(s); the step's fn takes " n)
+                         ;; not the spec's: the shape check says what a :when is
+                         :else w)))
+        m0 (if (and (map? m0) (map? (:edges m0)))
+             (update m0 :edges
+                     (fn [es] (into {} (for [[from e] es]
+                                         [from (if (map? e)
+                                                 (into {} (for [[k tos] e
+                                                                :let [named (fn [c] (if (and (map? c) (symbol? (:when c)))
+                                                                                      (update c :when #(named-when k %))
+                                                                                      c))]]
+                                                            [k (if (vector? tos) (mapv named tos) (named tos))]))
+                                                 e)]))))
+             m0)
         m (if (and (map? m0) (map? (:edges m0)) (every? map? (vals (:edges m0))))
             (by->when where m0)
             m0)]
@@ -525,6 +573,13 @@
                      (or (nil? (:role a)) (keyword? (:role a))))
         (fail! where ": :actors is {:type T :role :key}: the type of the argument that acts, and the key"
                " of it that holds the role (none when the value is the role), had " (pr-str a))))
+    (when-let [md (:model m)]
+      (when-not (and (map? md) (simple-sym? (:view md)) (map? (:steps md))
+                     (every? (fn [[k v]] (and (simple-sym? k) (simple-sym? v))) (:steps md))
+                     (every? #{:view :steps} (keys md)))
+        (fail! where ": :model is {:view f :steps {step model-step ...}}: the spec's fn from a state to"
+               " its model, and for each step fn of the graph the spec's fn that does the same to the"
+               " model, taking the model and the step's other arguments; had " (pr-str md))))
     (when (and (contains? m :runs) (not (pos-int? (:runs m))))
       (fail! where ": :runs is how many runs to walk from :start, a positive integer, had "
              (pr-str (:runs m))))
@@ -550,7 +605,17 @@
         (known! "an edge" from)
         (when-not (map? es)
           (fail! where ": the edges from " (pr-str from) " must be a map of [fn ArgType ...] to states"))
-        (doseq [[k tos] es]
+        (doseq [[k tos0] es
+                ;; a step of cases, each a map with its own :when
+                :let [_ (when (vector? tos0)
+                          (when-not (and (seq tos0)
+                                         (every? #(and (map? %) (contains? % :when) (contains? % :to)
+                                                       (not (contains? % :else)))
+                                                 tos0))
+                            (fail! where ": the edge " (pr-str from) " " (pr-str k) " gives a vector of cases;"
+                                   " each is a map with its own :when and :to, and no :else -- where no case"
+                                   " holds the step is refused and keeps the state")))]
+                tos (if (vector? tos0) tos0 [tos0])]
           (when-not (and (vector? k) (simple-sym? (first k)))
             (fail! where ": an edge from " (pr-str from) " is keyed [fn ArgType ...], had " (pr-str k)))
           (when (< 1 (count (filter #{'_} (rest k))))
@@ -565,8 +630,17 @@
               (when-let [bad (seq (remove #{:to :when :else :changes :by :own-when} (keys tos)))]
                 (fail! edge " has unknown keys " (pr-str bad) "; an edge map takes :to, :when, :else, :changes and :by"))
               (when (contains? tos :changes)
-                (when-not (and (vector? ch) (seq ch) (every? keyword? ch))
-                  (fail! edge ": :changes is a vector of the keys the step may change, had " (pr-str ch))))
+                (when-not (and (vector? ch) (seq ch)
+                               (every? #(or (keyword? %)
+                                            (and (vector? %) (keyword? (first %))
+                                                 (every? (fn [x] (or (keyword? x) (number? x) (string? x)
+                                                                     (and (seq? x) (= 'arg (first x)) (= 2 (count x))
+                                                                          (integer? (second x)) (<= 1 (second x) (dec n)))))
+                                                         (rest %))))
+                                       ch))
+                  (fail! edge ": :changes is a vector of the keys the step may change, or of paths into the"
+                         " state such as [:copies (arg i)], where (arg i) is the step's i-th argument after the"
+                         " state, 1 to " (dec n) "; had " (pr-str ch))))
               (when (or (contains? tos :when) (not (contains? tos :changes)))
                 (when-shape! edge w n))
               (when (and el (not (contains? tos :when)))
@@ -705,6 +779,26 @@
    `(-register! '~(ns-name *ns*) :law '~(cond-> {:name nm :prop prop}
                                           (seq opts) (assoc :opts opts)))))
 
+(defmacro example
+  "An example of what fn f returns at given arguments:
+
+    (example price [6000] 12000)
+
+  It is checked as a law, (= (price 6000) 12000), named example:price:N.
+  It also asks of the other laws that they pin f down there: a stand-in
+  that agrees with f everywhere but at the example, where it answers
+  otherwise, must break one of them, or the report says no law says what
+  f returns there."
+  [f args out]
+  (when-not (and (simple-sym? f) (vector? args))
+    (fail! "`example` is (example f [arg ...] result), had " (pr-str (list 'example f args out))))
+  (let [spec-ns (ns-name *ns*)
+        n (inc (count (filter #(and (:example %) (= f (:fn (:example %))))
+                              (:laws (get @registry spec-ns)))))]
+    `(-register! '~spec-ns :law '~{:name (symbol (str "example:" f ":" n))
+                                   :prop (list '= (list* f args) out)
+                                   :example {:fn f :args args :out out}})))
+
 ;; --- propositions ----------------------------------------------------------
 
 (defn- head? [f s]
@@ -727,6 +821,91 @@
               (reverse (partition 2 bs))))
     (or (head? p "and") (head? p "=>"))
     (cons (first p) (map desugar (rest p)))
+    :else p))
+
+;; --- an integer between bounds ----------------------------------------------------
+
+(def ^:private binding-heads
+  '#{let let* fn fn* loop loop* for doseq letfn binding when-let if-let when-some if-some
+     as-> cond-> cond->> some-> some->> case condp})
+
+(defn- inline-helpers
+  "form with each call of a spec helper -- a defn of one expression that
+  binds no names of its own -- replaced by its body at the call's
+  arguments, to depth 4.  helpers: name -> [params body]."
+  [form helpers]
+  (let [plain? (fn [[_ body]] (not-any? #(and (seq? %) (contains? binding-heads (first %)))
+                                        (tree-seq coll? seq body)))
+        helpers (into {} (filter (comp plain? val)) helpers)]
+    (letfn [(inl [f depth]
+              (cond
+                (and (seq? f) (contains? helpers (first f)) (pos? depth)
+                     (= (count (first (get helpers (first f)))) (count (rest f))))
+                (let [[params body] (get helpers (first f))]
+                  (inl (walk/postwalk-replace (zipmap params (map #(inl % depth) (rest f))) body)
+                       (dec depth)))
+                (seq? f) (apply list (map #(inl % depth) f))
+                (vector? f) (mapv #(inl % depth) f)
+                :else f))]
+      (inl form 4))))
+
+(defn- bounds-of
+  "An atom of an integer t's range as a vector of [:lo L k] (L + k <= t),
+  [:up U k] (t + k <= U) and [:fact f] (a part without t); nil when t
+  appears some other way."
+  [a t]
+  (let [has-t? #(some #{t} (tree-seq coll? seq %))
+        pair (fn [op l r]
+               (let [k (if (= '< op) 1 0)]
+                 (cond
+                   (not (or (has-t? l) (has-t? r))) [[:fact (list op l r)]]
+                   (and (= t l) (not (has-t? r))) [[:up r k]]
+                   (and (= t r) (not (has-t? l))) [[:lo l k]])))]
+    (cond
+      (not (has-t? a)) [[:fact a]]
+      (not (and (seq? a) (symbol? (first a)))) nil
+      :else
+      (let [op (symbol (name (first a))), xs (vec (rest a))]
+        (case op
+          (< <=) (when (>= (count xs) 2)
+                   (let [ps (map #(pair op %1 %2) xs (rest xs))]
+                     (when (every? some? ps) (vec (apply concat ps)))))
+          (> >=) (bounds-of (apply list (if (= '> op) '< '<=) (rseq xs)) t)
+          = (when (= 2 (count xs))
+              (let [[l r] xs]
+                (cond (and (= t l) (not (has-t? r))) [[:lo r 0] [:up r 0]]
+                      (and (= t r) (not (has-t? l))) [[:lo l 0] [:up l 0]])))
+          nil)))))
+
+(defn- eliminate-exists
+  "Each (exists [t Nat] P), or over Int, whose body -- its spec helpers
+  inlined -- is a conjunction of bounds on t and facts without t, read as
+  the facts and each lower bound at most each upper one: over the
+  integers there is such a t exactly then.  The prover reads that, and a
+  test evaluates it exactly, where sampling t could miss the one value.
+  An exists of any other shape is left as it is."
+  [p helpers]
+  (cond
+    (head? p "exists")
+    (let [[q [t ty] body] p
+          body (eliminate-exists body helpers)
+          tn (when (symbol? ty) (symbol (name ty)))
+          flat (fn flat [f] (if (head? f "and") (mapcat flat (rest f)) [f]))
+          parts (when (contains? '#{Nat Int} tn)
+                  (map #(bounds-of % t) (flat (inline-helpers body helpers))))]
+      (if (or (nil? parts) (some nil? parts))
+        (list q [t ty] body)
+        (let [xs (apply concat parts)
+              facts (keep #(when (= :fact (first %)) (second %)) xs)
+              los (cond-> (filter #(= :lo (first %)) xs) (= 'Nat tn) (conj [:lo 0 0]))
+              ups (filter #(= :up (first %)) xs)
+              meets (for [[_ l k1] los, [_ u k2] ups
+                          :let [k (+ k1 k2)]]
+                      (list '<= (if (zero? k) l (list '+ l k)) u))
+              cs (distinct (concat facts meets))]
+          (case (count cs) 0 true 1 (first cs) (cons 'and cs)))))
+    (head? p "forall") (let [[q b body] p] (list q b (eliminate-exists body helpers)))
+    (or (head? p "and") (head? p "=>")) (cons (first p) (map #(eliminate-exists % helpers) (rest p)))
     :else p))
 
 (defn- auto-proof
@@ -969,6 +1148,99 @@
 (def ^:private finite-double
   (gen/double* {:NaN? false :infinite? false}))
 
+(defn- domain-size
+  "How many values type t has, when it is a handful: a Bool, a refinement
+  of an integer over a finite range, an enumeration.  nil for a type with
+  many.  A refinement of a finite type has at most its base's values."
+  [t tenv]
+  (let [t (plain t)]
+    (cond
+      (= 'Bool t) 2
+      (= 'Unit t) 1
+      (refinement t tenv) (let [r (refinement t tenv)]
+                            (or (some-> (:window r) count)
+                                (when-not (:window r) (domain-size (:base r) tenv))))
+      (and (symbol? t) (data-decl t tenv))
+      (let [[d args] (data-decl t tenv)
+            cs (keys (:ctors d))]
+        (when (and (seq cs) (every? #(empty? (:fields (ctor-info d args %))) cs))
+          (count cs)))
+      :else nil)))
+
+(defn- record-field-type
+  "The type of field k of a record type r, or of the record a refinement
+  refines."
+  [r k tenv]
+  (let [r (plain r)]
+    (cond (map? r) (get r k)
+          (refinement r tenv) (record-field-type (:base (refinement r tenv)) k tenv)
+          :else nil)))
+
+(defn- collection-type?
+  "Is t a collection whose length its generator chooses from the size?"
+  [t tenv]
+  (let [t (plain t)]
+    (or (and (seq? t) (contains? '#{List Vec Set Map} (first t)))
+        (and (kind/index-type? t) (not (data-decl t tenv))))))
+
+(defn- element-gen
+  "The generator of a collection's elements of type t.  An element that is
+  itself a collection is at most the square root of the size long, so a
+  map of vectors stays near the size rather than its square; the values
+  inside keep the whole size, so a number in a nested vector is as large
+  as one anywhere.  A collection of a type with few values keeps the
+  whole size."
+  [t tenv]
+  (let [tenv (dissoc tenv ::nested)
+        t* (plain t)
+        ;; a vector of a few values, such as a queue of members, keeps the
+        ;; whole size: its elements cost little, and its repeats are the point
+        few? (and (seq? t*) (contains? '#{List Vec Set} (first t*)) (domain-size (second t*) tenv))]
+    (type->gen t (cond-> tenv (and (collection-type? t tenv) (not few?)) (assoc ::nested true)))))
+
+(defn- max-length
+  "The longest a collection may be at size s: s, its root when the
+  collection is inside another, and no more than cap."
+  [tenv s cap]
+  (cond-> (if (::nested tenv) (long (Math/sqrt s)) s)
+    cap (min cap)))
+
+(defn- capped-vector
+  "A vector of g, no longer than max-length allows."
+  [g tenv cap]
+  (if (or cap (::nested tenv))
+    (gen/sized (fn [s] (gen/vector g 0 (max-length tenv s cap))))
+    (gen/vector g)))
+
+(defn- keys-first
+  "A generator of [[key value] ...] with distinct keys: the keys drawn as
+  a vector the size long, as many as a collection's entries, and a value
+  made for each distinct one.  As many keys come out as when whole
+  entries are drawn and those that share a key dropped, but no value is
+  made to be dropped: a map over three titles draws its values three
+  times, not fifty."
+  [kg vg tenv]
+  (gen/sized
+    (fn [s]
+      (gen/bind (gen/vector kg 0 (max-length tenv s nil))
+                (fn [ks]
+                  (let [ks (vec (distinct ks))]
+                    (if (empty? ks)
+                      (gen/return [])
+                      (gen/fmap #(mapv vector ks %) (apply gen/tuple (repeat (count ks) vg))))))))))
+
+(defn- index-records
+  "Records for an index keyed by k.  When its key type has few values,
+  the keys are drawn first and a record made for each, its key set: a
+  record that would land on a key already taken is never made."
+  [r k tenv]
+  (if-let [kt (when (domain-size (record-field-type r k tenv) tenv) (record-field-type r k tenv))]
+    (gen/fmap (fn [kvs] (into [] (comp (map (fn [[kk rec]] (if (map? rec) (assoc rec k kk) rec)))
+                                       (filter #(conforms? r % tenv)))
+                              kvs))
+              (keys-first (type->gen kt tenv) (element-gen r tenv) tenv))
+    (capped-vector (element-gen r tenv) tenv nil)))
+
 (defn type->gen
   "The test.check generator for values of type `t`."
   [t tenv]
@@ -1042,7 +1314,7 @@
                                 m
                                 (assoc m (get x k) x)))
                             {} rs))
-                  (gen/vector (type->gen r tenv))))
+                  (index-records r k tenv)))
 
       (seq? t)
       (let [[h & as] t
@@ -1051,14 +1323,25 @@
           Opt (gen/frequency [[1 (gen/return nil)] [3 (el 0)]])
           ;; a (List T) is any seq Clojure hands around: a list, a vector,
           ;; a lazy seq or nil.  Shrinking prefers the list.
-          List (let [g (el 0)]
-                 (gen/frequency [[3 (gen/list g)]
-                                 [3 (gen/vector g)]
-                                 [2 (gen/fmap #(map identity %) (gen/list g))]
+          List (let [g (element-gen (nth as 0) tenv)
+                     v (capped-vector g tenv nil)
+                     l (if (::nested tenv) (gen/fmap #(apply list %) v) (gen/list g))]
+                 (gen/frequency [[3 l]
+                                 [3 v]
+                                 [2 (gen/fmap #(map identity %) l)]
                                  [1 (gen/return nil)]]))
-          Vec (gen/vector (el 0))
-          Set (gen/set (el 0))
-          Map (gen/map (el 0) (el 1))
+          Vec (capped-vector (element-gen (nth as 0) tenv) tenv nil)
+          Set (let [g (element-gen (nth as 0) tenv)]
+                (if (::nested tenv)
+                  (gen/sized (fn [s] (gen/set g {:max-elements (max-length tenv s nil)})))
+                  (gen/set g)))
+          ;; keys first, when they have few values: a map over three
+          ;; keys never draws fifty values to keep three
+          Map (let [kg (element-gen (nth as 0) tenv)
+                    vg (element-gen (nth as 1) tenv)]
+                (cond (domain-size (nth as 0) tenv) (gen/fmap #(into {} %) (keys-first kg vg tenv))
+                      (::nested tenv) (gen/sized (fn [s] (gen/map kg vg {:max-elements (max-length tenv s nil)})))
+                      :else (gen/map kg vg)))
           (Tuple &) (apply gen/tuple (map #(type->gen % tenv) as))
           -> (fn-gen (type->gen (last t) tenv))
           (if-let [[d args] (data-decl t tenv)]
@@ -1071,6 +1354,46 @@
   "`n` generated values of type `t`, for a look at what laws are run on."
   ([t tenv] (sample t tenv 10))
   ([t tenv n] (gen/sample (type->gen t tenv) n)))
+
+(def ^:dynamic *parallel*
+  "Whether par-map may spread its work over threads: false under a check
+  with {:parallel false}, and inside a par-map's own work, so a nested one
+  runs on the thread it is given."
+  true)
+
+(defn- par-map
+  "(mapv f xs), the calls spread over one thread a processor.  The results
+  keep the order of xs; the first exception a call threw, in that order,
+  is thrown again."
+  [f xs]
+  (let [xs (vec xs)
+        n (min (count xs) (.availableProcessors (Runtime/getRuntime)))]
+    (if (or (not *parallel*) (< n 2))
+      (mapv f xs)
+      (let [next-i (atom -1)
+            out (object-array (count xs))
+            work (fn []
+                   (binding [*parallel* false]
+                     (loop []
+                       (let [i (swap! next-i inc)]
+                         (when (< i (count xs))
+                           (aset out i (try {:ok (f (nth xs i))} (catch Throwable e {:thrown e})))
+                           (recur))))))]
+        (run! deref (doall (repeatedly n #(future (work)))))
+        (mapv #(if (contains? % :thrown) (throw (:thrown %)) (:ok %)) out)))))
+
+(defn- draw
+  "The value of type t drawn at size and seed.  The draw is deterministic,
+  so a check makes it once: (:draws ctx), an atom, keeps it for every
+  stand-in and law that asks for the same one."
+  [ctx t size seed]
+  (let [make #(gen/generate (type->gen t (:tenv ctx)) size seed)]
+    (if-let [cache (:draws ctx)]
+      ;; a delay, so threads that want the same draw at once make it once
+      (let [k [t size seed]]
+        @(or (get @cache k)
+             (get (swap! cache #(if (contains? % k) % (assoc % k (delay (make))))) k)))
+      (make))))
 
 ;; --- evaluating laws ---------------------------------------------------------
 
@@ -1090,6 +1413,12 @@
                     (contains? target-publics f) (symbol (name target) (name f))
                     (contains? spec-interns f) (symbol (name spec-ns) (name f))
                     :else f)
+              ;; an alias of the spec's, set/intersection, by its namespace's
+              ;; own name, which the prover knows
+              (and (symbol? f) (namespace f))
+              (if-let [a (try (get (ns-aliases (the-ns spec-ns)) (symbol (namespace f))) (catch Throwable _ nil))]
+                (symbol (str (ns-name a)) (name f))
+                f)
               (and (seq? f) (= 'quote (first f))) f
               (and (seq? f) (quant? f))
               (let [[q [x t] body] f] (list q [x t] (walk body (conj bound x))))
@@ -1152,7 +1481,11 @@
   "A nested quantifier: sampled over a handful of generated values."
   [ctx [q [x t] body] env]
   (let [ctx* (update ctx :vars conj x)
-        vals (gen/sample (type->gen t (:tenv ctx)) 20)
+        g (type->gen t (:tenv ctx))
+        ;; drawn from the values around it, so a check with a seed
+        ;; replays the same samples
+        base (hash env)
+        vals (map #(gen/generate g % (+ base %)) (range 20))
         rs (map #(holds ctx* body (assoc env x %)) vals)]
     (if (= "forall" (name q))
       (or (first (filter #(= :fail (:result %)) rs)) {:result :pass})
@@ -1233,6 +1566,32 @@
 
 (def ^:private witness-trials 1000)
 
+(defn- law-atoms
+  "The clauses of a law whose outcome a test should see both ways: each
+  comparison in it, and each part of its hypotheses, that mentions one of
+  its variables.  Not inside a fn literal, whose locals a test cannot
+  bind.  At most 8."
+  [body vars]
+  (let [vars (set vars)
+        mentions? (fn [f] (some vars (tree-seq coll? seq f)))
+        walk (fn walk [f]
+               (cond
+                 (and (seq? f) (contains? '#{fn fn* letfn} (first f))) []
+                 (seq? f) (concat (when (contains? '#{< <= > >=} (first f)) [f]) (mapcat walk (rest f)))
+                 (coll? f) (mapcat walk f)
+                 :else []))
+        flat (fn flat [f] (if (and (seq? f) (contains? '#{and or not} (first f))) (mapcat flat (rest f)) [f]))
+        hyps (loop [p body, hs []] (if (head? p "=>") (recur (nth p 2) (into hs (flat (nth p 1)))) hs))]
+    (vec (take 8 (distinct (filter #(and (seq? %) (mentions? %)) (concat hyps (walk body))))))))
+
+(defn- count-atoms!
+  "Note how each atom came out at env, in counts: {atom {true n false n}}."
+  [ctx atoms counts env]
+  (doseq [a atoms]
+    (let [r (run-term ctx a env)]
+      (when (contains? r :ok)
+        (swap! counts update-in [a (boolean (:ok r))] (fnil inc 0))))))
+
 (defn- test-law
   [ctx {:keys [name prop witness]} {:keys [trials seed max-size]}]
   (let [[bs body] (leading-foralls prop)
@@ -1279,11 +1638,17 @@
       (let [vars (mapv first bs)
             ctx* (assoc ctx :vars vars)
             discards (atom 0)
+            atoms (law-atoms body vars)
+            counts (atom {})
             res (qc (prop/for-all* (mapv #(type->gen (second %) (:tenv ctx)) bs)
                                    (fn [& vals]
                                      (case (:result (holds ctx* body (zipmap vars vals)))
-                                       :pass true
-                                       :discard (do (swap! discards inc) true)
+                                       :pass (do (count-atoms! ctx* atoms counts (zipmap vars vals)) true)
+                                       ;; a trial its hypothesis refused still shows
+                                       ;; how the hypothesis came out
+                                       :discard (do (swap! discards inc)
+                                                    (count-atoms! ctx* atoms counts (zipmap vars vals))
+                                                    true)
                                        false))))]
         (cond
           (not (:pass? res))
@@ -1300,7 +1665,7 @@
 
           :else
           {:law name :status :tested :trials (:num-tests res) :seed (:seed res)
-           :discarded @discards})))))
+           :discarded @discards :coverage @counts})))))
 
 ;; --- adequacy: does the spec pin the code down? ------------------------------
 
@@ -1360,16 +1725,36 @@
                          :kind :pass-through
                          :make (fn [_] (fn [& args] (nth args i)))}))
                     (:params sig))
-      (let [h (if (seq? ret) (first ret) ret)]
+      ;; the real result, changed a little: the mistakes that keep its
+      ;; type -- one off, an element dropped or added, a field changed
+      (let [h (if (seq? ret) (first ret) ret)
+            el (when (and (seq? ret) (contains? '#{List Vec Set} h))
+                 (try (gen/generate (type->gen (second ret) tenv) 3 seed) (catch Throwable _ nil)))]
         (case h
-          (Nat Int) [(wrap "returns one more than the real result" inc)]
+          Nat [(wrap "returns one more than the real result" inc)
+               (wrap "returns one less than the real result (one more at 0)" #(if (pos? %) (dec %) 1))]
+          Int [(wrap "returns one more than the real result" inc)
+               (wrap "returns one less than the real result" dec)]
           Bool [(wrap "returns the opposite of the real result" not)]
           String [(wrap "returns the real result with a character appended" #(str % "x"))]
-          List [(wrap "returns the real result reversed" reverse)
-                (wrap "returns the real result without its first element" rest)]
-          Vec [(wrap "returns the real result reversed" #(vec (reverse %)))
-               (wrap "returns the real result without its first element" #(vec (rest %)))]
-          (when other [(wrap "returns a different value than the real result" other)])))
+          List (cond-> [(wrap "returns the real result reversed" reverse)
+                        (wrap "returns the real result without its first element" rest)
+                        (wrap "returns the real result without its last element" #(or (butlast %) ()))]
+                 (some? el) (conj (wrap (str "returns the real result with " (pr-str el) " added") #(cons el %))))
+          Vec (cond-> [(wrap "returns the real result reversed" #(vec (reverse %)))
+                       (wrap "returns the real result without its first element" #(vec (rest %)))
+                       (wrap "returns the real result without its last element" #(vec (butlast %)))]
+                (some? el) (conj (wrap (str "returns the real result with " (pr-str el) " added") #(conj (vec %) el))))
+          Set (cond-> [(wrap "returns the real result without one of its elements" #(if (seq %) (disj % (first (sort-by pr-str %))) %))]
+                (some? el) (conj (wrap (str "returns the real result with " (pr-str el) " added") #(conj (set %) el))))
+          (if (and (map? ret) (seq ret) (every? keyword? (keys ret)))
+            ;; a record: each field, changed alone
+            (vec (for [[k kt] (sort-by (comp str key) ret)
+                       :let [o (other-value (plain kt) tenv seed)]
+                       :when o]
+                   (wrap (str "returns the real result with its " k " changed")
+                         #(if (map? %) (update % k o) %))))
+            (when other [(wrap "returns a different value than the real result" other)]))))
       (when other
         (for [[i vs] (sort-by key pins)
               :when (not (and (= 'Bool (plain (nth (:params sig) i nil)))
@@ -1447,10 +1832,11 @@
             run (fn [g args] (try {:ok (apply g args)} (catch Throwable _ ::threw)))
             differ (fn [g]
                      (when gens
-                       (first (for [i (range 60)
-                                    :let [args (map-indexed (fn [j gn] (gen/generate gn (mod i 20) (+ seed i (* 31 j)))) gens)]
+                       (first (for [i (range 200)
+                                    :let [args (map-indexed (fn [j t] (draw ctx t (mod i 20) (+ seed i (* 31 j)))) (:params sig))]
                                     :when (not= (run real args) (run g args))]
-                                (zipmap (map-indexed (fn [i _] (nth params i (symbol (str "arg" i)))) (:params sig)) args)))))]
+                                (with-meta (zipmap (map-indexed (fn [i _] (nth params i (symbol (str "arg" i)))) (:params sig)) args)
+                                  {::args (vec args)})))))]
         (->> (mutation-sites (vec body))
              (take (* 4 budget))
              (keep (fn [[path x desc]]
@@ -1463,6 +1849,7 @@
                            (when d
                              {:desc (str desc ", and it differs from the real fn on " (pr-str d))
                               :kind :mutant
+                              :args (::args (meta d))
                               :make (fn [_] g)}))))))
              (take budget))))))
 
@@ -1481,45 +1868,185 @@
 
       :else
       (let [vars (mapv first bs)
-            ctx* (assoc ctx :vars vars)
-            gens (mapv #(type->gen (second %) (:tenv ctx)) bs)]
+            ctx* (assoc ctx :vars vars)]
         ;; each variable its own seed: with one seed, two variables of a
         ;; type get the same value every time, and a law relating them
         ;; never sees them differ
-        (every? (fn [i]
-                  (not= :fail (:result (holds ctx* body
-                                              (zipmap vars (map-indexed
-                                                             (fn [j g] (gen/generate g (mod i 30)
-                                                                                     (+ seed i (* 7919 j))))
-                                                             gens))))))
-                (range n))))))
+        (and (every? (fn [i]
+                       (not= :fail (:result (holds ctx* body
+                                                   (zipmap vars (map-indexed
+                                                                  (fn [j [_ t]] (draw ctx t (mod i 30)
+                                                                                          (+ seed i (* 7919 j))))
+                                                                  bs))))))
+                     (range n))
+             ;; the inputs the solver found to meet a hypothesis no sample meets
+             (every? #(not= :fail (:result (holds ctx* body %))) (::witness (meta prop))))))))
+
+(defn- calls-on-vars
+  "The calls of fn qnm in law prop whose arguments are each a variable
+  the law binds or an expression of none: where the law can be run at
+  given arguments of qnm.  Each as {var arg-position}."
+  [prop qnm n]
+  (let [[bs body] (leading-foralls prop)
+        vars (set (map first bs))
+        free? (fn [x] (not-any? vars (tree-seq coll? seq x)))]
+    (vec (distinct
+           (for [c (tree-seq coll? seq body)
+                 :when (and (seq? c) (= qnm (first c)) (= n (count (rest c))))
+                 :let [args (vec (rest c))]
+                 :when (every? #(or (contains? vars %) (free? %)) args)
+                 :let [pos (into {} (keep-indexed (fn [i a] (when (contains? vars a) [a i]))) args)]
+                 :when (seq pos)]
+             pos)))))
+
+(defn- rejects-at?
+  "Does law prop fail when run with fn qnm's arguments set to args, at a
+  call that takes them straight from the law's variables, the law's
+  other variables drawn n times?  A pinned value its variable's type
+  does not take is no input of the law."
+  [ctx prop qnm args n seed]
+  (let [[bs body] (leading-foralls prop)
+        vars (mapv first bs)
+        types (into {} bs)
+        ctx* (assoc ctx :vars vars)]
+    (boolean
+      (some (fn [pos]
+              (let [pinned (into {} (for [[v i] pos] [v (nth args i)]))]
+                (when (every? (fn [[v x]] (conforms? (get types v) x (:tenv ctx))) pinned)
+                  (let [rest-bs (remove #(contains? pinned (first %)) bs)]
+                    (some (fn [i]
+                            (= :fail (:result
+                                       (holds ctx* body
+                                              (merge (zipmap (map first rest-bs)
+                                                             (map-indexed (fn [j [_ t]] (draw ctx t (mod i 30) (+ seed i (* 7919 j))))
+                                                                          rest-bs))
+                                                     pinned)))))
+                          (range n))))))
+            (calls-on-vars prop qnm (count args))))))
+
+(def ^:dynamic *stand-ins*
+  "var -> the fn a stand-in puts in its place, on this thread: a var
+  adequacy dispatches calls it while it judges stand-ins, so threads judge
+  different ones at once."
+  {})
+
+(defn- dispatching
+  "In place of fn real at var v: the stand-in this thread has for v, or real."
+  [v real]
+  (fn [& args]
+    (if-let [g (get *stand-ins* v)]
+      (apply g args)
+      (apply real args))))
+
+(declare adequacy*)
 
 (defn- adequacy
-  "Swap each signed public fn for its impostors, one at a time, and run
-  every law against each.  Returns, per fn, [{:fn f :laws n :rejected
+  "Swap each signed public fn for its impostors, and run every law against
+  each.  The impostors of every fn are judged at once, each on its own
+  thread's view of the fns.  Returns, per fn, [{:fn f :laws n :rejected
   [impostor] :survivors [desc]}]: a survivor is a gap in the spec."
   [ctx target fns anns props trials seed & [extra]]
-  (vec (for [nm fns
+  (let [vars (into {} (for [nm fns
+                            :let [v (ns-resolve (the-ns target) nm)]
+                            :when (and (var? v) (fn? @v))]
+                        [nm [v @v]]))]
+    (try
+      (doseq [[_ [v real]] vars] (alter-var-root v (constantly (dispatching v real))))
+      (adequacy* ctx target fns anns props trials seed extra vars)
+      (finally
+        (doseq [[_ [v real]] vars] (alter-var-root v (constantly real)))))))
+
+(defn- adequacy*
+  [ctx target fns anns props trials seed extra vars]
+  (let [per-fn
+        (vec (for [nm fns
              :let [v (ns-resolve (the-ns target) nm)
-                   real @v
+                   real (or (second (get vars nm)) @v)
                    sig (get anns nm)
                    argn (vec (take (count (:params sig)) (first (:arglists (meta v)))))
                    qnm (symbol (name target) (name nm))
                    pins (pinned-args props qnm (count (:params sig)))
+                   ;; a mutant is told apart at the input that shows it: when
+                   ;; the samples miss it, each law that calls the fn on its
+                   ;; own variables is run there, so a survivor is a gap in
+                   ;; the laws, not in the data
+                   ;; a stand-in off an example is judged by the other laws:
+                   ;; the example's own law rejects it, and says nothing of them
+                   judges (fn [imp] (if (= :off-example (:kind imp)) (remove #(::example (meta %)) props) props))
                    survives? (fn [imp]
                                (try
-                                 (alter-var-root v (constantly ((:make imp) real)))
-                                 (every? #(holds-sampled? ctx % trials seed) props)
-                                 (catch Throwable _ false)
-                                 (finally (alter-var-root v (constantly real)))))
-                   {survived true rejected false}
-                   (group-by (comp boolean survives?)
-                             (concat (impostors nm sig argn (:tenv ctx) seed pins)
+                                 (binding [*stand-ins* {v ((:make imp) real)}]
+                                   (and (every? #(holds-sampled? ctx % trials seed) (judges imp))
+                                        (not (and (:args imp)
+                                                  (some #(rejects-at? ctx % qnm (:args imp) 10 seed) (judges imp))))))
+                                 (catch Throwable _ false)))
+                   off-examples (let [ret (plain (:ret sig))
+                                      other (other-value ret (:tenv ctx) seed)]
+                                  (when other
+                                    (for [{:keys [args out]} (keep #(let [x (::example (meta %))]
+                                                                      (when (= nm (:fn x)) x))
+                                                                   props)
+                                          :let [args (vec args) wrong (other out)]
+                                          :when (not= wrong out)]
+                                      {:desc (str "agrees with the real fn except at " (pr-str (list* nm args))
+                                                  ", where it returns " (pr-str wrong) " -- the example says "
+                                                  (pr-str out) ", and no other law says what `" nm "` returns there")
+                                       :kind :off-example
+                                       :args args
+                                       :make (fn [real] (fn [& a] (if (= (vec a) args) wrong (apply real a))))})))
+                   gap-desc (fn [imp]
+                              (if (and (:args imp) (not= :off-example (:kind imp)))
+                                (str (:desc imp)
+                                     (if (some #(seq (calls-on-vars % qnm (count (:args imp)))) props)
+                                       ", and no law tells it apart, even run there"
+                                       (str ", and no law calls `" nm "` on its own variables, so none could be run there")))
+                                (:desc imp)))
+                   imps (vec (concat (impostors nm sig argn (:tenv ctx) seed pins)
+                                     off-examples
                                      (when extra (extra nm sig))))]]
+           {:nm nm :v v :real real :qnm qnm :imps imps :survives? survives? :gap-desc gap-desc}))
+        ;; the values every stand-in is judged on, drawn first and at once:
+        ;; judged at once, the stand-ins would all wait on the same draw
+        _ (par-map (fn [[t size sd]] (try (draw ctx t size sd) (catch Throwable _ nil)))
+                   (distinct (for [p props
+                                   :let [[bs] (leading-foralls p)]
+                                   i (range trials)
+                                   [j [_ t]] (map-indexed vector bs)]
+                               [t (mod i 30) (+ seed i (* 7919 j))])))
+        ;; every stand-in of every fn, judged at once
+        verdicts (par-map (fn [[i imp]] ((:survives? (nth per-fn i)) imp))
+                          (for [[i f] (map-indexed vector per-fn), imp (:imps f)] [i imp]))
+        verdicts (loop [vs verdicts, fs per-fn, out []]
+                   (if-let [f (first fs)]
+                     (let [n (count (:imps f))]
+                       (recur (drop n vs) (rest fs) (conj out (vec (take n vs)))))
+                     out))]
+    (vec (for [[{:keys [nm v real qnm imps gap-desc]} vs] (map vector per-fn verdicts)
+               :let [{survived true rejected false} (group-by first (map vector vs imps))
+                     survived (map second survived)
+                     rejected (map second rejected)
+                   ;; which laws, each on its own, tell some stand-in apart: a
+                   ;; law that tells none says no more than the types do
+                   about (filter #(some #{qnm} (tree-seq coll? seq %)) props)
+                   credited (reduce (fn [done imp]
+                                      (let [open (remove #(or (nil? (::law (meta %))) (contains? done (::law (meta %))))
+                                                         about)]
+                                        (if (empty? open)
+                                          (reduced done)
+                                          (try
+                                            (binding [*stand-ins* {v ((:make imp) real)}]
+                                              (into done (keep #(when-not (holds-sampled? ctx % trials seed)
+                                                                  (::law (meta %)))
+                                                               open)))
+                                            (catch Throwable _ done)))))
+                                    #{} rejected)]]
          {:fn nm
-          :laws (count (filter #(some #{qnm} (tree-seq coll? seq %)) props))
-          :rejected (mapv #(dissoc % :make) rejected)
-          :survivors (mapv :desc survived)})))
+          :laws (count about)
+          :about (set (keep #(::law (meta %)) about))
+          :credited credited
+          :impostors (+ (count rejected) (count survived))
+          :rejected (mapv #(dissoc % :make :args) rejected)
+          :survivors (mapv gap-desc survived)}))))
 
 ;; --- the target's source -----------------------------------------------------
 
@@ -2189,14 +2716,20 @@
   parameters (where `_` marks it, else first), the edge's key as written,
   and its targets in the order the graph lists its states."
   [[_ m]]
-  (for [[from es] (:edges m), [[f & args :as k] v] es
-        :let [tos (if (map? v) (:to v) v)]]
+  ;; a step of several cases, [{:when ... :to ...} ...], is an edge per
+  ;; case, each knowing every case's guard and targets
+  (for [[from es] (:edges m), [[f & args :as k] v0] es
+        [i v] (if (vector? v0) (map-indexed vector v0) [[nil v0]])
+        :let [tos (if (map? v) (:to v) v)
+              in-order #(filterv (set %) (keys (:states m)))]]
     (cond-> {:from from :f f :args (vec (remove #{'_} args)) :key k
              :pos (or (first (keep-indexed #(when (= '_ %2) %1) args)) 0)
-             :tos (filterv (set tos) (keys (:states m)))}
+             :tos (in-order tos)}
       (and (map? v) (:when v)) (assoc :guard (:when v) :else (or (:else v) :keep)
                                       :by (:by v) :own-when (:own-when v))
-      (and (map? v) (:changes v)) (assoc :changes (:changes v)))))
+      (and (map? v) (:changes v)) (assoc :changes (:changes v))
+      i (assoc :case (inc i)
+               :cases (mapv (fn [c] {:guard (:when c) :tos (in-order (:to c))}) v0)))))
 
 (defn- insert-at [v i x] (vec (concat (take i v) [x] (drop i v))))
 
@@ -2277,7 +2810,7 @@
   test that is an `and`, one per clause says it fails while the others
   hold, so each clause rules out something of its own."
   [[gname m :as g] refs invs]
-  (vec (for [{:keys [from f args tos pos guard else changes by own-when]} (graph-edges g)
+  (vec (for [{:keys [from f args tos pos guard else changes by own-when case cases]} (graph-edges g)
              :let [ty #(get (:states m) %)
                    ref-of #(let [t (plain (ty %))] (when (symbol? t) (get refs t)))
                    refined? (every? ref-of tos)
@@ -2286,7 +2819,8 @@
                    ;; assume them
                    inv? #(seq (invariants-of invs gname %))
                    landing? (or refined? (some inv? tos))]
-             :when (or landing? guard (seq changes))
+             :let [model-step (get-in m [:model :steps f])]
+             :when (or landing? guard (seq changes) model-step)
              :let [v (or (:var (ref-of from)) 's)
                    avs (reduce (fn [acc [i t]]
                                  (conj acc (if (fixed-arg? t) (second t) (arg-var t i (set (conj acc v))))))
@@ -2318,13 +2852,15 @@
                           (when (and entered? (seq hs)) (if (next hs) (cons 'and hs) (first hs))))
                    pre (cond (and held test) (list 'and held test) held held :else test)
                    under (fn [p] (if pre (list '=> pre p) p))
-                   edge (str gname ":" (name from) ":" f)
+                   step-name (str gname ":" (name from) ":" f)
+                   edge (str step-name (when case (str "#" case)))
+                   sfx (when case (str "#" case))
                    tested (get-in m [:tested from])
                    off-proof #(cond-> % tested (assoc :opts {:require :tested :because tested}))]
              law (concat
                    (when landing?
                      (cons (off-proof
-                             {:name (symbol edge) :oid (str "edge." gname "." (name from) "." f)
+                             {:name (symbol edge) :oid (str "edge." gname "." (name from) "." f sfx)
                               :prop (list 'forall binders (under (lands tos)))
                               :explain (str "a " f " from " (name from)
                                             (when test " that passes its guard")
@@ -2346,17 +2882,64 @@
                    ;; a frame: the keys the step may change, and every other
                    ;; key, named by the record or not, as it was
                    (when (seq changes)
-                     [(off-proof
-                        {:name (symbol (str edge ":frame"))
-                         :oid (str "frame." gname "." (name from) "." f)
-                         :prop (list 'forall binders
-                                     (under (list '= (list* 'dissoc call changes) (list* 'dissoc v changes))))
-                         :explain (str "a " f " from " (name from) " may change only "
-                                       (str/join ", " changes) ", and must keep every other key as it was")
-                         :graph gname})])
+                     (let [;; (arg i), the step's i-th argument after the state
+                           at (fn [x] (if (and (seq? x) (= 'arg (first x))) (nth avs (dec (second x))) x))
+                           paths (mapv #(if (vector? %) (mapv at %) %) changes)]
+                       [(off-proof
+                          {:name (symbol (str edge ":frame"))
+                           :oid (str "frame." gname "." (name from) "." f sfx)
+                           :prop (list 'forall binders
+                                       (under (if (every? keyword? paths)
+                                                (list '= (list* 'dissoc call paths) (list* 'dissoc v paths))
+                                                (list '= (list 'writ.spec/without call paths)
+                                                      (list 'writ.spec/without v paths)))))
+                           :explain (str "a " f " from " (name from) " may change only "
+                                         (str/join ", " (map pr-str changes))
+                                         ", and must keep everything else as it was")
+                           :graph gname})]))
+                   ;; the step does to the model what the model's own step does
+                   (when model-step
+                     (let [view (get-in m [:model :view])]
+                       [(off-proof
+                          {:name (symbol (str edge ":model"))
+                           :oid (str "model." gname "." (name from) "." f sfx)
+                           :prop (list 'forall binders
+                                       (under (list '= (list view call) (list* model-step (list view v) avs))))
+                           :explain (str "a " f " from " (name from) " must do to its " view " what "
+                                         model-step " does")
+                           :graph gname})]))
+                   ;; a step of cases: once, that where no case holds it is
+                   ;; refused, and that no two cases hold at once
+                   (when (= 1 case)
+                     (let [tests (mapv #(guard-of (:guard %) call-args) cases)
+                           pairs (for [i (range (count tests)) j (range (inc i) (count tests))] [i j])]
+                       (cons (off-proof
+                               {:name (symbol (str step-name ":refused"))
+                                :oid (str "refused." gname "." (name from) "." f)
+                                ;; some case holds, or the state is kept: an
+                                ;; implication from "no case holds" starves
+                                ;; when the cases cover every input
+                                :prop (list 'forall binders
+                                            (let [p (list 'or (cons 'or tests) (list '= call v))]
+                                              (if held (list '=> held p) p)))
+                                :explain (str "when none of its cases holds, a " f " from " (name from)
+                                              " must leave it as it was")
+                                :graph gname
+                                :total true})
+                             (for [[i j] pairs]
+                               {:name (symbol (str step-name ":cases" (when (next pairs) (str "." (inc i) "." (inc j)))))
+                                :oid (str "cases." gname "." (name from) "." f "." (inc i) "." (inc j))
+                                :prop (list 'forall binders
+                                            (let [p (list 'not (list 'and (nth tests i) (nth tests j)))]
+                                              (if held (list '=> held p) p)))
+                                :explain (str "cases " (inc i) " and " (inc j) " of " f " from " (name from)
+                                              " both hold: a step is in one case at most, or which it takes is"
+                                              " left to the code")
+                                ;; about the spec's guards, not the code
+                                :graph gname :guard-law true}))))
                    (when guard
                      (concat
-                       (when (or (= :keep else) (ref-of else) (inv? else))
+                       (when (and (nil? case) (or (= :keep else) (ref-of else) (inv? else)))
                          [(off-proof
                             {:name (symbol (str edge ":refused"))
                              :oid (str "refused." gname "." (name from) "." f)
@@ -2375,7 +2958,7 @@
                              :graph gname
                              :total true})])
                        [{:name (symbol (str edge ":when"))
-                         :oid (str "guard." gname "." (name from) "." f)
+                         :oid (str "guard." gname "." (name from) "." f sfx)
                          :prop (list 'exists binders test)
                          :explain (str "the guard of " f " from " (name from) " never holds: no generated "
                                        (name from) " and arguments pass it, so the step can never be taken")
@@ -2383,7 +2966,7 @@
                        (let [cs (guard-clauses test)]
                          (for [[i c] (map-indexed vector cs)]
                            {:name (symbol (str edge ":when." (inc i)))
-                            :oid (str "guard." gname "." (name from) "." f "." (inc i))
+                            :oid (str "guard." gname "." (name from) "." f sfx "." (inc i))
                             :prop (list 'exists binders
                                         (list* 'and (list 'not c) (concat (take i cs) (drop (inc i) cs))))
                             :explain (str "clause " (pr-str (nth (guard-clauses (nth guard 2)) i))
@@ -2432,6 +3015,18 @@
            ", so nothing tells them apart and a step between them checks only the type;"
            " make each a refinement that says what sets it apart"))))
 
+(defn without
+  "m with each of paths taken out: a key, or a path to an entry, which is
+  left out of the map that holds it.  What a frame compares."
+  [m paths]
+  (reduce (fn [m p]
+            (cond
+              (keyword? p) (dissoc m p)
+              (= 1 (count p)) (dissoc m (first p))
+              (map? (get-in m (pop p))) (update-in m (pop p) dissoc (peek p))
+              :else m))
+          m paths))
+
 (defn- graph-flow-errors
   "Each edge's fn must take its state's type, and return its targets'."
   [[gname m :as g] anns refs]
@@ -2443,7 +3038,7 @@
                :let [t (base (ty from))
                      edge (str "graph `" gname "`: the edge " (pr-str from) " " (pr-str key))]
                err (if (kind/record-type? t)
-                     (for [k changes :when (not (contains? t k))]
+                     (for [c changes :let [k (if (vector? c) (first c) c)] :when (not (contains? t k))]
                        (str edge ": :changes names " k ", which the record of " (pr-str from)
                             " does not have; name only its keys"))
                      [(str edge ": :changes needs a record state, but " (pr-str from) " is a " (pr-str t)
@@ -2559,6 +3154,11 @@
 
 (def ^:private default-depth 20)
 
+(def ^:private guard-draws
+  "How many plain draws a run makes for a guarded step before it draws
+  from the state's own integers; it makes twice as many of those."
+  4)
+
 (defn- graph-runs
   "Walk :runs runs through the graph's real steps.  Each starts at the
   :start value and takes up to :depth steps (default 20): at each, an
@@ -2579,29 +3179,80 @@
           start-v (try (binding [*ns* (the-ns spec-ns)] (eval (qualify-form (second st))))
                        (catch Throwable _ ::none))
           pick (fn [k r] (gen/generate (gen/choose 0 (dec k)) 30 r))
-          call-edge (fn [v {:keys [f args pos guard]} r]
-                      (let [avs (map-indexed
-                                  (fn [j t] (if (fixed-arg? t)
-                                              (second t)
-                                              (list 'quote (gen/generate (type->gen t tenv)
-                                                                         30 (+ r j 1)))))
-                                  args)
-                            call-args (insert-at (vec avs) pos (list 'quote v))
-                            call (qualify-form (apply list f call-args))
-                            ev #(binding [*ns* (the-ns spec-ns)] (eval %))]
+          ;; a guard compares an argument with the state, most often: a
+          ;; payment with the order's total.  On a searching step a draw it
+          ;; refuses is tried again, then with the state's own integers and
+          ;; their neighbours, so a run gets past a guard a random value
+          ;; rarely meets.  Each step's refusal is counted, by edge
+          refusals (atom {})
+          draw (fn [v args r i]
+                 (let [pool (vec (distinct (mapcat (fn [n] [n (inc n) (dec n)])
+                                                   (filter integer? (tree-seq coll? seq v)))))]
+                   (vec (map-indexed
+                          (fn [j t]
+                            (if (fixed-arg? t)
+                              (second t)
+                              (list 'quote
+                                    (let [g (type->gen t tenv)
+                                          sd (+ r j 1 (* 104729 i))
+                                          x (when (and (>= i guard-draws) (seq pool)
+                                                       (contains? '#{Nat Int} (plain t)))
+                                              (gen/generate (gen/elements pool) 30 sd))]
+                                      (if (and (some? x) (conforms? t x tenv)) x (gen/generate g 30 sd))))))
+                          args))))
+          call-edge (fn [v {:keys [f args pos guard cases]} r search?]
+                      (let [ev #(binding [*ns* (the-ns spec-ns)] (eval %))
+                            call-args (fn [avs] (insert-at avs pos (list 'quote v)))
+                            passes? #(try (boolean (ev (qualify-form (guard-of guard (call-args %)))))
+                                          (catch Throwable _ false))
+                            ;; every other step takes its first draw, so a
+                            ;; run still meets the guard's refusals
+                            avs (if (and guard (or search? (odd? r)))
+                                  (let [tries (map #(draw v args r %) (range (* 3 guard-draws)))]
+                                    (or (first (filter passes? tries)) (first tries)))
+                                  (draw v args r 0))
+                            call (qualify-form (apply list f (call-args avs)))]
                         (try (cond-> {:v (ev call)}
-                               guard (assoc :passes (boolean (ev (qualify-form (guard-of guard call-args))))))
+                               guard (assoc :passes (passes? avs))
+                               ;; a step of cases: the targets of whichever case holds
+                               cases (assoc :case-tos
+                                            (some (fn [c] (when (try (boolean (ev (qualify-form (guard-of (:guard c) (call-args avs)))))
+                                                                     (catch Throwable _ false))
+                                                            (:tos c)))
+                                                  cases)))
                              (catch Throwable ex {:thrown (ex-message ex)}))))
           conforms (fn [s v] (try (conforms? (get (:states m) s) v tenv) (catch Throwable _ false)))
-          run (fn [i]
+          ;; how many steps each state is from s, by the graph's edges
+          preds (reduce (fn [m [from es]] (reduce #(update %1 %2 (fnil conj #{}) from) m (mapcat :tos es)))
+                        {} edges)
+          steps-to (memoize
+                     (fn [s]
+                       (loop [d {s 0}, frontier [s], k 1]
+                         (let [nxt (distinct (remove d (mapcat preds frontier)))]
+                           (if (empty? nxt)
+                             d
+                             (recur (into d (map #(vector % k) nxt)) nxt (inc k)))))))
+          ;; a run toward a state takes, at each step, an edge that brings it
+          ;; closer when there is one, and looks for arguments its guard takes
+          run (fn [i & [toward]]
                 (loop [state (first st), v start-v, path [(first st)], k 0]
-                  (let [es (get edges state)]
-                    (if (or (empty? es) (= k depth))
+                  (let [es (get edges state)
+                        es (if-let [d (some-> toward steps-to)]
+                             (or (seq (filter (fn [e] (some #(< (get d % ##Inf) (get d state ##Inf)) (:tos e))) es))
+                                 es)
+                             es)]
+                    (if (or (empty? es) (= k depth) (and toward (= state toward)))
                       {:path path}
                       (let [r (+ (or seed 0) (* 7919 i) (* 31 k))
                             {:keys [tos guard else] :as e} (nth es (pick (count es) r))
-                            {nv :v thrown :thrown passes :passes} (call-edge v e r)
-                            refused (and guard (not passes))
+                            {nv :v thrown :thrown passes :passes case-tos :case-tos} (call-edge v e r (boolean toward))
+                            ;; a case refused is no refusal when another case holds
+                            refused (and guard (not passes) (not case-tos))
+                            tos (if (and guard (not passes) case-tos) case-tos tos)
+                            _ (when guard
+                                (swap! refusals update [state (:f e)]
+                                       (fnil #(update % (if refused :refused :passed) inc)
+                                             {:refused 0 :passed 0})))
                             tos (if refused (if (= :keep else) [state] [else]) tos)
                             land (first (filter #(conforms % nv) tos))
                             fail (fn [why] {:path path :value v :reason why})]
@@ -2621,9 +3272,19 @@
                             (recur land nv (conj path land) (inc k)))))))))]
       (if (= ::none start-v)
         {:failures [] :visited #{}}
-        (let [rs (map run (range n))]
+        (let [rs (doall (map run (range n)))
+              ;; a final state no run happened to reach: runs toward it,
+              ;; until one gets there
+              missed (remove (set (mapcat :path rs)) (:final m))
+              toward (doall (mapcat (fn [f]
+                                      (let [ts (map #(run (+ n %) f) (range n))]
+                                        (concat (take-while #(not (some #{f} (:path %))) ts)
+                                                (take 1 (drop-while #(not (some #{f} (:path %))) ts)))))
+                                    missed))
+              rs (concat rs toward)]
           {:failures (vec (distinct (filter :reason rs)))
-           :visited (set (mapcat :path rs))})))))
+           :visited (set (mapcat :path rs))
+           :refusals @refusals})))))
 
 (defn- vacuous-invariants
   "Invariants the state's own type already says: the prover shows them
@@ -2978,7 +3639,7 @@
     (let [forms (remove #(head? % "ns") (mapcat second (lib-pairs target)))
           xs (tree-seq coll? seq forms)
           kws (set (filter #(and (keyword? %) (nil? (namespace %))) xs))
-          ints (set (filter #(and (integer? %) (<= -1000 % 1000)) xs))
+          ints (set (filter #(and (integer? %) (<= -1000000000 % 1000000000)) xs))
           near (set (mapcat (fn [n] [(dec n) n (inc n)]) ints))]
       {'Keyword kws
        'Int near
@@ -2986,33 +3647,162 @@
        'Any (into kws near)})
     (catch Throwable _ {})))
 
+(def ^:private filter-size
+  "The largest size a filtered generator draws at.  test.check's such-that
+  grows the size by one each time its predicate refuses a value, so 5000
+  refusals would draw vectors 5000 long."
+  200)
+
+(defn- starved-error [nm what]
+  (ex-info (str "writ could not generate a value of refinement `" nm
+                "`: its predicate rejected " what ". Refine its parts"
+                " (a refined field, a narrower base type) so values are built"
+                " to fit rather than filtered, or give it {:build f}, a fn of"
+                " the spec that makes any value of its base one of it.")
+           {:writ/error true}))
+
+(def ^:private sizable
+  "The size from which a filter's candidates count toward its starving."
+  20)
+
+(defn- filtered
+  "gen/such-that, as test.check has it -- each refused candidate the next
+  one drawn a size larger -- but no larger than filter-size.  A
+  refinement's filter (opts from such-that-opts) also starves when fewer
+  than one in 200 of its candidates of size 20 or more meet it, after 1000
+  of them: the values it finds are the few small ones a random draw
+  happens on, such as a receipt with no items, and a law tested on them
+  tests little."
+  [pred g {:keys [max-tries ex-fn] :as opts}]
+  (let [nm (::name opts)
+        big (atom [0 0])]
+    (gen/->Generator
+      (fn [rnd size]
+        (loop [rnd rnd, size size, k 0]
+          (when (>= k max-tries)
+            (throw (ex-fn {:pred pred :gen g :max-tries max-tries})))
+          (let [[r1 r2] (random/split rnd)
+                sz (min size filter-size)
+                tree ((:gen g) r1 sz)
+                ok (pred (rose/root tree))]
+            (when (and nm (>= sz sizable))
+              (let [[t h] (swap! big (fn [[t h]] [(inc t) (if ok (inc h) h)]))]
+                (when (and (>= t 1000) (< (* 200 h) t))
+                  (throw (starved-error nm (str "all but " h " of the " t " candidates of size "
+                                                sizable " or more"))))))
+            (if ok
+              (rose/filter pred tree)
+              (recur r2 (inc size) (inc k)))))))))
+
 (defn- such-that-opts
   "How hard to look for a value of a refinement.  A value can be rare --
   a tag and an exact score together -- so it tries many times, and says
   which refinement starved if it still finds none."
   [nm]
   {:max-tries 5000
-   :ex-fn (fn [_] (ex-info (str "writ could not generate a value of refinement `" nm
-                                "`: its predicate rejected 5000 candidates. Refine its parts"
-                                " (a refined field, a narrower base type) so values are built"
-                                " to fit rather than filtered.")
-                           {:writ/error true}))})
+   ::name nm
+   :ex-fn (fn [_] (starved-error nm "5000 candidates in a row"))})
+
+(defn- fitting
+  "A fn that sets the fields of a refinement's value that its predicate
+  pins, or nil when it pins none: a conjunct (= :placed (:status o)) sets
+  :status, (zero? (:paid o)) sets :paid to 0, (= (:paid o) (:total o))
+  gives :paid the value of :total, and a tuple's (first t), (second t)
+  and (nth t i) are positions.  The spec's one-line helpers are read
+  through, (unpaid? o) as its body.  A value a random one of the base
+  rarely meets is then built rather than filtered for; the predicate
+  still judges it."
+  [r tenv]
+  (let [x (:var r)
+        form (or (:pred-form r) (when-not (fn? (:pred r)) (:pred r)))
+        helpers (::helpers tenv {})
+        conjuncts (fn conjuncts [f depth]
+                    (cond
+                      (and (seq? f) (= 'and (first f))) (mapcat #(conjuncts % depth) (rest f))
+                      (and (seq? f) (symbol? (first f)) (= [x] (vec (rest f))) (< depth 4))
+                      (if-let [[[p] body] (let [h (get helpers (symbol (name (first f))))]
+                                            (when (= 1 (count (first h))) h))]
+                        (conjuncts (walk/postwalk-replace {p x} body) (inc depth))
+                        [f])
+                      :else [f]))
+        place (fn [f]
+                (when (and (seq? f) (= x (second f)))
+                  (let [[h _ b] f n (count f)]
+                    (cond (and (keyword? h) (= 2 n)) [:key h]
+                          (and (= 'get h) (keyword? b) (= 3 n)) [:key b]
+                          (and (= 'first h) (= 2 n)) [:pos 0]
+                          (and (= 'second h) (= 2 n)) [:pos 1]
+                          (and (= 'nth h) (nat-int? b) (= 3 n)) [:pos b]))))
+        lit? #(or (keyword? %) (number? %) (string? %) (nil? %) (boolean? %))
+        sets (for [f (conjuncts form 0)
+                   :when (seq? f)
+                   :let [[h a b] f n (count f)
+                         s (cond
+                             (and (= '= h) (= 3 n) (place a) (lit? b)) [:const (place a) b]
+                             (and (= '= h) (= 3 n) (lit? a) (place b)) [:const (place b) a]
+                             (and (= '= h) (= 3 n) (place a) (place b)) [:copy (place a) (place b)]
+                             (and (= 'zero? h) (= 2 n) (place a)) [:const (place a) 0]
+                             (and (= 'nil? h) (= 2 n) (place a)) [:const (place a) nil]
+                             (and (= 'true? h) (= 2 n) (place a)) [:const (place a) true]
+                             (and (= 'false? h) (= 2 n) (place a)) [:const (place a) false])]
+                   :when s]
+               s)]
+    (when (seq sets)
+      (let [at (fn [v [kind k]] (if (= :key kind) (get v k) (nth v k nil)))
+            put (fn [v [kind k] y] (cond (and (= :key kind) (map? v)) (assoc v k y)
+                                         (and (= :pos kind) (vector? v) (< k (count v))) (assoc v k y)
+                                         :else v))
+            ;; the constants first, then the copies, so a copy of a set
+            ;; field takes its set value
+            ordered (concat (filter #(= :const (first %)) sets) (filter #(= :copy (first %)) sets))]
+        (fn [v]
+          (if (or (map? v) (vector? v))
+            (reduce (fn [v [kind to from]]
+                      (put v to (if (= :const kind) from (at v from))))
+                    v ordered)
+            v))))))
+
+(defn- window-values
+  "The values of integer base b in the window around 0 that meet pred."
+  [b pred tenv]
+  (filterv #(and (conforms? b % tenv) (try (pred %) (catch Throwable _ false)))
+           (range (- int-window) (inc int-window))))
+
+(defn- finite-window
+  "The values of an integer refinement, when they all lie inside the
+  window: none at its edges, so none past them."
+  [ok]
+  (when (and (seq ok) (not= (first ok) (- int-window)) (not= (peek ok) int-window))
+    ok))
 
 (defn- refine-gen
   "Values of a refinement.  An integer one is found once across a window
   and generated in its range, so a narrow range is never starved; any
   other is its base's values, favouring the literals its predicate
   mentions, that satisfy the predicate."
-  [{:keys [name base]} pred tenv]
+  [{:keys [name base] :as r} pred tenv]
   (let [b (plain base)]
     (if (contains? '#{Int Nat} b)
-      (let [ok (filterv #(and (conforms? b % tenv) (pred %))
-                        (range (- int-window) (inc int-window)))]
+      (let [ok (or (::window r) (window-values b pred tenv))]
         (cond
           (empty? ok)
-          (fail! "refinement `" name "` has no value between " (- int-window) " and " int-window)
+          ;; none near 0: a range past the window, such as (<= 5000 q).
+          ;; Its values are found from one that is in it -- the spec's own
+          ;; numbers first, where such a range starts, then powers of ten
+          ;; and two -- and drawn around it
+          (let [cands (concat (::spec-ints tenv)
+                              (for [k (range 3 19), sgn [1 -1], d [0 1 -1]] (+ d (* sgn (long (Math/pow 10 k)))))
+                              (for [k (range 11 62), sgn [1 -1]] (* sgn (bit-shift-left 1 k))))
+                anchor (first (filter #(try (and (conforms? b % tenv) (pred %)) (catch Throwable _ false)) cands))]
+            (if-not anchor
+              (fail! "refinement `" name "` has no value between " (- int-window) " and " int-window
+                     ", nor at any number the spec names or any power of ten or two")
+              (gen/frequency [[1 (gen/return anchor)]
+                              [3 (filtered #(try (and (conforms? b % tenv) (pred %)) (catch Throwable _ false))
+                                                (gen/fmap #(+ anchor %) gen/small-integer)
+                                                (such-that-opts name))]])))
           (or (= (first ok) (- int-window)) (= (peek ok) int-window))
-          (gen/such-that pred (type->gen b tenv) (such-that-opts name))
+          (filtered pred (type->gen b tenv) (such-that-opts name))
           :else
           (let [lo (first ok) hi (peek ok)
                 spread (if (= (count ok) (inc (- hi lo)))
@@ -3028,26 +3818,123 @@
                 edges (vec (sort (filter ok-set (concat [(first ok) (peek ok)]
                                                         (get-in tenv [::spec-ints] [])))))]
             (gen/frequency [[3 spread] [1 (gen/elements edges)]]))))
-      (gen/such-that pred (type->gen base (assoc tenv ::bias (::bias-of-refine tenv))) (such-that-opts name)))))
+      (if (and (kind/index-type? base) (not (data-decl base tenv)))
+        ;; a refinement of an index is built a record at a time, each kept
+        ;; only when the index with it still meets the predicate, so a
+        ;; rule across the records -- no two bookings clash -- is met
+        ;; rather than filtered for.  A predicate that dropping a record
+        ;; can break is still filtered for, from what was built
+        (let [{k :key r :of u :unique} (kind/index-parts base)
+              ok? #(try (boolean (pred %)) (catch Throwable _ false))
+              built (gen/fmap (fn [rs]
+                                (reduce (fn [m x]
+                                          (let [m2 (assoc m (get x k) x)]
+                                            (if (or (contains? m (get x k))
+                                                    (some (fn [f] (some #(= (get x f) (get % f)) (vals m))) u)
+                                                    (not (ok? m2)))
+                                              m
+                                              m2)))
+                                        {} rs))
+                              (index-records r k tenv))]
+          (filtered ok? built (such-that-opts name)))
+        (let [g (type->gen base (assoc tenv ::bias (::bias-of-refine tenv)))]
+          (if-let [fit (fitting r tenv)]
+            ;; set as the predicate pins it, and still judged by it and
+            ;; by the base, whose own rule a set field may break
+            (filtered #(and (conforms? base % tenv) (pred %)) (gen/fmap fit g) (such-that-opts name))
+            (filtered pred g (such-that-opts name))))))))
+
+(defn- int-leaves
+  "Paths to the integers inside v, through maps and vectors: their
+  values, never a map's keys."
+  [v path]
+  (cond
+    (integer? v) [path]
+    (map? v) (mapcat (fn [[k x]] (int-leaves x (conj path k))) v)
+    (vector? v) (mapcat (fn [i x] (int-leaves x (conj path i))) (range) v)
+    :else []))
+
+(defn- at-boundaries
+  "Values of g, and a third of the time with one integer inside set to a
+  number the code or the spec compares against, or one either side of it:
+  the inputs that tell `<` from `<=`.  A refinement's own generator never
+  sees the law's seeds, and a value its :build makes is moved off them,
+  so they are put back here.  A change that takes the value out of the
+  refinement is undone."
+  [g nums ok?]
+  (if (empty? nums)
+    g
+    (gen/frequency
+      [[2 g]
+       [1 (gen/bind g (fn [v]
+                        (let [paths (vec (int-leaves v []))]
+                          (if (empty? paths)
+                            (gen/return v)
+                            (gen/fmap (fn [[p n]] (let [v2 (if (seq p) (assoc-in v p n) n)] (if (ok? v2) v2 v)))
+                                      (gen/tuple (gen/elements paths) (gen/elements nums)))))))]])))
+
+(defn- remembering-starved
+  "Generator g, which once it starves -- its filter finds no value -- fails
+  every draw after with the same error at once, rather than looking as
+  hard again for each law."
+  [g]
+  (let [starved (atom nil)]
+    (gen/->Generator
+      (fn [rnd size]
+        (if-let [e @starved]
+          (throw e)
+          (try ((:gen g) rnd size)
+               (catch clojure.lang.ExceptionInfo e
+                 (when (:writ/error (ex-data e)) (reset! starved e))
+                 (throw e))))))))
 
 (defn- type-env-of
   "The data types and refinements of a spec entry.  Refinements sit under
   ::refines, apart from the data the prover and the static check read."
-  [{:keys [data refines laws]} spec-ns]
+  [{:keys [data refines laws] :as e} spec-ns]
   (let [bodies (delay (into {} (for [f (book/read-forms (source-url spec-ns))
                                      :when (and (seq? f) (contains? '#{defn defn-} (first f)))]
                                  [(second f) f])))
         spec-ints (delay (let [ns (filter integer? (literals (concat (map :prop laws) (map :pred refines)
                                                                      (vals @bodies))
                                                              spec-ns @bodies))]
-                           (vec (sort (distinct (mapcat (fn [n] [(dec n) n (inc n)]) ns))))))]
+                           (vec (sort (distinct (mapcat (fn [n] [(dec n) n (inc n)]) ns))))))
+        ;; the numbers the code and the spec mention, with their neighbours
+        boundary-nums (delay (vec (sort (into (set @spec-ints)
+                                              (get (code-seeds (:target e)) 'Int)))))]
     (reduce (fn [tenv {:keys [name pred-name] :as r}]
               (let [pred (deref (ns-resolve (the-ns spec-ns) pred-name))
-                    tenv (assoc-in tenv [::refines name] (assoc r :pred pred))
+                    ;; an integer refinement's values near 0, found once:
+                    ;; its generator draws from them, and when they are
+                    ;; all of its values, a collection keyed by it is sized by them
+                    window (when (contains? '#{Int Nat} (plain (:base r)))
+                             (window-values (plain (:base r)) pred tenv))
+                    tenv (assoc-in tenv [::refines name] (cond-> (assoc r :pred pred :pred-form (:pred r)
+                                                                        :spec-ns spec-ns)
+                                                           window (assoc :window (finite-window window))))
                     bias (bias-of (literals (:pred r) spec-ns @bodies))]
                 (assoc-in tenv [::refines name :gen]
-                          (refine-gen r pred (assoc tenv ::bias-of-refine bias ::spec-ints @spec-ints)))))
-            (tenv-of data)
+                          (remembering-starved
+                          (at-boundaries
+                          (if-let [b (:build r)]
+                            ;; built by the spec's own fn, then checked
+                            (let [build (some-> (ns-resolve (the-ns spec-ns) b) deref)]
+                              (when-not (fn? build)
+                                (fail! "refinement `" name "` is built by `" b "`, which is not a fn of the spec"))
+                              (filtered #(try (boolean (pred %)) (catch Throwable _ false))
+                                             (gen/fmap build (type->gen (:base r) tenv))
+                                             {:max-tries 100
+                                              :ex-fn (fn [_] (ex-info (str "the :build of refinement `" name "`, `" b
+                                                                           "`, makes values its predicate rejects")
+                                                                      {:writ/error true}))}))
+                            (refine-gen (cond-> r window (assoc ::window window))
+                                        pred (assoc tenv ::bias-of-refine bias ::spec-ints @spec-ints)))
+                          @boundary-nums
+                          #(try (and (conforms? (:base r) % tenv) (boolean (pred %)))
+                                (catch Throwable _ false)))))))
+            ;; the spec's one-line fns, which a refinement built to fit
+            ;; reads its predicate through
+            (cond-> (tenv-of data) (seq refines) (assoc ::helpers (one-line-helpers spec-ns)))
             refines)))
 
 (defn type-env
@@ -3055,6 +3942,95 @@
   [spec-ns]
   (require spec-ns)
   (type-env-of (get @registry spec-ns) spec-ns))
+
+;; --- why a value is not of its type ----------------------------------------------
+
+(defn- one-line-helpers
+  "name -> [params body] for the spec's defns of one expression."
+  [spec-ns]
+  (try
+    (into {} (for [f (book/read-forms (source-url spec-ns))
+                   :when (and (seq? f) (contains? '#{defn defn-} (first f)))
+                   :let [{:keys [name params body]} (defn-parts f)]
+                   :when (and (vector? params) (every? symbol? params) (not-any? #{'&} params)
+                              (= 1 (count body)))]
+               [name [params (first body)]]))
+    (catch Throwable _ {})))
+
+(defn- broken-rule
+  "Where in predicate form, with env binding its names, the value breaks
+  it: [{:rule form :at note} ...] from the outside in, ending at the
+  clause that is false.  A spec helper of one expression is read through,
+  `and` to the clause that fails, `every?` and `not-any?` to the element
+  that breaks them.  nil when it holds or cannot be followed."
+  [spec-ns helpers form env depth]
+  (let [run (fn [f] (try (let [ks (vec (keys env))]
+                           {:ok (apply (binding [*ns* (the-ns spec-ns)] (eval (list 'fn ks f)))
+                                       (map env ks))})
+                         (catch Throwable e {:thrown (or (ex-message e) (str e))})))
+        holds? (fn [f] (let [r (run f)] (and (contains? r :ok) (boolean (:ok r)))))
+        fn-body (fn [f] (when (and (seq? f) (contains? '#{fn fn*} (first f)) (vector? (second f))
+                                   (= 1 (count (second f))) (= 3 (count f)))
+                          [(first (second f)) (nth f 2)]))
+        key-of (fn [coll-form x]
+                 (let [c (:ok (run (if (and (seq? coll-form) (= 'vals (first coll-form))) (second coll-form) coll-form)))]
+                   (when (map? c) (first (keep (fn [[k v]] (when (or (= v x) (= [k v] x)) k)) c)))))]
+    (when (and (< depth 8) (seq? form))
+      (let [h (first form)]
+        (cond
+          (and (contains? helpers h) (= (count (first (get helpers h))) (count (rest form))))
+          (let [[params body] (get helpers h)]
+            (broken-rule spec-ns helpers (walk/postwalk-replace (zipmap params (rest form)) body) env (inc depth)))
+
+          (= 'and h)
+          (some (fn [c] (when-not (holds? c)
+                          (or (broken-rule spec-ns helpers c env (inc depth)) [{:rule c :env env}])))
+                (rest form))
+
+          (and (contains? '#{every? not-any?} h) (= 3 (count form)))
+          (let [[_ f coll] form
+                pf (:ok (run f))
+                xs (:ok (run coll))
+                bad (when (and (ifn? pf) (seqable? xs))
+                      (first (filter #(let [b (try (boolean (pf %)) (catch Throwable _ (= 'every? h)))]
+                                        (if (= 'every? h) (not b) b))
+                                     (seq xs))))]
+            (when (some? bad)
+              (let [[y] (fn-body f)
+                    at {:at (if (and (seq? coll) (= 'vals (first coll))) (second coll) coll)
+                        :key (key-of coll bad) :elem bad :as y}]
+                (if-let [[y body] (fn-body f)]
+                  (let [env2 (assoc env y bad)]
+                    (if (= 'every? h)
+                      (cons at (or (broken-rule spec-ns helpers body env2 (inc depth)) [{:rule body :env env2}]))
+                      [at {:rule body :env env2 :holds true}]))
+                  [at {:rule (list f bad) :env env :holds (= 'not-any? h)}]))))
+
+          :else nil)))))
+
+(defn- why-not
+  "Which rule of its refinement v breaks, when t is one: the clause that
+  is false, where in v, and what its parts are.  nil otherwise."
+  [t v tenv]
+  (let [t (plain t)]
+    (when-let [{:keys [base pred-form var spec-ns]} (refinement t tenv)]
+      (cond
+        (not (conforms? base v tenv)) (why-not base v tenv)
+        (and pred-form spec-ns)
+        (when-let [steps (seq (broken-rule spec-ns (one-line-helpers spec-ns) pred-form {var v} 0))]
+          (let [show (fn [x] (let [s (pr-str x)] (if (> (count s) 160) (str (subs s 0 157) "...") s)))
+                run (fn [f env] (try (let [ks (vec (keys env))]
+                                       (pr-str (apply (binding [*ns* (the-ns spec-ns)] (eval (list 'fn ks f)))
+                                                      (map env ks))))
+                                     (catch Throwable e (str "threw: " (ex-message e)))))
+                {:keys [rule env holds]} (last steps)]
+            (str "it breaks " (pr-str rule) (when holds ", which must not hold")
+                 (apply str (for [{:keys [at key elem as]} (butlast steps) :when at]
+                              (str ", at " (pr-str at) (when (some? key) (str " key " (pr-str key)))
+                                   ", " (if as (str as " = ") "the element ") (show elem))))
+                 (apply str (for [a (rest rule)
+                                  :when (and (seq? a) (not (contains? '#{fn fn*} (first a))))]
+                              (str ", " (pr-str a) " => " (run a env)))))))))))
 
 ;; --- instrument --------------------------------------------------------------
 
@@ -3084,7 +4060,9 @@
          (let [r (binding [*in-code* (not assumed)] (apply f args))]
            (when-not (conforms? (:ret sig) r tenv)
              (fail! "`" nm "` returns " (pr-str (:ret sig)) ", but returned " (pr-str r)
-                    " for arguments " (pr-str (vec args))))
+                    " for arguments " (pr-str (vec args))
+                    (when-let [w (try (why-not (:ret sig) r tenv) (catch Throwable _ nil))]
+                      (str ": " w))))
            (when (and ensures (not ((:f ensures) (concat args [r]))))
              (fail! "`" nm "` returns " (pr-str r) " for arguments " (pr-str (vec args))
                     ", which breaks its :ensures " (pr-str (:test ensures))))
@@ -3125,9 +4103,10 @@
        (assoc e ::proof (proof-entry spec-ns proof))))))
 
 (defn- assumed-var
-  "The var of an assumed fn, its namespace loaded, or nil."
+  "The var of an assumed fn, its namespace loaded, or nil.  A host member
+  has no var: its value, when it resolves."
   [q]
-  (try (requiring-resolve q) (catch Throwable _ nil)))
+  (try (if (l/host-member? q) (eval q) (requiring-resolve q)) (catch Throwable _ nil)))
 
 (defn- wrap!
   "Wrap the signed fns not already wrapped, and the fns the spec assumes
@@ -3228,13 +4207,18 @@
   [form]
   (walk/postwalk #(if (and (symbol? %) (namespace %)) (symbol (name %)) %) form))
 
+(def ^:private thin-tests
+  "Fewer trials than this meeting a law's hypothesis is a thin test."
+  20)
+
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
   [{:keys [ok target spec static laws gaps unspecified rejected calls flows machines proof graphs graph-missing
-           lemmas off-graph uses problems questions]
+           lemmas off-graph uses problems questions silent baseline-problems]
     contras ::contradictions assumed ::assumed
     ambiguous ::ambiguous explain ::explain}]
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
+       (when (seq baseline-problems) (str "\n\n" (str/join "\n" baseline-problems) "\n"))
        (when (and proof (pos? (:laws proof)))
          (str "\n  " (:proved proof) " of " (:laws proof) " laws proved"
               (when (and (:general proof) (pos? (:proved proof)))
@@ -3242,7 +4226,27 @@
                      (- (:proved proof) (:general proof)) " on particular values)"))
               (when (= :proved (:require proof)) " (the spec requires proof)")
               (when-let [ts (seq (filter #(= :test (:evidence %)) laws))]
-                (str "; tested, not proved: " (str/join ", " (map :law ts))))))
+                (str "; tested, not proved: " (str/join ", " (map :law ts))
+                     (when-let [n (some->> (seq (keep :trials ts)) (apply min))]
+                       (str " (each on at least " n " inputs)"))))))
+       ;; a law that, on its own, tells no wrong answer from the right one
+       (apply str (for [{:keys [law fns]} silent]
+                    (str "\n  law `" law "` tells none of " (str/join ", " (map #(str "`" % "`'s") fns))
+                         " stand-ins from the real fn: on its own it holds of a constant or a"
+                         " truncated answer too. Say what the result must be")))
+       ;; a clause a test saw come out one way only tests one side of it
+       (apply str (for [{:keys [law one-sided trials evidence]} laws
+                        :when (= :test evidence)
+                        [a side] one-sided]
+                    (str "\n  law `" law "`: " (pr-str a) " was never " side " in " trials
+                         " trials, nor at an input the solver found. A clause that never turns"
+                         " tests one side only: build inputs that turn it, or drop it if it always holds")))
+       ;; a test of a law whose hypothesis seldom holds says little
+       (apply str (for [{:keys [law held trials evidence]} laws
+                        :when (and (= :test evidence) held trials (< held thin-tests))]
+                    (str "\n  law `" law "` is thinly tested: its hypothesis held in " held " of "
+                         trials " trials. Build inputs that meet it: a refinement, or values"
+                         " picked from the ones the law is about")))
        (apply str (for [{:keys [id text blocking]} questions :when (not blocking)]
                     (str "\n  open question `" id "`: " text)))
        ;; what every proof here rests on
@@ -3391,7 +4395,23 @@
                          (apply str (map #(str "\n  " %) errors))
                          "\n  Pass each step what the step before it returns; the spec names the path"
                          " the data takes.")))
-       (apply str (map #(str "\n\n" (format-failure %)) (filter #(= :failed (:status %)) laws)))
+       ;; a target fn that returned a value outside its type is the fault
+       ;; to fix first: every law that ran into it fails because of it, so
+       ;; it is said once, with one of them, and the rest named after it
+       (let [failed (filter #(= :failed (:status %)) laws)
+             breach (fn [r] (some (fn [[_ v]] (when (string? v)
+                                                (second (re-find #"Writ: `([^`]+)` returns ([^,]+), but returned" v))))
+                                  (:detail r)))
+             by-fn (group-by breach failed)]
+         (str (apply str (for [[f rs] (sort-by (comp str key) (dissoc by-fn nil))
+                               :let [ret (some (fn [r] (some (fn [[_ v]] (when (string? v)
+                                                                            (nth (re-find #"Writ: `([^`]+)` returns ([^,]+), but returned" v) 2)))
+                                                             (:detail r)))
+                                               rs)]]
+                           (str "\n\n`" f "` returns values outside " ret ": fix it first; laws that fail"
+                                " because of it: " (str/join ", " (sort (map (comp str :law) rs)))
+                                "\n" (format-failure (first (sort-by (comp count pr-str :counterexample) rs))))))
+              (apply str (map #(str "\n\n" (format-failure %)) (get by-fn nil)))))
        (apply str (for [{l :lemma :as lr} lemmas :when (= :failed (:status lr))]
                     (str "\n\n" (str/replace-first (format-failure (assoc lr :law l)) "law `" "lemma `")
                          "\n  A lemma must hold: it is a law about the code, written to help prove the spec.")))
@@ -3446,6 +4466,18 @@
 (def ^:private writ-version
   (delay (apply str (map #(or (some-> (io/resource %) slurp) "") writ-sources))))
 
+(defn- spit-whole!
+  "Write text to file f whole: to a file of its own first, then renamed
+  over f, so two checks writing one cache at once leave one of their
+  files, never the two run together, and a reader never sees half of one."
+  [f text]
+  (let [f (io/file f)
+        tmp (io/file (.getParentFile f) (str (.getName f) "." (java.util.UUID/randomUUID) ".tmp"))]
+    (try (spit tmp text)
+         (when-not (.renameTo tmp f)
+           (throw (ex-info (str "could not write " f) {})))
+         (finally (when (.exists tmp) (.delete tmp))))))
+
 (defn- cache-file
   "One file per spec and target: a spec checked against several
   implementations keeps a cache for each."
@@ -3469,7 +4501,7 @@
 
 (defn- save-proofs! [dir spec-ns version cache]
   (try (.mkdirs (io/file dir))
-       (spit (cache-file dir spec-ns) (pr-str (assoc cache :version version)))
+       (spit-whole! (cache-file dir spec-ns) (pr-str (assoc cache :version version)))
        (catch Throwable _ nil)))
 
 (defn- canonical-names
@@ -3520,9 +4552,24 @@
             (try (let [text (pr-str data)]
                    (when (= data (edn/read-string text))
                      (.mkdirs (io/file dir))
-                     (spit f text)))
+                     (spit-whole! f text)))
                  (catch Throwable _ nil)))
           rules))))
+
+(defn- completed
+  "A solver's values for bindings bs, a record it gave only the keys its
+  formula reads filled from a value of the record's type.  What it fills
+  is checked like the rest, by the type and by running the law."
+  [ctx bs cex]
+  (when cex
+    (merge cex
+           (into {} (for [[x t] bs
+                          :let [v (get cex x)]
+                          :when (and (map? v) (not (conforms? t v (:tenv ctx))))
+                          :let [g (try (gen/generate (type->gen t (:tenv ctx)) 0 (hash v))
+                                       (catch Throwable _ nil))]
+                          :when (map? g)]
+                      [x (merge g v)])))))
 
 (defn- refuted
   "The law's failure at the counterexample the solver found, confirmed by
@@ -3533,7 +4580,8 @@
   [ctx r cex]
   (when cex
     (let [[bs body] (leading-foralls (:prop r))
-          vars (mapv first bs)]
+          vars (mapv first bs)
+          cex (completed ctx bs cex)]
       (when (and (every? #(contains? cex %) vars)
                  (every? (fn [[x t]] (conforms? t (get cex x) (:tenv ctx))) bs))
         (let [res (try (holds (assoc ctx :vars vars) body cex)
@@ -3595,7 +4643,9 @@
                     [(symbol (name q)) q]))
          (into {} (for [[a lib] aliases, q assumed :when (= (str lib) (namespace q))]
                     [(symbol (str a) (name q)) q]))
-         (into {} (for [[r q] refers :when (contains? assumed q)] [r q]))))
+         (into {} (for [[r q] refers :when (contains? assumed q)] [r q]))
+         (into {} (for [q assumed :when (l/host-member? q)]
+                    [(symbol (str "java.lang." (namespace q)) (name q)) q]))))
 
 (defn- lib-pairs
   "The target and the project namespaces it requires, transitively, as
@@ -3790,7 +4840,11 @@
                                                 ;; a lemma's types erased as the law's are, so a
                                                 ;; refinement in both is the same base type
                                                 :lemmas (mapv #(update % :prop erase-law refs spec-ns) lemmas)
-                                                :rets (into {} (for [[f sig] sigs] [f (:ret sig)]))}))
+                                                :rets (into {} (for [[f sig] sigs] [f (:ret sig)]))
+                                                :guards (set (for [[_ r] refs] (symbol (str spec-ns) (str (:pred-name r)))))
+                                                ;; a law a test refuted is tried only to catch a
+                                                ;; prover that would prove it: briefly
+                                                :sym-budget (when (= :failed (:status r)) 500)}))
                            (catch Throwable e
                              {:proved false :reason (str "the prover failed: " (ex-message e))})))
             ;; that a step never throws is proved only by running it
@@ -3821,13 +4875,91 @@
                               (when (:trace pr) (swap! cached assoc-in [:traces law-id] (:trace pr)))
                               (reset! fresh true)
                               pr))))
+            ;; an input that meets a law's hypotheses, from the solver: a
+            ;; counterexample to their negation, run to confirm it
+            ;; an input of a law's bindings bs that meets h, from the solver:
+            ;; a counterexample to its negation, run to confirm it; one apart
+            ;; from each input in seen
+            meeting
+            (fn [r bs h seen]
+              (let [vars (mapv first bs)
+                    apart (for [w seen] (cons 'or (for [x vars] (list 'not= x (get w x)))))
+                    h* (if (seq apart) (list* 'and h apart) h)
+                    none (reduce (fn [p [x t]] (list 'forall [x t] p)) (list 'not h*) (reverse bs))
+                    cex (completed ctx bs (:counterexample (attempt** {:law (:law r) :prop none} [] nil)))]
+                (when (and cex (every? #(contains? cex %) vars)
+                           (every? (fn [[x t]] (conforms? t (get cex x) (:tenv ctx))) bs)
+                           (= :pass (:result (try (holds (assoc ctx :vars vars) h* cex)
+                                                  (catch Throwable _ nil)))))
+                  (select-keys cex vars))))
+            hyps-of (fn [body] (loop [p body, hs []]
+                                 (if (head? p "=>") (recur (nth p 2) (conj hs (nth p 1))) hs)))
+            hypothesis-witness
+            (fn [r]
+              (let [[bs body] (leading-foralls (:prop r))
+                    hyps (hyps-of body)
+                    h (if (= 1 (count hyps)) (first hyps) (cons 'and hyps))]
+                ;; one found input, and then others apart from it: a
+                ;; stand-in that agrees with the code at one input is told
+                ;; apart at another
+                (when (seq hyps)
+                  (loop [seen []]
+                    (let [w (when (< (count seen) 3) (meeting r bs h seen))]
+                      (if w (recur (conj seen w)) (not-empty seen)))))))
+            ;; a law only tested, run where a computed term it compares with
+            ;; a number is that number or one either side: the inputs that
+            ;; tell < from <=, which a generator reaches only by chance
+            at-the-boundary
+            (fn [r]
+              (let [[bs body] (leading-foralls (:prop r))
+                    vars (set (map first bs))
+                    hyps (hyps-of body)
+                    number (fn [x] (cond (integer? x) x
+                                         (and (symbol? x) (namespace x))
+                                         (let [v (try (some-> (resolve x) deref) (catch Throwable _ nil))]
+                                           (when (integer? v) v))))
+                    uses-var? (fn [x] (and (coll? x) (some vars (tree-seq coll? seq x))))
+                    atoms (->> (tree-seq coll? seq body)
+                               (keep (fn [f]
+                                       (when (and (seq? f) (contains? '#{< <= > >= =} (first f)) (= 3 (count f)))
+                                         (let [[_ a b] f]
+                                           (cond (and (number a) (uses-var? b)) [b (number a)]
+                                                 (and (number b) (uses-var? a)) [a (number b)])))))
+                               distinct (take 3))]
+                (first (for [[t c] atoms, n [(dec c) c (inc c)]
+                             :let [w (meeting r bs (cons 'and (conj (vec hyps) (list '= t n))) [])
+                                   bad (when w (refuted ctx r w))]
+                             :when bad]
+                         (assoc bad :boundary (list '= t n))))))
+            ;; a clause the trials saw come out only one way, turned the
+            ;; other by the solver: the law run there, and failing or not,
+            ;; the clause counted as seen both ways
+            turn-clauses
+            (fn [r]
+              (let [[bs body] (leading-foralls (:prop r))
+                    hyps (hyps-of body)
+                    cov (:coverage r)
+                    one-sided (for [a (law-atoms body (map first bs))
+                                    side [true false]
+                                    :when (zero? (get-in cov [a side] 0))]
+                                [a side])]
+                (loop [[[a side] & more] (take 4 one-sided), r r]
+                  (if-not a
+                    r
+                    (let [w (meeting r bs (cons 'and (conj (vec hyps) (if side a (list 'not a)))) [])
+                          bad (when w (refuted ctx r w))]
+                      (cond
+                        bad (assoc bad :turned [a side])
+                        w (recur more (update-in r [:coverage a side] (fnil inc 0)))
+                        :else (recur more r)))))))
             open? (fn [r] (and (:prop r) (contains? #{:tested :failed} (:status r))
                                (not (:proof r)) (not (:unproved-final r))))
-            pass (fn [[rs lemmas]]
-                   (reduce
-                     (fn [[out lemmas] r]
+            ;; one law in a pass: its result, and the lemma it becomes
+            ;; when it is proved.  It cites only the laws proved before the
+            ;; pass began, so the laws of a pass are tried at once
+            step (fn [lemmas r]
                        (if-not (open? r)
-                         [(conj out r) lemmas]
+                         [r nil]
                          ;; a proved law that says the same is no proof of this one
                          ;; from the code, so it is left out of the search; when
                          ;; the search fails, that law is the proof
@@ -3842,43 +4974,67 @@
                                                      ", and it threw on no test (that it never throws is not proved)"))})]
                            (cond
                              (and (:proved pr) (= :tested (:status r)))
-                             [(conj out (cond-> (-> r (dissoc :unproved :stuck)
+                             [(cond-> (-> r (dissoc :unproved :stuck)
                                                     (cond-> (and (:explain opts) (:attempts pr)) (assoc :attempts (:attempts pr)))
                                                     (assoc :status :proved :proof (:summary pr)))
                                           (:cached pr) (assoc :cached true)
                                           (:replayed pr) (assoc :replayed true)
-                                          (seq (:lemmas pr)) (assoc :lemmas (:lemmas pr))))
-                              (conj lemmas {:name (:law r) :prop (:prop r)})]
+                                          (seq (:lemmas pr)) (assoc :lemmas (:lemmas pr)))
+                              {:name (:law r) :prop (:prop r)}]
 
-                             ;; a law whose hypothesis never held is true of
-                             ;; every input, and tested nothing: the failure
-                             ;; stands, and it is no refutation of the proof
+                             ;; a hypothesis no test met: where the solver
+                             ;; finds the law false, running it there says so
+                             (and (:no-hypothesis r) (not (:proved pr)) (refuted ctx r (:counterexample pr)))
+                             [(dissoc (refuted ctx r (:counterexample pr)) :no-hypothesis) nil]
+
+                             ;; a law whose hypothesis never held would be
+                             ;; true of every input and test nothing; the
+                             ;; proof stands only when the solver finds an
+                             ;; input that meets the hypothesis
                              (and (:proved pr) (:no-hypothesis r))
-                             [(conj out r) lemmas]
+                             (if-let [w (hypothesis-witness r)]
+                               [(cond-> (-> r (dissoc :counterexample :detail :no-hypothesis)
+                                                      (assoc :status :proved
+                                                             :hypothesis-witness w
+                                                             :proof (str (:summary pr) ", and its hypothesis held at "
+                                                                         (str/join " and " (map pr-str w))
+                                                                         ", which the solver found: no generated input met it")))
+                                            (:cached pr) (assoc :cached true)
+                                            (seq (:lemmas pr)) (assoc :lemmas (:lemmas pr)))
+                                {:name (:law r) :prop (:prop r)}]
+                               [r nil])
 
                              (and (:proved pr) (not (thrown? r)))
-                             [(conj out (assoc r :prover-bug true :proof (:summary pr))) lemmas]
+                             [(assoc r :prover-bug true :proof (:summary pr)) nil]
 
                              (and (= :tested (:status r)) (refuted ctx r (:counterexample pr)))
-                             [(conj out (refuted ctx r (:counterexample pr))) lemmas]
+                             [(refuted ctx r (:counterexample pr)) nil]
 
                              (= :tested (:status r))
-                             [(conj out (cond-> (assoc r :unproved (:reason pr))
+                             [(cond-> (assoc r :unproved (:reason pr))
                                           (seq (:stuck pr)) (assoc :stuck (:stuck pr))
                                           (and (:explain opts) (:attempts pr)) (assoc :attempts (:attempts pr))
                                           ;; outside the model: no lemma changes that
                                           (str/starts-with? (str (:reason pr)) "outside")
-                                          (assoc :unproved-final true)))
-                              lemmas]
-                             :else [(conj out (assoc r :unproved-final true)) lemmas]))))
-                     [[] lemmas]
-                     rs))]
+                                          (assoc :unproved-final true))
+                              nil]
+                             :else [(assoc r :unproved-final true) nil]))))
+            pass (fn [[rs lemmas]]
+                   (let [steps (par-map #(step lemmas %) rs)]
+                     [(mapv first steps) (into lemmas (keep second steps))]))]
         ;; the proved laws of the specs this one uses come first
         (loop [[rs lemmas] (pass [results (into (vec (::imports opts)) (:lemmas assumed))])]
           (let [[rs2 lemmas2] (pass [rs lemmas])]
             (if (= (count lemmas2) (count lemmas))
               (do (when (and cache-dir @fresh) (save-proofs! cache-dir [spec-ns target] @writ-version @cached))
-                  (let [rs2 (mapv #(dissoc % :unproved-final) rs2)]
+                  (let [rs2 (mapv #(dissoc % :unproved-final) rs2)
+                        rs2 (if (false? (:prove opts))
+                              rs2
+                              (par-map #(or (when (and (= :tested (:status %)) (not (:lemma %)))
+                                           (or (try (at-the-boundary %) (catch Throwable _ nil))
+                                               (try (turn-clauses %) (catch Throwable _ nil))))
+                                         %)
+                                    rs2))]
                     (if (:suggest opts)
                       (mapv #(if (and (= :tested (:status %)) (:unproved %)
                                       (not (str/starts-with? (str (:unproved %)) "outside")))
@@ -4187,7 +5343,13 @@
                            (if (:fn a)
                              {:fn (:fn a) :sig (:sig a)}
                              {:assumption (:assumption a) :prop (get props (:assumption a))}))))
-     :obligations (:obligations r)}))
+     :obligations (:obligations r)
+     ;; each signature and refinement as written, so one loosened shows
+     :anns (into (sorted-map) (for [[f sig] (:anns e)]
+                                [f (cond-> {:params (:params sig) :ret (:ret sig)}
+                                     (get (:contracts e) f) (assoc :contract (get (:contracts e) f)))]))
+     :refines (into (sorted-map) (for [{:keys [name base pred]} (:refines e)]
+                                   [name {:base base :pred pred}]))}))
 
 (declare check)
 
@@ -4261,8 +5423,34 @@
                (let [now-blocking (into {} (map (juxt :id :blocking)) (:questions new))]
                  (for [{:keys [id blocking]} (:questions old)
                        :when (and blocking (false? (get now-blocking id)))]
-                   {:question id :what :no-longer-blocking}))))]
+                   {:question id :what :no-longer-blocking}))
+               ;; a signature or a refinement gone, or written otherwise:
+               ;; looser, as far as writ can tell, until its owner agrees
+               (for [[f sig] (:anns old)
+                     :let [n (get (:anns new) f)]
+                     :when (not= sig n)]
+                 (cond-> {:ann f :what (if n :changed :removed) :was sig}
+                   n (assoc :now n)))
+               (for [[nm r] (:refines old)
+                     :let [n (get (:refines new) nm)]
+                     :when (not= r n)]
+                 (cond-> {:refinement nm :what (if n :changed :removed) :was r}
+                   n (assoc :now n)))))]
     {:ok (empty? weakened) :weakened weakened}))
+
+(defn- weakening-text
+  "One line of what attest found weaker."
+  [{:keys [law obligation question fn assumption ann refinement what was now]}]
+  (str (cond law (str "law `" law "`")
+             obligation (str "obligation " obligation)
+             question (str "question `" question "`")
+             ann (str "the ann of `" ann "`")
+             refinement (str "refinement `" refinement "`")
+             fn (str "the assumed signature of `" fn "`")
+             assumption (str "assumption `" assumption "`")
+             :else "the check")
+       " is " (str/replace (name what) "-" " ")
+       (when (and was now) (str ": was " (pr-str was) ", now " (pr-str now)))))
 
 (declare reachable-from)
 
@@ -4316,6 +5504,63 @@
              (catch Throwable ex
                {:assumption name :status :failed :why (str "assumption `" name "`: " (or (ex-message ex) (str ex)))})))))))
 
+;; --- more trials for a law that is only tested --------------------------------------
+
+(def ^:private more-trials-default
+  "The trials a law the prover could not prove gets beyond its first
+  run, and the most time they may take, per law."
+  {:trials 900 :ms 20000})
+
+(defn- more-trials
+  "A law that is only tested runs again, a hundred trials at a time
+  with the seeds after its own, until it has had :trials more or :ms
+  have passed.  So does one whose hypothesis no trial met, where the
+  solver found no input either: a rare hypothesis is met in more trials.
+  A failure among them is the law's result, with the seed that replays
+  it.  :held counts the trials whose hypothesis held."
+  [ctx r opts]
+  (let [{extra :trials ms :ms} (merge more-trials-default
+                                     (when (map? (:more-trials opts)) (:more-trials opts)))
+        starved? (and (= :failed (:status r)) (:no-hypothesis r))]
+    (if (or (not (or (= :tested (:status r)) starved?)) (:lemma r) (not (:prop r))
+            (false? (:more-trials opts)) (not (pos? extra)))
+      r
+      (let [t0 (System/currentTimeMillis)
+            base (or (:seed r) 0)
+            first-run (or (:trials r) (:trials opts) 100)
+            [bs body] (leading-foralls (:prop r))
+            atoms (law-atoms body (map first bs))
+            ;; every clause seen both ways, often enough: more trials of the
+            ;; same would say little more
+            covered? (fn [cov ran held] (and (seq atoms) (>= ran 300) (>= held thin-tests)
+                                        (every? #(and (<= 5 (get-in cov [% true] 0)) (<= 5 (get-in cov [% false] 0)))
+                                                atoms)))]
+        (loop [k 1, ran first-run, held (if starved? 0 (- first-run (or (:discarded r) 0))),
+               cov (or (:coverage r) {})]
+          (if (or (> (* 100 k) extra) (> (- (System/currentTimeMillis) t0) ms) (covered? cov ran held))
+            (cond
+              (not starved?) (assoc r :trials ran :discarded (- ran held) :held held :coverage cov
+                                    :one-sided (vec (for [a atoms, side [false true]
+                                                          :when (zero? (get-in cov [a side] 0))]
+                                                      [a side])))
+              (pos? held) (-> r (dissoc :counterexample :detail :no-hypothesis)
+                              (assoc :status :tested :trials ran :discarded (- ran held) :held held
+                                     :coverage cov))
+              :else r)
+            (let [t (try (test-law ctx {:name (:law r) :prop (:prop r)}
+                                   {:trials 100 :seed (+ base k) :max-size (or (:max-size opts) 50)})
+                         ;; as the first run: a law that cannot be run fails with the reason
+                         (catch Throwable ex
+                           {:status :failed :counterexample {} :detail [] :seed (+ base k)
+                            :error (or (ex-message ex) (str ex))}))]
+              (if (and (= :failed (:status t)) (not (:no-hypothesis t)))
+                (merge (dissoc r :unproved :stuck :trials :discarded :no-hypothesis)
+                       (select-keys t [:status :counterexample :original :trial :seed :detail :error])
+                       {:after-trials ran})
+                (recur (inc k) (+ ran 100)
+                       (+ held (if (:no-hypothesis t) 0 (- (or (:trials t) 100) (or (:discarded t) 0))))
+                       (merge-with (partial merge-with +) cov (:coverage t)))))))))))
+
 (defn- reachable-from
   "Every fn of graph g that f reaches through calls."
   [g f]
@@ -4323,6 +5568,8 @@
     (if-let [x (first todo)]
       (recur (into (vec (rest todo)) (remove seen (get g x))) (into seen (get g x)))
       seen)))
+
+(declare check*)
 
 (defn check
   "Check a spec namespace against its target (or opts :target).  Returns a
@@ -4337,19 +5584,31 @@
   the prover over writ.prove/default-config, for a bench to try) and
   :explain (true
   gives each law the prover tried its :attempts, and the report the
-  goals a tested law's proof got stuck on)."
+  goals a tested law's proof got stuck on) and :parallel (false runs the
+  laws one at a time, on the calling thread)."
   ([spec-ns] (check spec-ns {}))
   ([spec-ns opts]
+   (binding [*parallel* (and *parallel* (not (false? (:parallel opts))))]
+     (check* spec-ns opts))))
+
+(defn- check*
+  [spec-ns opts]
    (when (and (contains? opts :record) (not (string? (:record opts))))
      (fail! "`check` :record is a path to write the report to, had: " (pr-str (:record opts))))
    (let [{:keys [trials seed max-size] :or {trials 100 max-size 50}} opts
+         t0 (System/nanoTime)
+         clock (atom (zipmap [:static :tests :prover :more-trials :adequacy :graphs] (repeat 0)))
+         ;; each phase's time, in ms, for the report's :timings
+         timed (fn [k f] (let [t (System/nanoTime)]
+                           (try (f) (finally (swap! clock update k + (quot (- (System/nanoTime) t) 1000000))))))
+         timings #(assoc @clock :total (quot (- (System/nanoTime) t0) 1000000))
          e (entry spec-ns (:target opts) (:proof opts))
          {:keys [target anns data laws]} e
          proof-e (::proof e)
          lemma-names (set (map :name (:lemmas proof-e)))
          ;; lemmas first, so a law proved after them may cite them
          laws (into (mapv #(assoc % :lemma true) (:lemmas proof-e)) laws)
-         static (static-check e)
+         static (timed :static #(static-check e))
          ambiguous (when (:ok static) (ambiguous-names e spec-ns))
          base (cond-> {:spec spec-ns :target target
                        :static (if (:ok static) {:ok true} static)
@@ -4359,7 +5618,7 @@
                 (seq ambiguous) (assoc :ambiguous (mapv :name ambiguous) ::ambiguous ambiguous))]
      (if (or (not (:ok static)) (seq ambiguous))
        (let [r (assoc base :ok false :laws [] :gaps [] :calls [] :flows [] :machines [] :graphs [])]
-         (assoc r :message (format-report r)))
+         (assoc r :message (format-report r) :timings (timings)))
        (let [refs (refines-of e)
              tenv (type-env-of e spec-ns)
              data-tenv (tenv-of data)
@@ -4374,16 +5633,29 @@
                                                                       (plain (:ret s)))
                                                        k)))
                                anns)
-             ctx {:ev (evaluator spec-ns) :tenv (assoc tenv ::seeds (code-seeds target))}
+             ctx {:ev (evaluator spec-ns) :tenv (assoc tenv ::seeds (code-seeds target))
+                  ;; the values drawn with a fixed seed, made once a check
+                  :draws (atom {})}
+             ;; the spec's own one-expression fns, which an exists over
+             ;; an integer's bounds is read through
+             helpers (into {} (for [f (book/read-forms (source-url spec-ns))
+                                    :when (and (seq? f) (contains? '#{defn defn-} (first f)))
+                                    :let [{:keys [name params body]} (defn-parts f)]
+                                    :when (and (vector? params) (not-any? #{'&} params)
+                                               (every? symbol? params) (= 1 (count body))
+                                               (not (contains? publics name)))]
+                                [name [params (first body)]]))
              ;; only what this check wrapped is unwrapped after it, so a
              ;; caller's own instrument stays in place
              wrapped (wrap! e)
-             assumed (try (assumption-results e ctx publics interns target spec-ns
-                                              {:trials trials :seed seed :max-size max-size})
-                          (catch Throwable ex (unwrap! wrapped) (throw ex)))
-             results (try
-                       (vec (for [{:keys [name prop explain graph total lemma step-of witness guard-law]} laws
-                                  :let [p (desugar prop)]]
+             assumed (timed :tests
+                            #(try (assumption-results e ctx publics interns target spec-ns
+                                                      {:trials trials :seed seed :max-size max-size})
+                                  (catch Throwable ex (unwrap! wrapped) (throw ex))))
+             results (timed :tests #(try
+                       (par-map
+                         (fn [{:keys [name prop explain graph total lemma step-of witness guard-law example]}]
+                            (let [p (eliminate-exists (desugar prop) helpers)]
                               (try
                                 (lw/check-prop-shape! p)
                                 (let [qp (qualify p #{} publics interns target spec-ns
@@ -4403,13 +5675,15 @@
                                                "implementation, so any code satisfies it")}
 
                                     :else
-                                    (cond-> (assoc (test-law ctx {:name name :prop qp :witness witness}
-                                                             {:trials trials :seed seed :max-size max-size})
-                                                   :prop qp)
+                                    (cond-> (let [t (System/nanoTime)
+                                                  r (test-law ctx {:name name :prop qp :witness witness}
+                                                              {:trials trials :seed seed :max-size max-size})]
+                                              (assoc r :prop qp :test-ms (quot (- (System/nanoTime) t) 1000000)))
                                       explain (assoc :explain explain)
                                       graph (assoc :graph graph)
                                       step-of (assoc :step-of step-of)
                                       guard-law (assoc :guard-law true)
+                                      example (assoc :example example)
                                       total (assoc :total true)
                                       lemma (assoc :lemma true))))
                                 ;; a law that cannot be run (a malformed
@@ -4418,12 +5692,13 @@
                                 (catch Throwable ex
                                   {:law name :status :failed :counterexample {} :detail []
                                    :error (or (ex-message ex) (str ex))}))))
-                       (finally (unwrap! wrapped)))
+                         laws)
+                       (finally (unwrap! wrapped))))
              level (or (:require opts) (:require e) :tested)
              _ (check-level! "`check`" level)
              results (mapv #(cond-> % (contains? lemma-names (:law %)) (assoc :lemma true)) results)
              imports (imports-of spec-ns e opts)
-             results (-> (prove-laws results (assoc opts ::hints (:hints proof-e) ::proof-ns (:ns proof-e)
+             results (-> (timed :prover #(prove-laws results (assoc opts ::hints (:hints proof-e) ::proof-ns (:ns proof-e)
                                                    ::imports (:lemmas imports)
                                                    ;; what held is given to the prover
                                                    ::assumed {:sigs (into {} (for [{f :fn sig :sig st :status} assumed
@@ -4432,7 +5707,13 @@
                                                               :lemmas (vec (for [{a :assumption p :prop st :status} assumed
                                                                                  :when (and a (= :held st))]
                                                                              {:name a :prop p}))})
-                                     target spec-ns (merge (:tenv imports) data-tenv) anns refs ctx)
+                                     target spec-ns (merge (:tenv imports) data-tenv) anns refs ctx))
+                         ;; a law the prover could not prove rests on its
+                         ;; tests alone, so it gets more of them
+                         ((fn [rs] (timed :more-trials
+                                          #(let [wrapped (wrap! e)]
+                                             (try (par-map (fn [r] (more-trials ctx r opts)) rs)
+                                                  (finally (unwrap! wrapped)))))))
                          (require-evidence
                            ;; a lemma is there to be cited, so it must be proved
                            (mapv #(if (:lemma %) (assoc-in % [:opts :require] :proved) %) laws)
@@ -4449,11 +5730,21 @@
                            results)
              sound? (not-any? #(contains? #{:failed :vacuous} (:status %)) results)
              per-fn (if (and sound? (not= false (:adequacy opts)))
-                      (adequacy ctx target
+                      (timed :adequacy #(adequacy ctx target
                                 (sort (filter #(contains? publics %) (keys anns)))
                                 ;; a step's witness is found by search, so a stand-in
                                 ;; that misses it may only be unlucky: it pins nothing
-                                anns (concat (keep :prop (remove #(or (:lemma %) (:step-of %)) results))
+                                anns (concat (keep #(when-let [p (:prop %)]
+                                                      (cond-> (vary-meta p assoc ::law
+                                                                         ;; an exists never rejects a stand-in
+                                                                         (when-not (or (:graph %) (:guard-law %)
+                                                                                       (quant? (second (leading-foralls p)))
+                                                                                       (head? p "exists"))
+                                                                           (:law %))
+                                                                         ::example (:example %))
+                                                        (:hypothesis-witness %)
+                                                        (vary-meta assoc ::witness (:hypothesis-witness %))))
+                                                   (remove #(or (:lemma %) (:step-of %)) results))
                                              (for [m (:machines e)]
                                                (qualify (machine-prop m e) #{} publics interns
                                                         target spec-ns)))
@@ -4461,7 +5752,7 @@
                                 ;; mutants of the fn's source, on request: they cost
                                 ;; a static check each
                                 (when (= :mutants (:adequacy opts))
-                                  (fn [nm sig] (mutants e target nm sig ctx (or seed 42) 12))))
+                                  (fn [nm sig] (mutants e target nm sig ctx (or seed 42) 12)))))
                       [])
              gaps (vec (for [{f :fn s :survivors} per-fn :when (seq s)]
                          {:fn f :survivors s}))
@@ -4490,7 +5781,7 @@
              call-results (check-calls e target-forms forms-of)
              flow-results (check-flows e target-forms forms-of)
              machine-results (mapv #(check-machine % e target) (:machines e))
-             graph-results (mapv (fn [g]
+             graph-results (timed :graphs #(mapv (fn [g]
                                    (let [q #(qualify % #{} publics interns target spec-ns)
                                          errs (vec (concat (graph-flow-errors g anns refs)
                                                            (graph-start-errors g spec-ns tenv q (:invariants e))
@@ -4513,10 +5804,18 @@
                                                                  :when (and (contains? reached f)
                                                                             (not (contains? (:visited walked) f)))]
                                                              {:seed run-seed
-                                                              :reason (str "no run of " (:runs (second g)) " reached "
-                                                                           (pr-str f) " in " (or (:depth (second g)) default-depth)
-                                                                           " steps; a run from the start should reach every"
-                                                                           " final state, so walk more runs, or longer ones (:depth)")}))))
+                                                              :reason (let [shut (sort (for [[[st fe] {:keys [refused passed]}] (:refusals walked)
+                                                                                             :when (and (pos? refused) (zero? passed))]
+                                                                                         (str "the guard of " fe " from " (pr-str st)
+                                                                                              " refused all " refused " of its steps, half of them"
+                                                                                              " searching " (* 3 guard-draws) " draws for arguments it takes")))]
+                                                                        (str "no run of " (:runs (second g)) " reached "
+                                                                             (pr-str f) " in " (or (:depth (second g)) default-depth)
+                                                                             " steps; a run from the start should reach every final state"
+                                                                             (if (seq shut)
+                                                                               (str ": " (str/join "; " shut)
+                                                                                    ". Check that the guard can hold from the states a run reaches")
+                                                                               ", so walk more runs, or longer ones (:depth)")))}))))
                                          obls (filter #(= (first g) (:graph %)) results)]
                                      (let [ok? (and (empty? errs) (empty? rules) (empty? run-errs))]
                                        (cond-> {:graph (first g) :states (count (:states (second g)))
@@ -4534,7 +5833,7 @@
                                                 (seq errs) (assoc :errors errs)
                                                 (seq rules) (assoc :rules rules)
                                                 (seq run-errs) (assoc :runs-failed run-errs)))))
-                                 (:graphs e))
+                                 (:graphs e)))
              graphless (and (empty? (:graphs e)) (empty? (:machines e)))
              problems (vec (for [[g st] (:invariants e)
                                  :when (not-any? #(= g (first %)) (:graphs e))]
@@ -4555,6 +5854,14 @@
                            :proof (proof-coverage results level)
                            :machines (mapv #(dissoc % :shown :step) machine-results)
                            :rejected (mapv #(select-keys % [:fn :laws :rejected]) per-fn)
+                           ;; a law of the spec's own that, on its own, tells no
+                           ;; stand-in of any fn it calls from the real one
+                           :silent (let [with (filter #(pos? (or (:impostors %) 0)) per-fn)
+                                         credited (set (mapcat :credited with))]
+                                     (vec (for [l (sort-by str (distinct (mapcat :about with)))
+                                                :when (not (contains? credited l))]
+                                            {:law l :fns (vec (sort-by str (keep #(when (contains? (:about %) l) (:fn %))
+                                                                                 with)))})))
                            :off-graph (vec (sort-by str (remove (step-fns e)
                                                                 (filter #(contains? publics %) (keys anns)))))
                            :ok (and sound? (empty? gaps) (empty? (:unspecified base))
@@ -4569,12 +5876,32 @@
                                     (every? #(= :held (:status %)) assumed)
                                     (not graphless)))
                  r (assoc r :obligations (obligation-status (obligations* e) r))
-                 r (assoc r ::record (record-of e spec-ns laws r level))]
+                 r (assoc r ::record (record-of e spec-ns laws r level))
+                 ;; a spec held to a baseline fails when it is weaker than it
+                 baseline (:baseline e)
+                 r (if (and baseline (not= baseline (:record opts)))
+                     (let [f (io/file baseline)]
+                       (if-not (.exists f)
+                         (assoc r :ok false
+                                :baseline-problems [(str "the spec is held to the baseline " baseline
+                                                         ", which does not exist; write it from a check its owner"
+                                                         " agrees with: (writ.spec/check '" spec-ns " {:record \""
+                                                         baseline "\"})")])
+                         (let [weak (remove #(= :claimed-pass (:what %))
+                                            (:weakened (attest (edn/read-string (slurp f)) (::record r))))]
+                           (if (seq weak)
+                             (assoc r :ok false
+                                    :baseline-problems (into [(str "the spec is weaker than its baseline " baseline
+                                                                   "; its owner takes a new record to accept a change:")]
+                                                             (map #(str "  " (weakening-text %)) weak)))
+                             r))))
+                     r)]
          (do (when-let [path (:record opts)]
                (spit path (pr-str (::record r))))
              (assoc r :message (format-report (assoc r :machines machine-results
                                                      :graphs graph-results
-                                                     ::explain (:explain opts))))))))))
+                                                     ::explain (:explain opts)))
+                    :timings (timings)))))))
 (defn check!
   "`check`, throwing with the report's message when anything fails."
   ([spec-ns] (check! spec-ns {}))

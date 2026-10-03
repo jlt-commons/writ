@@ -35,6 +35,7 @@
      :by (let [n (:name win)] (if (vector? n) (first n) n))
      :fuel (reduce + 0 (keep :fuel as))
      :ms (reduce + 0 (keep :ms as))
+     :test-ms (or (:test-ms l) 0)
      :attempts (mapv #(select-keys % [:name :outcome :fuel :ms]) as)}))
 
 (defn run

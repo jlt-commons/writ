@@ -277,7 +277,11 @@
   [apps]
   (conj* (for [[i a] (map-indexed vector apps)
                b (drop (inc i) apps)
-               :when (and (= (:kind a) (:kind b)) (= (:f a) (:f b)))]
+               :when (and (= (:kind a) (:kind b)) (= (:f a) (:f b))
+                          ;; arguments that are two different numbers: the
+                          ;; clause holds already
+                          (not-any? (fn [[[xm xc] [ym yc]]] (and (empty? xm) (empty? ym) (not= xc yc)))
+                                    (map vector (:args a) (:args b))))]
            (disj* (concat (map (comp negf eq*) (:args a) (:args b))
                           [(if (= :fn (:kind a))
                              (eq* [{(:var a) 1} 0] [{(:var b) 1} 0])
@@ -315,10 +319,38 @@
 
 (defn preprocess
   "The clauses of formula under decls, with the applications they name:
-  {:clauses [[lit ...] ...] :apps [{:kind :f :args :var} ...]}."
-  [f decls]
-  (let [st (volatile! {:n 0 :memo {} :sides [] :apps [] :clauses []})
-        main (formula st decls f)
-        whole (conj* (concat [main] (:sides @st) [(ackermann (:apps @st))]))]
-    (clausify! st whole)
-    (select-keys @st [:clauses :apps])))
+  {:clauses [[lit ...] ...] :apps [{:kind :f :args :var} ...]}.  With
+  {:congruence false}, no clause says that equal arguments give equal
+  results: those are added on demand (see congruence-clauses)."
+  ([f decls] (preprocess f decls {}))
+  ([f decls {:keys [congruence] :or {congruence true}}]
+   (let [st (volatile! {:n 0 :memo {} :sides [] :apps [] :clauses []})
+         main (formula st decls f)
+         whole (conj* (concat [main] (:sides @st) (when congruence [(ackermann (:apps @st))])))]
+     (clausify! st whole)
+     (select-keys @st [:clauses :apps]))))
+
+(defn- lits-of
+  "The literals of a disjunction in negation normal form."
+  [f]
+  (cond (false? f) [] (literal? f) [f] (= :or (first f)) (vec (mapcat lits-of (rest f)))
+        :else (throw (ex-info "not a disjunction of literals" {:f f}))))
+
+(defn congruence-clauses
+  "The clauses saying applications a and b of one fn or predicate give
+  equal results when their arguments are equal: Ackermann's constraint
+  for the pair, as plain clauses, none when it holds already."
+  [a b]
+  (when-not (and (= (:kind a) (:kind b)) (= (:f a) (:f b)) (= (count (:args a)) (count (:args b))))
+    (throw (ex-info "not two applications of one fn" {:writ.solve/rejected true})))
+  (let [differ (disj* (map (comp negf eq*) (:args a) (:args b)))
+        same (if (= :fn (:kind a))
+               (eq* [{(:var a) 1} 0] [{(:var b) 1} 0])
+               (let [p [:bool (:var a) true] q [:bool (:var b) true]]
+                 (conj* [(disj* [(negate p) q]) (disj* [p (negate q)])])))]
+    (if (or (true? differ) (true? same))
+      []
+      (vec (for [part (if (and (vector? same) (= :and (first same))) (rest same) [same])
+                 :let [c (disj* [differ part])]
+                 :when (not (true? c))]
+             (lits-of c))))))

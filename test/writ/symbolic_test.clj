@@ -9,7 +9,7 @@
             [writ.spec :as spec]
             [clojure.string :as str]))
 
-(require 'writ.spec-demo.shapes 'writ.spec-demo.signal 'writ.spec-demo.court)
+(require 'writ.spec-demo.shapes 'writ.spec-demo.signal 'writ.spec-demo.court 'writ.spec-demo.ledger-off)
 
 (defn- defs-of [ns-sym file]
   (first (prover/definitions [[ns-sym (writ.book/read-forms (clojure.java.io/resource file))]])))
@@ -120,8 +120,9 @@
     (testing "seq, empty?, first and rest of a value of unknown shape agree"
       (is (= :proved (get status 'a-pair-binds-its-second)) (:message r))
       (is (= :proved (get status 'the-first-matching-clause-wins)) (:message r)))
-    (testing "a recursion into a form of any depth gives up, and soon"
-      (is (= :tested (get status 'a-depth-is-never-negative)) (:message r))
+    (testing "a recursion into a form of any depth: past the unrolling, the call is
+              some Nat, as depth's signature says, which is all the law needs"
+      (is (= :proved (get status 'a-depth-is-never-negative)) (:message r))
       (is (< (- (System/currentTimeMillis) t0) 120000)))))
 
 (deftest some-over-a-seq-of-known-length-is-its-first-truthy-value
@@ -191,3 +192,67 @@
 (deftest nth-of-nil-is-nil
   (is (sym/prove {} [] [:call 'nil? [:call 'nth [:nil] [:lit 3]]]))
   (is (sym/prove {} [] [:call '= [:lit :d] [:call 'nth [:nil] [:lit 0] [:lit :d]]])))
+
+;; --- maps of any size -----------------------------------------------------------------
+
+(deftest laws-over-maps-of-any-size-are-proved
+  (let [r (spec/check 'writ.spec-demo.ledger-spec {:seed 1 :cache false})]
+    (is (:ok r) (:message r))
+    (doseq [l (:laws r) :when (not (str/includes? (str (:law l)) ":"))]
+      (is (= :proved (:status l)) (str (:law l) ": " (:unproved l))))))
+
+(deftest false-laws-over-maps-are-never-proved
+  (let [r (spec/check 'writ.spec-demo.ledger-spec {:seed 1 :cache false :target 'writ.spec-demo.ledger-off})
+        st (into {} (map (juxt :law :status)) (:laws r))]
+    (is (not (:ok r)))
+    (is (not-any? :prover-bug (:laws r)))
+    (doseq [l '[a-deposit-to-no-account-changes-nothing a-closed-account-is-gone
+                a-withdrawal-keeps-every-balance-whole an-overdraft-changes-nothing
+                closing-takes-one-account-away]]
+      (is (= :failed (get st l)) (str l)))
+    (testing "the laws the wrong code still keeps are proved of it"
+      (doseq [l '[a-deposit-adds-to-the-balance a-tag-reads-back closing-leaves-the-others]]
+        (is (= :proved (get st l)) (str l))))))
+
+(deftest a-counterexample-over-a-map-of-any-size-is-a-map
+  (let [defs (defs-of 'writ.spec-demo.ledger-off "writ/spec_demo/ledger_off.clj")
+        q (fn [f & args] (into [:app (symbol "writ.spec-demo.ledger-off" f)] args))
+        types '{l {:accts (Index :id {:id Nat, :balance Int}), :tags (Map Keyword Nat)}, a Nat, n Int}
+        ;; a deposit to no account changes nothing: false of the wrong code
+        cex (sym/counterexample {:types types :defs defs :tenv {}}
+                                [[:call 'not [:call 'contains? [:call 'get 'l [:lit :accts]] 'a]]]
+                                [:call '= 'l (q "deposit" 'l 'a 'n)])]
+    (is (map? (get cex 'l)) (pr-str cex))
+    (is (map? (:accts (get cex 'l))) (pr-str cex))
+    (is (not (contains? (:accts (get cex 'l)) (get cex 'a))) (pr-str cex))
+    (is (not= (get cex 'l) (writ.spec-demo.ledger-off/deposit (get cex 'l) (get cex 'a) (get cex 'n))))))
+
+;; --- vectors of unknown length ---------------------------------------------------------
+
+(deftest laws-over-vectors-of-unknown-length-are-proved
+  (let [r (spec/check 'writ.spec-demo.waitlist-spec {:seed 1 :cache false})]
+    (doseq [l (:laws r) :when (not (str/includes? (str (:law l)) ":"))]
+      (is (= :proved (:status l)) (str (:law l) ": " (:unproved l))))))
+
+(deftest false-laws-over-vectors-are-never-proved
+  (let [r (spec/check 'writ.spec-demo.waitlist-spec {:seed 1 :cache false :target 'writ.spec-demo.waitlist-off})
+        st (into {} (map (juxt :law :status)) (:laws r))]
+    (is (not (:ok r)))
+    (is (not-any? :prover-bug (:laws r)))
+    (doseq [l '[joining-again-changes-nothing serving-takes-the-first-off cancelling-keeps-the-others-in-order]]
+      (is (= :failed (get st l)) (str l)))
+    (doseq [l '[the-first-in-line-is-next]]
+      (is (= :proved (get st l)) (str l)))))
+
+(deftest a-call-past-the-unrolling-is-some-value-of-its-type
+  (let [defs (defs-of 'writ.spec-demo.walk "writ/spec_demo/walk.clj")
+        q 'writ.spec-demo.walk/depth
+        opts {:types '{f Any} :defs defs :tenv {} :rets {q 'Nat}}]
+    (testing "proved from the signature's type"
+      (is (some? (sym/prove opts [] [:call '<= [:lit 0] [:app q 'f]]))))
+    (testing "but nothing more: the depth is not known to be small"
+      (is (nil? (sym/prove opts [] [:call '<= [:app q 'f] [:lit 3]]))))
+    (testing "with no signature, the evaluation gives up"
+      (is (nil? (sym/formula (dissoc opts :rets) [] [:call '<= [:lit 0] [:app q 'f]]))))
+    (testing "nor where a throw must be ruled out"
+      (is (nil? (sym/formula (assoc opts :total true) [] [:call '<= [:lit 0] [:app q 'f]]))))))

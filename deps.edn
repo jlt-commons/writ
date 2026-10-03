@@ -7,4 +7,7 @@
          :main-opts   ["-m" "writ.test-runner"]}
   ;; jolt -M:bench test/writ/spec_demo: the prover over the demo specs
   :bench {:extra-paths ["test"]
-          :main-opts   ["-m" "writ.bench"]}}}
+          :main-opts   ["-m" "writ.bench"]}
+  ;; jolt -M:bench:trials bench/trials/test: the prover over the trial
+  ;; projects' specs, the corpus the solver's work is measured on
+  :trials {:extra-paths ["bench/trials/src" "bench/trials/test"]}}}

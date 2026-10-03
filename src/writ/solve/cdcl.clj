@@ -48,6 +48,20 @@
   [st l]
   (get (:val st) l))
 
+(defn- order-key
+  "Atom a's place in the order of unassigned atoms: highest activity
+  first, and of equal ones the atom met last, as max-key chooses."
+  [st a]
+  [(- (get-in st [:activity a] 0.0)) (some-> (get-in st [:aid a]) -)])
+
+(defn- add-atom
+  "st knowing atom a, unassigned, among the atoms decisions choose from."
+  [st a]
+  (if (contains? (:aid st) a)
+    st
+    (let [st (-> st (update :atoms conj a) (assoc-in [:aid a] (count (:atoms st))))]
+      (if (some? (get (:val st) a)) st (update st :order conj (order-key st a))))))
+
 (defn- assign
   "Make l true at the current level, for reason r (a clause index, or nil
   for a decision)."
@@ -56,6 +70,8 @@
         nl (or (get n l) (negate l))
         a (atom-of l)]
     (-> st
+        ;; an assigned atom leaves the order decisions choose from
+        (update :order disj (order-key st a))
         (assoc-in [:val l] true)
         (assoc-in [:val nl] false)
         (assoc-in [:level a] (count (:lims st)))
@@ -120,8 +136,13 @@
 (defn- bump [st a]
   (let [act (+ (get-in st [:activity a] 0.0) (:inc st))]
     (if (> act 1e100)
-      (-> st (update :activity (fn [m] (update-vals m #(* % 1e-100)))) (update :inc * 1e-100))
-      (assoc-in st [:activity a] act))))
+      (let [st (-> st (update :activity (fn [m] (update-vals m #(* % 1e-100)))) (update :inc * 1e-100))]
+        ;; every key moves: the order rebuilt from the unassigned atoms
+        (assoc st :order (into (sorted-set) (for [b (:atoms st) :when (nil? (get (:val st) b))] (order-key st b)))))
+      (if (and (contains? (:aid st) a) (nil? (get (:val st) a)))
+        (-> st (update :order disj (order-key st a)) (assoc-in [:activity a] act)
+            (as-> st (update st :order conj (order-key st a))))
+        (assoc-in st [:activity a] act)))))
 
 (defn- analyze
   "The first-UIP clause learned from conflict clause index ci, and the level
@@ -150,6 +171,14 @@
             [(update st :inc / 0.95) learned back])
           (recur st (nth (:clauses st) (get-in st [:reason (atom-of t)])) seen out counter (dec idx) t))))))
 
+(defn- truncate
+  "The first n elements of vector v, by popping the rest: jolt's subvec
+  just past a trie boundary (1025 elements and more) makes a vector whose
+  next conj throws, and a trail is conj'd onto after every backjump.  The
+  pops cost what the conjs that made them did."
+  [v n]
+  (loop [v v] (if (> (count v) n) (recur (pop v)) v)))
+
 (defn- backjump
   "Undo every assignment above level k."
   [st k]
@@ -162,11 +191,13 @@
                          (-> st
                              (update :val dissoc l (negate l))
                              (update :level dissoc a)
-                             (update :reason dissoc a))))
+                             (update :reason dissoc a)
+                             ;; unassigned again: back in the order
+                             (cond-> (contains? (:aid st) a) (update :order conj (order-key st a))))))
                      st gone)]
       (-> st
-          (assoc :trail (subvec (:trail st) 0 cut) :qhead cut :lims (subvec (:lims st) 0 k))
-          (assoc :tabs (subvec (:tabs st) 0 (inc k)))))))
+          (assoc :trail (truncate (:trail st) cut) :qhead cut :lims (truncate (:lims st) k))
+          (assoc :tabs (truncate (:tabs st) (inc k)))))))
 
 (defn- learn
   "Learn clause c (justified by just) after a conflict, jump back and assert
@@ -190,8 +221,10 @@
 (defn- theory
   "The simplex over the inequalities that hold, from the level's tableau."
   [st]
-  (let [lits (filter #(= :le (first %)) (:trail st))
-        from (peek (:tabs st))]
+  (let [from (peek (:tabs st))
+        ;; the level's tableau holds the inequalities of the trail up to the
+        ;; place it was made at: only those after are new
+        lits (filter #(= :le (first %)) (subvec (:trail st) (or (:pos from) 0)))]
     (simplex/check lits (:max-pivots st) from)))
 
 ;; --- the search -------------------------------------------------------------------
@@ -209,10 +242,9 @@
   "The unassigned atom of highest activity, as the literal of its saved
   phase, or nil when every atom is assigned."
   [st]
-  (let [free (remove #(some? (value st %)) (:atoms st))]
-    (when (seq free)
-      (let [a (apply max-key #(get-in st [:activity %] 0.0) free)]
-        (if (get-in st [:phase a] false) a (negate a))))))
+  (when-let [[_ i] (first (:order st))]
+    (let [a (nth (:atoms st) (- i))]
+      (if (get-in st [:phase a] false) a (negate a)))))
 
 (defn- conflict-step
   "Handle the conflict of clause ci, every literal of which is false: learn
@@ -233,7 +265,10 @@
   (let [atoms (vec (distinct (map atom-of (mapcat identity clauses))))
         st {:clauses [] :lemmas [] :watch {} :val {} :level {} :reason {} :phase {}
             :activity {} :inc 1.0 :trail [] :qhead 0 :lims [] :tabs [nil]
-            :atoms atoms :conflicts 0 :decisions 0 :budget budget :max-pivots max-pivots :cuts 0}]
+            :atoms atoms :aid (zipmap atoms (range))
+            ;; the unassigned atoms, highest activity first: VSIDS's heap
+            :order (into (sorted-set) (map (fn [i] [-0.0 (- i)]) (range (count atoms))))
+            :conflicts 0 :decisions 0 :budget budget :max-pivots max-pivots :cuts 0}]
     (reduce (fn [st c]
               (if (:unsat st)
                 st
@@ -260,12 +295,12 @@
         (budget! st)
         (let [st (propagate st)]
           (cond
-            (:unsat st) {:lemmas (:lemmas (:unsat st))}
+            (:unsat st) {:lemmas (:lemmas (:unsat st)) :spent (+ (:conflicts st 0) (:decisions st 0))}
 
             (:conflict st)
             (let [r (conflict-step st (:conflict st))]
               (if (:unsat r)
-                {:lemmas (:lemmas (:unsat r))}
+                {:lemmas (:lemmas (:unsat r)) :spent (+ (:conflicts r 0) (:decisions r 0))}
                 (recur r restarts until)))
 
             :else
@@ -278,10 +313,11 @@
                       [st i] (add-clause st c {:farkas fk})
                       r (conflict-step st i)]
                   (if (:unsat r)
-                    {:lemmas (:lemmas (:unsat r))}
+                    {:lemmas (:lemmas (:unsat r)) :spent (+ (:conflicts r 0) (:decisions r 0))}
                     (recur r restarts until)))
-                (let [st (assoc st :tabs (conj (pop (:tabs st)) (:tableau t)))]
+                (let [st (assoc st :tabs (conj (pop (:tabs st)) (assoc (:tableau t) :pos (count (:trail st)))))]
                   (cond
+
                     ;; restart: back to level 0, keeping what was learned
                     (>= (:conflicts st) until)
                     (let [restarts (inc restarts)]
@@ -296,25 +332,26 @@
                                  (assign l nil))
                              restarts until)
                       ;; every atom assigned and the theory agrees: integral?
-                      (if-let [[x v] (first (remove #(integer? (val %)) (sort-by (comp str key) (:sat t))))]
+                      (if-let [[x v] (first (remove #(integer? (val %)) (sort-by (comp str key) (force (:sat t)))))]
                         (let [terms (when (< (:cuts st) 12) (simplex/gomory (:tableau t)))]
                           (if (and terms (nil? (value st (cert/cut (set (:trail st)) terms))))
                             ;; a Gomory cut: the bounds it combines imply it
                             (let [cl (cert/cut (set (:trail st)) terms)
                                   c (into [cl] (map (comp negate first) terms))
                                   [st i] (add-clause (update st :cuts inc) c {:cut terms :lit cl})
-                                  st (update st :atoms conj (atom-of cl))]
+                                  st (add-atom st (atom-of cl))]
                               (recur (assign st cl i) restarts until))
                             ;; branch: x <= floor v, a new atom, decided
                             (let [b [:le {x 1} (simplex/floor-value v)]
-                                  st (update st :atoms conj (atom-of b))]
+                                  st (add-atom st (atom-of b))]
                               (recur (-> st
                                          (update :decisions inc)
                                          (update :lims conj (count (:trail st)))
                                          (update :tabs conj (peek (:tabs st)))
                                          (assign b nil))
                                      restarts until))))
-                        {:sat true :assign (set (:trail st)) :values (:sat t)}))))))))))))
+                        {:sat true :assign (set (:trail st)) :values (force (:sat t))
+                         :spent (+ (:conflicts st 0) (:decisions st 0))}))))))))))))
 
 ;; --- constraint independence -------------------------------------------------------
 
@@ -346,6 +383,7 @@
         (if-let [p (first parts)]
           (let [r (search (vec p) opts)]
             (if (:sat r)
-              (recur (rest parts) (-> acc (update :assign into (:assign r)) (update :values merge (:values r))))
+              (recur (rest parts) (-> acc (update :assign into (:assign r)) (update :values merge (:values r))
+                                      (update :spent (fnil + 0) (:spent r 0))))
               r))
           acc)))))

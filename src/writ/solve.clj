@@ -49,23 +49,84 @@
                 :when (not (contains? fns x))]
             [x (if (bool? x) (contains? assign [:bool x true]) (value-of x))]))))
 
+(def ^:private max-clauses
+  "The most clauses a check searches; past it, :unknown at once.  Every
+  formula the benches prove has under 6000."
+  15000)
+
+(def ^:private max-rounds
+  "The most searches one check makes, adding congruence between them."
+  6)
+
+(defn- broken-pairs
+  "[i j] of the applications of one fn that solver result r gives equal
+  arguments and different results, i < j, none of them in seen."
+  [apps {:keys [assign values]}]
+  (let [value-of #(get values % 0)
+        result (fn [{:keys [kind var]}] (if (= :fn kind) (value-of var) (contains? assign [:bool var true])))]
+    (fn [seen]
+      (vec (for [[_ group] (group-by (fn [[_ a]] [(:kind a) (:f a)]) (map-indexed vector apps))
+                 [_ same-args] (group-by (fn [[_ a]] (mapv #(pre/lin-value % value-of) (:args a))) group)
+                 :when (next same-args)
+                 :let [[[i a] & more] same-args]
+                 [j b] more
+                 :when (and (not= (result a) (result b)) (not (contains? seen [i j])))]
+             [i j])))))
+
+(declare check-clauses)
+
 (defn check
   "Is formula f satisfiable?  {:result :sat :model m}, {:result :unsat
   :certificate c} or {:result :unknown :reason s}.  opts: :budget, the
-  most decisions and conflicts to make, and :engine, :cdcl (clause
-  learning, the default) or :dpll (the tree search, kept for comparison)."
+  most decisions and conflicts to make, :engine, :cdcl (clause
+  learning, the default) or :dpll (the tree search, kept for comparison),
+  and :congruence false, which leaves out that equal arguments give
+  equal results: its :unsat holds of the formula, its :sat may not."
   [f decls opts]
-  (let [{:keys [clauses apps]} (pre/preprocess f decls)
+  (let [{:keys [clauses] :as pp} (pre/preprocess f decls {:congruence false})]
+    (if (> (count clauses) (or (:max-clauses opts) max-clauses))
+      {:result :unknown :reason (str (count clauses) " clauses, past the most a check searches")}
+      (check-clauses f decls opts pp))))
+
+(defn- check-clauses
+  [f decls opts {:keys [clauses apps]}]
+  (let [apps (vec apps)
         budget (or (:budget opts) default-budget)
-        sopts {:budget budget :max-pivots (* 100 (max budget 100))}]
+        ;; one budget for every round: a round that finds a model spends
+        ;; what it searched, and the next has what is left
+        left (atom budget)
+        run (fn [cls]
+              (let [b (max 1 @left)
+                    sopts {:budget b :max-pivots (* 100 (max b 100))}
+                    r (if (= :dpll (:engine opts)) (search/solve cls sopts) (cdcl/solve cls sopts))]
+                ;; each round costs at least a fortieth: a search from the
+                ;; start, so a run of cheap rounds ends too
+                (swap! left - (max (quot budget 40) (:spent r 0)))
+                r))]
     (try
-      (let [r (if (= :dpll (:engine opts))
-                (search/solve clauses sopts)
-                (cdcl/solve clauses sopts))]
-        (if (:sat r)
-          {:result :sat :model (model f decls apps r)}
-          {:result :unsat :certificate {:claim :unsat
-                                        :proof (if (:lemmas r) {:lemmas (:lemmas r)} (:proof r))}}))
+      ;; congruence on demand, as SMT solvers add Ackermann's constraints
+      ;; dynamically: search without them, and where the model gives two
+      ;; applications of a fn equal arguments and different results, add
+      ;; that pair's constraint and search again.  A certificate lists the
+      ;; pairs, so the checker adds the same clauses
+      (loop [cls clauses, pairs [], seen #{}, rounds 0]
+        (let [r (run cls)]
+          (if (:sat r)
+            (let [broken (if (false? (:congruence opts)) [] ((broken-pairs apps r) seen))]
+              (cond
+                ;; with {:congruence false} a model may give one fn two
+                ;; results at equal arguments: for a caller that wants only
+                ;; to hear :unsat, which holds of the full formula too
+                (empty? broken) {:result :sat :model (model f decls apps r)}
+                ;; every proof of the benches takes one round; a model that
+                ;; keeps breaking congruence is left unknown
+                (or (<= @left 0) (>= rounds max-rounds)) {:result :unknown :reason "the budget ran out adding congruence"}
+                :else (recur (into cls (mapcat (fn [[i j]] (pre/congruence-clauses (apps i) (apps j))) broken))
+                             (into pairs broken) (into seen broken) (inc rounds))))
+            {:result :unsat :spent (+ (- budget @left) (:spent r 0))
+             :certificate {:claim :unsat
+                                          :congruence pairs
+                                          :proof (if (:lemmas r) {:lemmas (:lemmas r)} (:proof r))}})))
       (catch clojure.lang.ExceptionInfo e
         (if (or (::search/budget (ex-data e)) (::simplex/budget (ex-data e)))
           {:result :unknown :reason (ex-message e)}

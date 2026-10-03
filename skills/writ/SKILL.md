@@ -32,6 +32,9 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
   downgrade a blocking `question` yourself. `(spec/attest record 'my.spec)`
   compares a recorded check with the spec now and names every way it got
   weaker.
+  A spec may hold itself to a record, `(spec my.ns {:baseline "path"})`:
+  the check then fails on any weakening. Never write a new record to get
+  a check through; that is the owner's call.
 - The implementation is yours. Change it until `check` reports `:ok`.
 - If you are asked to write the spec, write the intent: see
   [What a spec should say](#what-a-spec-should-say).
@@ -111,7 +114,11 @@ failures: a law over every input may already answer one.
 - `(refine Name [x Base] pred)` is a type: values of Base where pred
   holds. Use it in `ann`, `forall`, states, other refinements. It defines
   `Name?`. Refine the parts (a Paddle, a Ball) rather than folding random
-  Ints into range inside laws.
+  Ints into range inside laws. A rule across a whole value that a random
+  one rarely meets (a total that is the sum of the items, counts that
+  match what they count) starves the generator: give the refinement
+  `{:build f}`, `(refine Receipt [r ...] pred {:build settle})`, where
+  `settle` is a spec fn that makes any base value one that meets pred.
 - Each edge's fn must fit by its `ann`: the state's param (first, or at
   `_`) = the state's base type, the others the arg types; the return type
   = the targets' base type.
@@ -157,6 +164,9 @@ failures: a law over every input may already answer one.
   passes the guard; for an `and` test, `g:s:f:when.N` says clause N fails
   while the others hold. Guard what the problem refuses, rather than
   folding the refusal into the targets.
+  A `:when` may name a spec fn of one expression that takes the step's
+  arguments in order, `:when may-withdraw?`, so the laws use the same
+  predicate instead of restating the guard.
 - Who may act: `:actors {:type User :role :role}` on the graph names the
   argument that acts and the key holding its role, and `:by #{:owner}` on
   an edge the roles that may take it. It is a guard, joined after the
@@ -165,11 +175,28 @@ failures: a law over every input may already answer one.
 - A frame, on a record state: `{[award Nat] {:to #{:active} :changes
   [:points]}}`. `g:s:f:frame` says the step changes only those keys and
   keeps every other one, named by the record or not, as it was. It can go
-  with `:when`, and then holds under the guard.
+  with `:when`, and then holds under the guard. An entry may be a path
+  into the state, its parts the step's own arguments: `{[lend Nat Nat]
+  {:to #{:lib} :changes [[:copies (arg 2)] [:members (arg 1)]]}}` says
+  `lend` touches only that copy and that member, in place of a law per
+  step saying it.
+- A step of cases: `{[withdraw Nat] [{:to #{:open} :when covered?
+  :changes [:balance]} {:to #{:overdrawn} :when short?}]}`. Each case has
+  its own laws (`g:s:f#1`, `#2`); no case holding refuses the step; and
+  `g:s:f:cases` says no two cases hold at once.
+- `:model {:view f :steps {step model-step ...}}`: f takes a state to a
+  simpler value, and each model-step does to that value what the step
+  does, taking the step's other arguments. Each such edge gets the law
+  `g:s:step:model`, `(= (f (step s ...)) (model-step (f s) ...))`.
 - `:runs N` (with `:depth D`, default 20) walks N seeded runs from a
   `[state value]` start through the real fns: every landing must be in an
   allowed state and hold its invariants, and every final state the graph
-  reaches must be reached by some run.
+  reaches must be reached by some run. A guarded step searches for
+  arguments its guard takes (the state's own integers among them), and a
+  final state the seeded runs miss gets runs walked toward it. "no run
+  reached :s ... the guard of f from :x refused all N of its steps" means
+  the guard cannot hold from the states a run reaches: check the guard
+  and the start value.
 
 ## A spec
 
@@ -227,9 +254,13 @@ failures: a law over every input may already answer one.
 - A law is built from:
   - `(= a b)`
   - `(and P ...)`
-  - `(=> P Q)`; a case where `P` does not hold is skipped
+  - `(=> P Q)`; a case where `P` does not hold is skipped. When no
+    generated input meets `P`, the solver looks for inputs that do: the
+    law is refuted there, or its proof stands on them
   - `(forall [x T, y U] P)`
-  - `(exists [x T] P)`
+  - `(exists [x T] P)`. Over `Nat` or `Int`, with a body of bounds on x
+    (helpers of one expression read through), it is read as the bounds
+    meeting, and proved or refuted; any other nested `exists` is sampled
   - `(throws? e)`: evaluating `e` throws, lazy seqs in its value
     realised. A signature broken by the law itself is rethrown, not
     counted. Refer it from `writ.spec`.
@@ -288,6 +319,19 @@ dependency documents, not whatever closes a proof.
 - ``assumes a signature for `ns/f`, which does not resolve`` - require
   the namespace in the spec and name the fn through its alias.
 
+A pure static member of a host class is assumed the same way, and the
+code may then call it, which the static check otherwise rejects:
+
+```clojure
+(assume Math/sqrt [Double -> Double])   ; java.lang.Math/sqrt is the same member
+```
+
+The signature types the calls, and the laws run against the real member,
+but what it returns is not checked (a member has no var to wrap). Assume
+only pure members. Members of `System`, `Runtime` and `Thread` and the
+random sources are refused: they are effects, which belong in the shell.
+Prefer the core fn where there is one (`abs`, not `Math/abs`).
+
 ## The proof namespace
 
 When a law holds but isn't proved, add what the prover needs in
@@ -330,11 +374,26 @@ When a law holds but isn't proved, add what the prover needs in
 - Maps are modelled: literals, `assoc`, `dissoc`, `merge`, `get`, `(:k m)`,
   `(m k)`, `contains?`, `count` and equality by entries, keys symbolic or
   not; `keys` and `vals` are unordered, so `every?` over them works and an
-  order-sensitive use gives up. A map of unknown size (a `(Map K V)`
-  variable) is outside.
+  order-sensitive use gives up.
+- A map of unknown size (a `(Map K V)` or `(Index :k R)` variable) and a
+  vector of unknown length (a `(Vec T)`) are read as arrays: `assoc`,
+  `dissoc`, `assoc-in`, `update`, `update-in`, `get`, `get-in`,
+  `contains?`, `conj`, `first`, `rest`, `nth` and `count` on them, and
+  equality of two maps changed from one, are proved for any size.
+  `every?`, `some`, `not-any?`, `filter`, `remove`, `map`, `seq` and
+  `empty?` over a map's entries, keys or vals, or over such a vector, are
+  read as quantified tests, so a refinement's rule over every member is
+  used where a step touches it. `count` of such a map or of a filter of it,
+  and `(reduce + 0 xs)` or `(apply + xs)` of its vals, are arithmetic:
+  "opening an account adds one" is proved. State laws over a whole store
+  with these forms and they are likely to be proved.
 - A recursive definition is unfolded, exactly, while a literal drives it --
   a pattern walked to its end, a vector of known length -- up to a depth
-  and a count; past them the law is left to testing.
+  and a count. Past them, a fn with a signature is left uninterpreted: some
+  value of its return type, equal for equal arguments, so what follows
+  from the type alone (a `Nat` result is at least 0) is still proved; the
+  rest needs a lemma or induction.
+- Induction on an integer is tried only where the code recurses on it.
 - A branch that gives up is dropped when the solver shows its path cannot
   be taken under the law's hypothesis, so `(=> (not (vector? x)) ...)`
   proves even though the code's vector branch walks elements the prover
@@ -423,6 +482,35 @@ of the algorithm (that is the code).
 - **Measure with the spec's own helpers.** Never use the implementation's
   fns to judge its results. A law that checks the code with the code is
   circular.
+- **Give an example or two.** `(example price [6000] 12000)` is checked as
+  a law, and the other laws must pin `price` down at 6000 as well: a
+  stand-in that agrees everywhere but there must break one of them.
+- **Reach for the strong kinds of law.** Hughes ("How to Specify It!",
+  2019) planted eight bugs in a search tree: laws that only said the
+  result was valid caught three; every bug was caught by each of these:
+  - a postcondition: what the result is, `(= (lookup k (insert k v t)) v)`;
+  - a metamorphic law: how results of related inputs relate,
+    `(= (count (union a b)) (count (union b a)))`;
+  - a model: the code agrees with a simple reference,
+    `(= (to-list (insert k v t)) (sorted-insert k v (to-list t)))`;
+  - an inductive set: laws for each way a value is built, which together
+    leave one answer.
+  A law that says only what kind of value comes back, `(seqable? (isort
+  xs))`, is one the report names: it "tells none of `isort`'s stand-ins
+  from the real fn".
+- **Write the model so the prover can read it.** A proved law holds for
+  every input; a tested one only for the inputs generated, and a bug on
+  one input in a hundred gets past the tests now and then. Say what a
+  model means with arithmetic, `and`/`or`, records and `exists` over
+  bounds rather than building sets or ranges: "two spans overlap when some
+  unit t is in both", `(exists [t Nat] (and (holds? a t) (holds? b t)))`,
+  is proved or refuted. So is a set of integers made by `range`, and its
+  intersection, union and difference with another, its count and its
+  emptiness: `(seq (set/intersection (set (range s1 e1)) (set (range s2
+  e2))))` is read as two intervals meeting. `frequencies`, most string fns
+  and `conj` onto a value not known to be a vector are not read, and a law
+  through them is only tested. "tested, not proved" in a report is a
+  prompt to restate the law in what the prover reads.
 
 writ rejects a spec that does not do this:
 
@@ -448,7 +536,9 @@ Plain Clojure, with no writ require and no annotations. writ rejects:
 
 - Effects and interop: I/O, atoms and refs, futures, `eval`, `throw`,
   `new`, `.method`, `reify`, static members such as `System/getenv` or
-  `Math/abs` (use `abs`), reflection.
+  `Math/abs` (use `abs`), reflection. A pure static member the spec
+  assumes a signature for, `(assume Math/sqrt [Double -> Double])`, may be
+  called; see [Assumptions](#assumptions).
 - Top-level forms other than `ns`, `comment`, `def` and `defn`: no
   `defmulti`, `defrecord`, `defmacro`, `declare` or bare expressions.
   Each fn has one arity.
@@ -554,9 +644,16 @@ check, so the test runner checks the spec namespace with no wrapper
 (a runner that picks namespaces by name must match `-spec` too).
 `{:test {:seed 42}}` passes check options; `{:test false}` drops it.
 By hand: `(let [r (spec/check 'my.sort-spec)] (is (:ok r) (:message r)))`.
-Other options are `:trials`, the test.check runs per law (default 100),
-`:max-size`, the largest generated size (default 50), and
+Other options are `:trials`, the test.check runs per law (default 100;
+a law the prover does not prove gets up to 900 more, within 20s,
+`:more-trials false` turns that off),
+`:max-size`, the largest generated size (default 50; a collection inside
+another gets its square root), `:parallel false`, which runs the laws one
+at a time instead of a thread per processor, and
 `:adequacy false`, which skips the gap check while a spec is being drafted.
+A report's `:timings` says where the time went, in milliseconds
+(`:static :tests :prover :more-trials :adequacy :graphs :total`), and each
+tested law carries `:test-ms`.
 
 ## Reading a report
 
@@ -671,7 +768,22 @@ confirm it, then without one.
 - ``law `x` fails for ...`` - the implementation is wrong for that input;
   see [Reading a report](#reading-a-report).
 - ``the hypothesis never held in N trials`` - no generated input satisfied
-  the `=>` premise, so the law tested nothing. Tell the spec's owner.
+  the `=>` premise, and the solver found none either, so the law tested
+  nothing. Tell the spec's owner: the premise may be unsatisfiable, or
+  its inputs need building to fit (a refinement, or values folded into
+  range in the law).
+- ``writ could not generate a value of refinement `R` `` - its predicate
+  rejects nearly every candidate, so its values would be the few small
+  ones a draw happens on. Refine its parts so values are built to fit, or
+  give it `{:build f}`.
+- ``` `f` returns values outside R: fix it first ``` - the laws listed
+  fail because `f` broke its return refinement; the message names the
+  clause of the predicate it breaks and the part of the value that breaks
+  it. Fix `f`, and the other failures often go with it.
+- ``law `x`: (<= a b) was never false in N trials, nor at an input the
+  solver found`` - a clause of the law that only ever went one way tests
+  one side only. Build inputs that turn it (a refinement, a value in the
+  law), or drop it if it always holds. Tell the spec's owner.
 - ``no witness among N generated values`` - the `exists` law found no
   value. Either the implementation is wrong, or the witness is too rare to
   generate.
@@ -764,6 +876,9 @@ confirm it, then without one.
   exactly its frame: the loop's slots or the defn's parameters. Match the count.
 - ``` `throw`/`new`/`.foo` is host interop or effect code ``` - writ checks
   pure data-and-functions code only; no host calls, no mutation, no effects.
+- ``` `Math/sqrt` is host interop or effect code ... (assume Math/sqrt [A -> R]) ```
+  - a static member. Use a core fn if there is one; if the member is pure,
+  the spec may assume its signature (see [Assumptions](#assumptions)).
 - ``` duplicate parameter in `f` ``` - parameters are binders: rename one, or
   use `_` for a parameter you ignore (it may repeat).
 - ``` def `x` must carry a value ``` - a book is never evaluated, so a def

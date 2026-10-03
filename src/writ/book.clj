@@ -343,7 +343,7 @@
                 (nil? ns) s
                 (= target name) (with-meta (symbol (clojure.core/name s)) (meta s))
                 (not= target ns) (with-meta (symbol target (clojure.core/name s)) (meta s))
-                :else s)))
+                :else (with-meta (l/host-name s) (meta s)))))
           (walk [f]
             (cond
               (symbol? f) (fix f)
@@ -366,7 +366,16 @@
   book's own are."
   {})
 
+(declare check-book*)
+
 (defn check-book
+  [forms]
+  ;; a host member the spec assumes a signature for is called like an
+  ;; assumed fn
+  (binding [l/*assumed-hosts* (into l/*assumed-hosts* (filter l/host-member?) (keys *extra-sigs*))]
+    (check-book* forms)))
+
+(defn- check-book*
   [forms]
   (let [info (ns-info forms)
         forms (mapv (fn [f] (if (ns-form? f) f (d/annotate-fns (normalize-names f info))))

@@ -128,12 +128,12 @@
              {:proof {:farkas fk} :used (set (map first fk))})
            (if-let [c (first (remove #(some assign %) clauses))]
              (split st assign cuts (first (remove #(assign (negate %)) c)) tab)
-             (if-let [[x v] (first (remove #(integer? (val %)) (sort-by (comp str key) (:sat t))))]
+             (if-let [[x v] (first (remove #(integer? (val %)) (sort-by (comp str key) (force (:sat t)))))]
                (let [terms (when (< cuts max-cuts) (simplex/gomory (:tableau t)))]
                  (if (and terms (not (assign (cert/cut assign terms))))
                    (add-cut st assign cuts terms tab)
                    (split st assign cuts [:le {x 1} (simplex/floor-value v)] tab)))
-               {:sat true :assign assign :values (:sat t)}))))))))
+               {:sat true :assign assign :values (force (:sat t)) :spent (:decisions @st)}))))))))
 
 (defn solve
   "Search clauses for a model.  {:sat true :assign #{literal} :values

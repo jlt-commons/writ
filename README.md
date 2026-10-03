@@ -257,6 +257,31 @@ at positive and negative `n` but not at 0:
 the spec does not pin down `sign`: every law still holds when it has 1 for 0 in (cond (pos? n) 1 (neg? n) -1 :else 0), and it differs from the real fn on {n 0}
 ```
 
+A mutant the samples do not tell apart is run again at the input that
+shows it: each law that calls the fn on its own variables is run with
+them set to that input. If one fails there, the mutant is rejected, and
+the miss was the data's. A survivor is then a gap in the laws, and the
+report says so: `and no law tells it apart, even run there`. writ seeds
+the numbers in the code, the large ones too, so a threshold of 5000 is
+tried at 4999, 5000 and 5001.
+
+A spec may give examples beside its laws: `(example price [6000] 12000)`
+says `(price 6000)` is 12000. It is checked as a law, `example:price:1`.
+It also asks the other laws to pin `price` down there: a stand-in that
+agrees with `price` everywhere but at 6000 must break one of them, or the
+report says no law but the example says what `price` returns there. An
+example is checked against the laws, not the laws against code written
+by the same hand.
+
+The stand-ins that change the real result change it the ways a mistake
+keeps its type: a number one more or one less, a collection without its
+first or last element or with one added, a record with one field changed.
+
+Each law of the spec's own is also judged alone: one that tells none of
+the stand-ins of the fns it calls from the real ones, such as a law that
+says only `(every? nat-int? (isort xs))`, is named in the report. On its
+own it holds of a constant answer too.
+
 Passing this check is necessary for a good spec, not sufficient.
 
 ## Writing a spec
@@ -329,6 +354,16 @@ by default, and a `Nat` between 0 and `max-size`. A law quantified over
 matter, such as a return code's sentinels, anchor each one with a law that
 names it: `(law eof-sentinel (forall [e Bool] (= :eof (classify-read -127 e))))`.
 
+A collection is at most `max-size` long, and one inside another collection
+at most its square root, 7 by default, so a map of vectors stays near the
+size rather than its square; the numbers inside it still range over the
+whole size, and a collection of a type with few values, such as a queue of
+one of four members, keeps the whole size. A map or index whose key can
+take only a few values (a `Bool`, an integer refinement such as `(< t 3)`,
+a data type of constants) draws its keys first and makes a value for each
+distinct one, so it is as full as when every entry was drawn, without
+making the values that would share a key.
+
 ### Data
 
 A data value is a vector headed by its constructor keyword: `[:Leaf]`,
@@ -378,8 +413,11 @@ one):
 ```
 
 Generated values are built that way, keyed and with no field shared, not
-filtered for it. A refinement of an Index checks the same in its
-predicate, so the edge law `registry:db:register` says a registration
+filtered for it. A refinement of an Index is built the same way: a record
+is kept only when the index with it still meets the refinement's
+predicate, so a rule across the records, no two bookings of a room at
+once, costs nothing to generate. The refinement checks the key and
+unique fields in its predicate too, so the edge law `registry:db:register` says a registration
 lands in a `Db`: keyed by id, no email twice. A `register` that forgets
 to look at the emails fails it:
 
@@ -466,6 +504,38 @@ A proposition is built from:
   breaks a signature, is not counted: it is rethrown, and the law fails
   with it, since the law misuses the code rather than finding it throws.
 - any other expression, which holds when it is truthy
+
+A hypothesis no generated input meets, such as `(= a (* 3 (+ b 40)))` when
+a generated `Int` stays within 50 of 0, tests nothing. writ then asks the
+solver for inputs that meet it: where the law is false there, the report
+gives the solver's counterexample, confirmed by running the code; where
+the law is proved, the proof stands on up to three inputs the solver found
+for the hypothesis, and the stand-ins are judged at them too. Only when
+the solver finds none either does the law fail with "the hypothesis never
+held".
+
+A set of integers made by `range` is read as an interval: its members,
+its count, whether it is empty, and its intersection with another range
+come from its bounds, so a law like "two spans overlap when their unit
+sets meet", `(seq (set/intersection (set (range s1 e1)) (set (range s2
+e2))))`, is proved or refuted by the solver. A spec's alias of
+`clojure.set` is read as `clojure.set`.
+
+An `exists` over a `Nat` or `Int` whose body is bounds on it, with the
+spec's own one-expression helpers read through, means the bounds meet:
+`(exists [t Nat] (and (<= s1 t) (< t e1) (<= s2 t) (< t e2)))` holds
+exactly when each lower bound is below each upper one: `(<= (+ s1 1) e1)`,
+`(<= (+ s1 1) e2)`, `(<= (+ s2 1) e1)`, `(<= (+ s2 1) e2)`. writ reads it
+that way, so a law of that shape is proved or refuted by the
+solver, where a nested `exists` of any other shape is only sampled:
+
+```clojure
+(defn holds? [s t] (and (<= (:start s) t) (< t (:end s))))
+
+(law overlap-means-a-shared-unit
+  (forall [a Span, b Span]
+    (=> (overlaps? a b) (exists [t Nat] (and (holds? a t) (holds? b t))))))
+```
 
 ```clojure
 (law reading-past-the-end-throws
@@ -638,6 +708,60 @@ numbers, where code tends to break -- so a law never folds random inputs
 into shape. The prover takes the predicate as a hypothesis, and the
 static check sees the base type. `refine` also defines the predicate, as
 `Paddle?`, for laws to use.
+
+Other values are found by drawing from the base type and keeping those
+that meet the predicate. A field the predicate pins is set before the
+predicate judges the value: in `(refine Placed [o Order] (and (= :placed
+(:status o)) (unpaid? o)))`, with `(defn unpaid? [o] (and (zero? (:paid
+o)) (zero? (:refunded o))))`, the drawn order gets `:status :placed` and
+zero amounts, read through the spec's one-line fns. `(= c (:k o))`,
+`(zero? (:k o))`, `(nil? (:k o))` and `(= (:a o) (:b o))` pin a field, and
+`(first t)`, `(second t)` and `(nth t i)` a tuple's position. A predicate
+a random value rarely meets in any other way
+starves: a receipt whose total is the sum of its items, a library whose
+members' loan counts match the copies they hold. The check fails, naming
+the refinement, when 5000 candidates in a row are refused, or when fewer
+than one in 200 of the candidates of size 20 or more meet it: the values
+it finds then are the few small ones a draw happens on, a receipt with no
+items, and the laws would be tested on little else. Once a refinement
+starves, the rest of the check's draws of it fail at once. `{:build f}` names a fn
+of the spec that makes any value of the base type one of the refinement,
+and its values are drawn through it:
+
+```clojure
+(defn settle [r] (assoc r :total (reduce + 0 (:items r))))
+
+(refine Receipt [r {:items (Vec Nat), :total Nat}] (= (:total r) (reduce + 0 (:items r)))
+  {:build settle})
+```
+
+The predicate still decides: a built value it rejects is a mistake in
+the builder, and the check says so.
+
+When a fn returns a value outside its refinement, the report says which
+rule it breaks. writ follows the predicate through the spec's helpers of
+one expression, through `and` to the clause that fails, and through
+`every?` and `not-any?` to the element that breaks them:
+
+```
+`lend` returns Lib, but returned {...} for arguments [...]: it breaks
+(= (:loans m) (lent-to l (:id m))), at (:members l) key 0, m = {:id 0, :loans 0},
+(:loans m) => 0, (lent-to l (:id m)) => 1
+```
+
+Every law that runs into such a value fails because of it, so the report
+names the fn first, once, with the laws it explains, and shows one of
+them in full: `` `lend` returns values outside Lib: fix it first; laws
+that fail because of it: desk:lib:lend, lending-marks-the-copy ``. The
+other failures follow.
+
+Whichever way a refinement's values are made, writ sets one of their
+integers, now and then, to a number the code or the spec mentions, or
+one either side of it, and keeps the change when the value is still one
+of the refinement. Those are the inputs that tell `<` from `<=`: a
+member owing exactly the 500 at which borrowing stops. A law that is only
+tested is also run where a sum or other computed term it compares with a
+number equals that number or one either side, at inputs the solver finds.
 
 ### The state graph
 
@@ -821,15 +945,60 @@ law `membership:fresh:award:frame` fails for
   (dissoc m :points) => {:email "", :id 0, :nick ""}
 ```
 
+An entry of `:changes` may also be a path into the state, whose parts
+can be the step's own arguments, `(arg 1)` the first after the state:
+
+```clojure
+:edges {:lib {[lend Nat Nat] {:to #{:lib} :changes [[:copies (arg 2)] [:members (arg 1)]]}}}
+```
+
+says `lend` changes only the copy it lends and the member it lends to.
+Everything else in the library, the other copies and members included,
+stays as it was.
+
+A `:when` may also name a fn of the spec, of one expression, that takes
+the step's arguments in its order: `{[lend Nat Nat] {:to #{:lib} :when
+lendable?}}`. The laws then use the same `lendable?`, so the guard is
+said once, and each clause of its `and` still gets its own law.
+
+A step whose outcome depends on its inputs may give its cases, each with
+its own guard, targets and frame:
+
+```clojure
+:edges {:open {[withdraw Nat] [{:to #{:open} :when covered? :changes [:balance]}
+                               {:to #{:overdrawn} :when short? :changes [:status :fee]}]}}
+```
+
+Each case has its own laws, `bank:open:withdraw#1` and `#2` with their
+frames. Where no case holds the step is refused and keeps the state,
+`bank:open:withdraw:refused`. No two cases may hold at once,
+`bank:open:withdraw:cases`, so a spec that leaves a withdrawal of
+exactly the balance to both fails at that input.
+
+A graph may also give a model of its states: `:model {:view items
+:steps {enqueue put, dequeue take-one}}`, where `items` is a spec fn
+from a state to a simpler value, and each step fn named has a spec fn
+that does the same to that value. Each such edge gets one law,
+`queue:q:dequeue:model`: the step, then the view, equals the view, then
+the model's step. A queue kept as two vectors is then said once, as one
+vector, and a `dequeue` that takes from the wrong end fails it.
+
 `:changes` goes with `:when` too, and then the frame holds under the
 guard. It needs a record state and names only the record's keys.
 
 **Runs.** `:runs N` walks N runs through the real fns from a `[state
 value]` start, up to `:depth` steps each (default 20). At each step it
-takes an edge chosen by the seed, with generated arguments. Each landing
+takes an edge chosen by the seed, with generated arguments. On every
+other guarded step it looks for arguments the guard takes, drawing the
+state's own integers and their neighbours too, since a guard like
+`(= amt (:total o))` compares an argument with the state; the other steps
+take their first draw, so refusals are walked as well. Each landing
 must be in a state the edge allows (for a refused step, the state it
 stays in or its `:else`) and hold that state's invariants, and every
-final state reached by the graph must be reached by some run. A run finds
+final state reached by the graph must be reached by some run. When the
+seeded runs miss a final state, runs are walked toward it, each step
+taking an edge that brings it closer. A final state still not reached is
+reported with the guard that refused every step, when one did. A run finds
 what sampling each state apart can miss, a value only a long climb from
 the start produces:
 
@@ -1054,12 +1223,17 @@ gets an entry in `:machines`; a failed one carries `:mismatches`, one
 Options: `:target` checks a different implementation against the same spec,
 `:trials` is the number of test.check runs per law (default 100), `:seed`
 replays a run (default random, reported per law), and `:max-size` is the
-largest generated size (default 50). `:adequacy false` skips the third
+largest generated size (default 50). A law the prover does not prove gets
+up to 900 more trials after its first 100, a hundred at a time with the
+seeds after its own, within 20 seconds; `:more-trials {:trials n :ms t}`
+changes that and `:more-trials false` turns it off. `:adequacy false` skips the third
 stage, for example while a spec is still being written, and
 `:prove false` skips the prover. `:require` sets the evidence every law
 needs, in place of the spec's own. `:proof` names the proof namespace
 (`false` for none), and `:fuel` gives the prover more rewrites per
-attempt.
+attempt. The laws are tested, given more trials and proved over one thread
+a processor, and the stand-ins of the adequacy stage are judged the same
+way; `:parallel false` runs them one at a time.
 
 Proofs are cached in `.writ-cache/`, one file per spec. Each law's result
 is kept under a key of everything its proof can rest on: the law, its
@@ -1077,6 +1251,11 @@ apart, in one file per implementation, keyed on the code, its signatures
 and data and writ, so editing a law or the proof namespace keeps them.
 `:cache false` turns it off; `:cache-dir` puts it
 elsewhere. Add `.writ-cache/` to `.gitignore`.
+
+A report's `:timings` says where the check's time went, in milliseconds:
+`{:static :tests :prover :more-trials :adequacy :graphs :total}`. Each
+tested law carries `:test-ms`, the time its first trials took, and a bench
+row carries it too.
 
 A spec can build on another's proved laws:
 
@@ -1099,7 +1278,22 @@ By default a spec accepts either, and the report says which each law got:
 
 ```
 writ.spec: my.sort-spec against my.sort: ok
-  6 of 7 laws proved; tested, not proved: smallest-first
+  6 of 7 laws proved; tested, not proved: smallest-first (each on at least 1000 inputs)
+```
+
+A law that is only tested runs its first 100 trials and then up to 900
+more, since tests are all it rests on. A failure among the extra ones is
+reported with the seed that replays it in the first hundred.
+
+Each trial also notes how the law's clauses came out: every comparison
+in it, and every part of its hypotheses. A clause the first hundred saw
+only one way is turned the other by the solver, under the law's
+hypotheses, and the law run there. The extra trials stop once every
+clause has gone both ways a few times, and a clause that never turned,
+by the trials or the solver, is named:
+
+```
+law `spending-stays-within-the-limit`: (<= 0 (count (frequencies (:flags a)))) was never false in 1000 trials, nor at an input the solver found. ...
 ```
 
 A spec can require proof. Then a law that is only tested fails:
@@ -1217,6 +1411,12 @@ as a hypothesis:
   a recursion of the code climbs on a law's integer. A scan that resumes
   from `start` is proved this way.
 
+An integer is inducted on only where the code recurses on it: where it
+reaches an argument of a fn that calls itself (a loop is one), or of a
+core fn that counts, such as `range`. Elsewhere the step case is the law
+again, so a day or an id passed to code that never recurses on it is
+not tried; a hint's `:induct` still is.
+
 Within a case, the prover:
 
 - splits an open integer comparison into its two outcomes, and
@@ -1264,8 +1464,10 @@ a value of its return type. Then `(insert x t)` is known to be a `Tree`.
 A set, a map or a fn has no recognizer, and takes only a variable of its
 own type. An `Int` return is proved an integer, and a `Nat` return is then
 proved not negative, so `(size t)` is an integer term the arithmetic
-works with, known to be at least 0. The passes repeat until nothing new is proved, so a
-law may cite one that comes later in the spec. A law that is only tested
+works with, known to be at least 0. The laws are proved in passes, the
+laws of a pass at once, each citing the laws proved in the passes before
+it. The passes repeat until nothing new is proved, so a law may cite one
+that comes later in the spec. A law that is only tested
 is never cited. The report names what each proof used:
 
 ```
@@ -1418,7 +1620,78 @@ Symbolic evaluation covers the non-recursive code: arithmetic, `if`,
 records, sets
 built from literals and sets of unknown size filtered, mapped by a
 translation, or tested for membership, and calls of pure core fns on
-literal data. Recursion is left to rewriting and induction.
+literal data. A recursive fn is unrolled while a literal drives it; past
+that bound, or where it would walk a value of unknown shape, the call is
+left uninterpreted, as Suter, Koksal and Kuncak do: some value of its
+signature's return type, made of fns of its arguments the solver knows
+nothing about, so equal arguments give equal results. That proves what
+follows from the type alone, such as a `Nat` result being at least 0;
+the rest is left to rewriting and induction. A fn with no signature, or
+a law that must show nothing throws, still gives up there.
+
+A map of unknown size, a variable of type `(Map K V)` or `(Index :k R)`,
+is read as the theory of arrays is reduced in an SMT solver: a predicate
+of the key says whether the map holds it, and each scalar part of the
+value it holds there is a fn of the key the solver knows nothing about.
+What the code does to it -- `assoc`, `dissoc`, `assoc-in`, `update`,
+`update-in` -- is a chain of stores on top; `get`, `get-in`, `contains?`
+and calling the map read the newest store at an equal key, else the map
+underneath. Two maps changed from one are equal when they agree at every
+key either changed, since everywhere else both are the map they came
+from. An index's record is known to hold its own key. So laws such as
+"a refused checkout changes nothing" or "paying touches only that
+member's fines" are proved for libraries of any size, and a
+counterexample decodes the map the model chose into a Clojure map.
+
+A vector of unknown length, a `(Vec T)`, is an array the same way: a
+length, and an element at each index made of fns of the index the solver
+knows nothing about. A value is a slice of it and the elements the code
+conj'd after: `first`, `rest`, `next` and `nth` move along the slice,
+`conj` adds after it, `count` is the slice's length and the added ones'.
+So a hold queue's "the first in line is served" and "a hold joins the end"
+are proved for queues of any length.
+
+`every?`, `some`, `not-any?`, `filter`, `remove`, `map`, `seq` and
+`empty?` over a map's entries, keys or vals, or over a vector of unknown
+length, are quantified tests, read as an SMT solver reads a quantifier
+(the array property fragment of Bradley, Manna and Sipma). The test is a
+boolean: when it is false, it fails at a fresh key or index, its witness;
+when it is true, it holds at each key or index the formula reads, the
+instances added once the goal is read, until no key is new or a bound is
+reached (instances of instances go one level deep, as an SMT solver
+bounds matching). So a refinement's rule over every member, assumed as
+a hypothesis, is used at the members a step touches, and a step is proved
+to keep it: "a withdrawal leaves every balance whole" holds of ledgers of
+any size. Two filters of one vector are equal when the filters agree at a
+fresh index, which is what "cancelling leaves the others in order" needs.
+A hypothesis evaluation cannot read at all is left out of the proof,
+which only makes the proof hold under less.
+
+`count` of a map of unknown size, or of a filter of its entries, keys or
+vals, is the count over the map it was changed from -- a fn of that map
+and of what the filter closes over, so the same filter of the same
+member counts the same -- plus one at each key the code put in it that
+was not there before, less one at each it took out. A count is never
+negative, and at least 1 where the formula reads a key the filter keeps.
+So "opening an account adds one" and "a loan counts against its member"
+are read as arithmetic. A sum, `(reduce + 0 xs)` or `(apply + xs)` of
+such a map's (mapped) vals, is read the same way. Over a vector of unknown
+length, a count of a filter or a sum is a prefix aggregate of the array:
+0 at the start, and at each index the formula reads, what that element
+adds to the one before; a slice is the difference at its ends. Two
+aggregates over one map or vector, of different fns, are equal when what
+they add agrees at a fresh key or index, so "a cancel leaves the count of
+the others" holds however the filters are written. A set, a keyword,
+`complement`, `comp` and `remove`'s negation are fns of known identity
+for this; a fn literal is known by its code, its parameters' names aside.
+
+A law is tried first without the refinements of its variables -- the
+rule a whole library keeps, say -- since most laws need none of it and
+reading it costs; when that fails, with them. The certificate names what
+it was made without. The solver adds congruence on demand, within one
+decision budget for all its rounds (5000 for a goal evaluated whole), and
+a law a test already refuted is tried only briefly, to catch a prover
+that would prove it.
 
 ### Which fns qualify
 
@@ -1517,6 +1790,23 @@ where it returns. Only the code's calls and the laws' are checked: writ's
 own calls to the fn, and the dependency's calls to itself, are not the
 spec's to type. The prover takes its result to be of its return type.
 
+A pure static member of a host class is assumed the same way, and the
+code may then call it, which the static check otherwise rejects as
+interop:
+
+```clojure
+(assume Math/sqrt [Double -> Double])
+(assume Math/abs [Double -> Double])
+```
+
+`Math/abs` and `java.lang.Math/abs` name the same member. The signature
+types the calls, and the laws run against the real member, but a member
+has no var to wrap, so what it returns is not checked against the
+signature. Assume only members that are pure. `assume` rejects the
+members that are plainly effects, those of `System`, `Runtime` and
+`Thread` and the random number sources, since they would make the laws'
+results depend on the machine and the clock.
+
 An assumed law is about such fns and never the target's: one that calls
 a fn of the target fails, directly or through a spec helper or project
 fn, since the target is what the spec checks. It
@@ -1607,8 +1897,20 @@ a new or changed assumption, or a check that passed and now fails.
 ;; => {:ok false :weakened [{:law sorted :what :require-lowered}]}
 ```
 
+A record also holds each `ann` and each refinement as written, so a
+signature loosened or a refinement rewritten shows as `:changed`.
+
 Changing the code never weakens the spec; a restated law its owner agreed
 to is accepted by writing a new record.
+
+A spec can hold itself to a record: `(spec my.sort {:baseline
+"spec-record.edn"})`. Its check, and the test it defines, then fails
+whenever the spec is weaker than the record, naming each way: `law
+`permutation` is removed`, `the ann of `insert` is changed: was ...,
+now ...`. An agent that edits the contract to get the code through is
+stopped by its own test run. The owner writes the record, and writes a
+new one to accept a change: `(spec/check 'my.sort-spec {:record
+"spec-record.edn"})`.
 
 ### Laws that contradict
 
@@ -1633,7 +1935,9 @@ These rules apply to the plain implementation.
   and refs, futures, `eval`, var mutation, randomness), no reflection.
   Calls into other namespaces pass through unchecked. writ reads source
   without loading it, so a qualified name whose qualifier ends in a
-  capitalised segment is taken to be a class.
+  capitalised segment is taken to be a class. A static member the spec
+  assumes a signature for, `(assume Math/sqrt [Double -> Double])`, may
+  be called; see [Assumptions](#assumptions).
 - **Top-level forms.** Only `ns`, `comment`, `def` and `defn`. A
   `defmulti`, `defrecord`, `defmacro` or bare expression is rejected
   rather than skipped. Each fn has a single arity.
@@ -1753,8 +2057,15 @@ rest of writ has no dependencies.
 
 ```
 jolt -M:test                   # or ./bin/test
+jolt -M:test --serial          # every namespace in one process
+jolt -M:test --run writ.spec-test writ.starved-test:0/4   # some, or a shard
 cd examples && jolt -M:test    # the example programs and their specs
 ```
+
+`jolt -M:test` runs each test namespace in a jolt process of its own, four
+at a time (`WRIT_TEST_JOBS` sets how many), the slow ones split into
+shards that each take every nth test, and prints a failing one's output
+whole.
 
 `jolt -M:bench DIR-or-spec-ns ...` (`./bin/bench` for the demo specs,
 `examples/bin/bench` for the examples) benchmarks the prover:
@@ -1763,7 +2074,10 @@ per law the prover tried, with the strategy that proved it, the rewrites
 and the time; the table ends with how many laws were proved and which
 strategies won. `--save FILE` keeps the rows, and `--baseline FILE` lists
 the laws a change gained, lost, sped up or slowed down against them. It
-never writes the proof cache.
+never writes the proof cache. `./bin/bench-trials` runs it over `bench/trials`, the
+four small projects (a room calendar, an order lifecycle, a token bucket,
+a library's lending rules) used to try writ out, against
+`bench/trials-baseline.edn`.
 
 The prover's knobs are one map, `writ.prove/default-config` (the fuel, how
 deep case splits go, the strategy order, ...), which check's `:prover`
