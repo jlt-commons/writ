@@ -56,6 +56,7 @@
             [writ.types :as ty]
             [writ.prove :as prover]
             [writ.prove.term :as pterm]
+            [writ.rng :as rng]
             [clojure.test.check :as tc]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
@@ -64,6 +65,9 @@
 
 (defn- fail! [& msg]
   (throw (ex-info (str "Writ: " (apply str msg)) {:writ/error true})))
+
+;; test.check's random numbers, the same ones, made without bignums
+(rng/install!)
 
 ;; --- the spec surface ----------------------------------------------------
 
@@ -4492,7 +4496,7 @@
   ["writ/lower.clj" "writ/types.clj" "writ/norm.clj" "writ/data.clj" "writ/spec.clj"
    "writ/prove.clj" "writ/prove/term.clj" "writ/prove/rewrite.clj" "writ/prove/translate.clj"
    "writ/prove/scheme.clj" "writ/prove/check.clj" "writ/prove/smt.clj" "writ/prove/symbolic.clj"
-   "writ/solve.clj" "writ/solve/pre.clj" "writ/solve/search.clj" "writ/solve/simplex.clj" "writ/solve/lra.clj"
+   "writ/solve.clj" "writ/solve/pre.clj" "writ/solve/search.clj" "writ/solve/simplex.clj" "writ/solve/lra.clj" "writ/rng.clj"
    "writ/solve/cdcl.clj" "writ/solve/cert.clj"])
 
 (def ^:private writ-version
