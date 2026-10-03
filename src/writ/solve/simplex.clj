@@ -4,7 +4,9 @@
 
   Each inequality a.x <= c bounds a variable: x itself when a is a single
   unit coefficient, otherwise a slack s = a.x, one per distinct form up to
-  sign.  The tableau keeps the basic variables as linear combinations of
+  sign.  Inside the tableau a variable is its number, the order it was
+  first met in, so rows, values and bounds are keyed by integers; the
+  variables themselves come back only in a model.  The tableau keeps the basic variables as linear combinations of
   the nonbasic ones; nonbasic variables always sit within their bounds,
   and a basic variable out of its bounds is pivoted back, choosing
   variables by Bland's rule so the search ends.
@@ -21,14 +23,30 @@
 
 (defn- neg-form [a] (into {} (map (fn [[x k]] [x (- k)])) a))
 
+(defn- form
+  "What literal l, [:le a c], bounds, worked out once in a search: {:x x
+  :k k} for a single variable of unit coefficient k, else {:a a :n -a :sa
+  [:slack a] :sn [:slack -a]}, the same objects at every check, so the
+  tableau's maps hash them once.  :forms, shared by every tableau of the
+  search, holds them."
+  [st [_ a _ :as l]]
+  (let [memo (:forms st)]
+    (or (get @memo l)
+        (let [f (if (and (= 1 (count a)) (#{1 -1} (val (first a))))
+                  (let [[x k] (first a)] {:x x :k k})
+                  (let [n (neg-form a)] {:a a :n n :sa [:slack a] :sn [:slack n]}))]
+          (vswap! memo assoc l f)
+          f))))
+
 (defn- bound-of
-  "The variable a literal bounds, the side, and the bound's value."
-  [slacks [_ a c]]
-  (if (and (= 1 (count a)) (#{1 -1} (val (first a))))
-    (let [[x k] (first a)] (if (= 1 k) [x :hi c] [x :lo (- c)]))
-    (if (contains? slacks (neg-form a))
-      [[:slack (neg-form a)] :lo (- c)]
-      [[:slack a] :hi c])))
+  "The variable literal l bounds, the side, and the bound's value."
+  [st [_ _ c :as l]]
+  (let [f (form st l)]
+    (if-let [x (:x f)]
+      (if (= 1 (:k f)) [x :hi c] [x :lo (- c)])
+      (if (contains? (:slacks st) (:n f))
+        [(:sn f) :lo (- c)]
+        [(:sa f) :hi c]))))
 
 (defn- tighter? [side v old] (or (nil? old) (if (= side :hi) (< v (first old)) (> v (first old)))))
 
@@ -40,24 +58,28 @@
           (and hi (> v (first hi))) :hi)))
 
 (defn- pivot-and-update
-  "Set basic xi to v by moving nonbasic xj, then swap their roles."
+  "Set basic xi to v by moving nonbasic xj, then swap their roles.  [st
+  moved]: the tableau, and the basic variables whose rows held xj, xi
+  among them -- the ones whose values moved.  Only those rows change."
   [st xi xj v]
   (let [rows (:rows st)
         row (rows xi)
         a (row xj)
         theta (/ (- v (value st xi)) a)
-        vals (reduce-kv (fn [m k r] (if-let [c (r xj)] (assoc m k (+ (get m k 0) (* c theta))) m))
-                        (:val st) (dissoc rows xi))
-        vals (-> vals (assoc xi v) (assoc xj (+ (value st xj) theta)))
         new-row (reduce-kv (fn [m k c] (if (= k xj) m (assoc m k (- (/ c a))))) {xi (/ 1 a)} row)
-        subst (fn [r] (if-let [c (r xj)]
-                        (reduce-kv (fn [m k d] (let [s (+ (get m k 0) (* c d))]
-                                                 (if (zero? s) (dissoc m k) (assoc m k s))))
-                                   (dissoc r xj) new-row)
-                        r))
-        rows (-> (into {} (map (fn [[k r]] [k (subst r)])) (dissoc rows xi))
-                 (assoc xj new-row))]
-    (assoc st :rows rows :val vals)))
+        others (dissoc rows xi)
+        [rows vals moved]
+        (reduce-kv (fn [[rows vals moved :as acc] k r]
+                     (if-let [c (r xj)]
+                       [(assoc rows k (reduce-kv (fn [m y d] (let [s (+ (get m y 0) (* c d))]
+                                                               (if (zero? s) (dissoc m y) (assoc m y s))))
+                                                 (dissoc r xj) new-row))
+                        (assoc vals k (+ (get vals k 0) (* c theta)))
+                        (conj moved k)]
+                       acc))
+                   [others (:val st) [xi]] others)
+        vals (-> vals (assoc xi v) (assoc xj (+ (value st xj) theta)))]
+    [(assoc st :rows (assoc rows xj new-row) :val vals) moved]))
 
 (defn- explain
   "The Farkas multipliers for basic x stuck below (side :lo) or above its bound."
@@ -73,31 +95,35 @@
 (defn- register [st x]
   (if (contains? (:idx st) x) st (assoc-in st [:idx x] (count (:idx st)))))
 
+(defn- id [st x] (get (:idx st) x))
+
 (defn- row-of
   "Linear form a written over the nonbasic variables of the tableau."
   [st a]
-  (reduce-kv (fn [m y k]
+  (reduce-kv (fn [m x k]
+               (let [y (id st x)]
                (if-let [r (get-in st [:rows y])]
                  (reduce-kv (fn [m z d] (let [v (+ (get m z 0) (* k d))] (if (zero? v) (dissoc m z) (assoc m z v))))
                             m r)
-                 (let [v (+ (get m y 0) k)] (if (zero? v) (dissoc m y) (assoc m y v)))))
+                 (let [v (+ (get m y 0) k)] (if (zero? v) (dissoc m y) (assoc m y v))))))
              {} a))
 
 (defn- assert-lit
   "The tableau with literal l's bound added: a new variable is nonbasic at
   0, a new slack a basic row over the nonbasic variables."
   [st [_ a _ :as l]]
-  (let [multi (not (and (= 1 (count a)) (#{1 -1} (val (first a)))))
+  (let [f (form st l)
         st (reduce register st (keys a))
-        st (if (and multi (not (contains? (:slacks st) a)) (not (contains? (:slacks st) (neg-form a))))
-             (let [sx [:slack a]
-                   row (row-of st a)]
+        st (if (and (:a f) (not (contains? (:slacks st) (:a f))) (not (contains? (:slacks st) (:n f))))
+             (let [row (row-of st a)
+                   st (register st (:sa f))
+                   sx (id st (:sa f))]
                (-> st (update :slacks conj a) (assoc-in [:rows sx] row)
-                   (register sx)
                    (assoc-in [:val sx] (reduce-kv (fn [t x k] (+ t (* k (get-in st [:val x] 0)))) 0 row))))
              st)
-        [x side v] (bound-of (:slacks st) l)
-        st (register st x)]
+        [x side v] (bound-of st l)
+        st (register st x)
+        x (id st x)]
     (if (tighter? side v (get-in st [:bounds x side]))
       (-> st (assoc-in [:bounds x side] [v l]) (update ::touched (fnil conj #{}) x))
       st)))
@@ -125,7 +151,7 @@
           [st #{}] xs))
 
 (defn empty-tableau []
-  {:slacks #{} :rows {} :bounds {} :idx {} :val {}})
+  {:slacks #{} :rows {} :bounds {} :idx {} :val {} :forms (volatile! {})})
 
 (defn check
   "Are the literals [:le a c] satisfiable over the rationals?  {:sat
@@ -144,30 +170,29 @@
          st (reduce assert-lit (dissoc base ::touched) new)
          touched (or (::touched st) #{})
          st (-> st (dissoc ::touched) (assoc :asserted (into asserted new)))
-         order #(get-in st [:idx %])
-         clash (first (sort-by order (filter (fn [x] (let [{:keys [lo hi]} (get-in st [:bounds x])]
+         clash (first (sort (filter (fn [x] (let [{:keys [lo hi]} (get-in st [:bounds x])]
                                                        (and lo hi (> (first lo) (first hi)))))
                                              touched)))]
      (if clash
        {:conflict [[(second (get-in st [:bounds clash :lo])) 1]
                    [(second (get-in st [:bounds clash :hi])) 1]]}
-       (let [[st moved] (repair-nonbasic st (sort-by order touched))]
+       (let [[st moved] (repair-nonbasic st (sort touched))]
          (loop [st st, candidates (into moved touched), n 0]
           (when (> n max-pivots)
             (throw (ex-info "simplex pivot budget exhausted" {::budget true})))
           ;; the violated basic variable first in order (Bland's rule), among
           ;; the candidates: the rest are as the last feasible tableau left them
           (let [rows (:rows st)
-                bad (reduce (fn [best x]
-                              (if (and (contains? rows x) (violation st x)
-                                       (or (nil? best) (< (order x) (order best))))
-                                x best))
-                            nil candidates)]
+                ;; the candidates out of bounds.  One within them stays so
+                ;; until a pivot moves it, which makes it a candidate again,
+                ;; so the rest are dropped
+                open (into #{} (filter #(and (contains? rows %) (violation st %))) candidates)
+                bad (when (seq open) (reduce min open))]
             (if-not bad
               ;; the values, made when a caller wants them: most checks only
               ;; need to hear they are consistent
-              {:sat (delay (into {} (for [x (keys (:idx st)) :when (not (and (vector? x) (= :slack (first x))))]
-                                      [x (value st x)])))
+              {:sat (delay (into {} (for [[x i] (:idx st) :when (not (and (vector? x) (= :slack (first x))))]
+                                      [x (value st i)])))
                :tableau st}
               (let [side (violation st bad)
                     target (first (get-in st [:bounds bad side]))
@@ -176,14 +201,12 @@
                            (let [up (if (= side :lo) (pos? a) (neg? a))
                                  b (get-in st [:bounds y (if up :hi :lo)])]
                              (or (nil? b) (if up (< (value st y) (first b)) (> (value st y) (first b))))))
-                    y (first (sort-by order (map first (filter can? (get-in st [:rows bad])))))]
+                    y (first (sort (map first (filter can? (get-in st [:rows bad])))))]
                 (if y
                   ;; the rows holding y move with it, and y, now basic, may
                   ;; leave its own bounds
-                  (recur (pivot-and-update st bad y target)
-                         (-> candidates (disj bad) (conj y)
-                             (into (keep (fn [[k r]] (when (r y) k))) rows))
-                         (inc n))
+                  (let [[st moved] (pivot-and-update st bad y target)]
+                    (recur st (-> open (disj bad) (conj y) (into moved)) (inc n)))
                   {:conflict (explain st bad side)}))))))))))
 
 (defn gomory
@@ -195,11 +218,11 @@
   x = v + sum a's; the literals saying s >= 0, weighted by the fractional
   parts of a', sum to an inequality with integer coefficients that the
   current point violates once its bound is rounded down."
-  [{:keys [rows bounds val idx]}]
+  [{:keys [rows bounds val]}]
   (let [value #(get val % 0)
         frac #(- % (floor-rat %))]
     (first
-     (for [[x row] (sort-by (comp idx key) rows)
+     (for [[x row] (sort-by key rows)
            :when (not (integer? (value x)))
            :let [terms (for [[y a] row]
                          (let [{:keys [lo hi]} (get bounds y)]

@@ -56,6 +56,7 @@
             [writ.types :as ty]
             [writ.prove :as prover]
             [writ.prove.term :as pterm]
+            [writ.rng :as rng]
             [clojure.test.check :as tc]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
@@ -64,6 +65,9 @@
 
 (defn- fail! [& msg]
   (throw (ex-info (str "Writ: " (apply str msg)) {:writ/error true})))
+
+;; test.check's random numbers, the same ones, made without bignums
+(rng/install!)
 
 ;; --- the spec surface ----------------------------------------------------
 
@@ -996,64 +1000,93 @@
 (defn- refinement [t tenv]
   (when (symbol? t) (get-in tenv [::refines (symbol (name t))])))
 
-(defn conforms?
-  "Does value `v` fit type `t`?  Unknown types and type variables pass."
-  [t v tenv]
-  (let [t (plain t)]
+(def ^:private conformers
+  "Each type's compiled check, by type, for the few type environments
+  seen last, each found by identity: a check runs the code thousands of
+  times, every value through the same few types."
+  (atom []))
+
+(declare conformer)
+
+(defn- conformer*
+  "Type t compiled to a predicate on values under tenv: what conforms?
+  says of a value, the type read once."
+  [t tenv]
+  (let [t (plain t)
+        c #(conformer % tenv)]
     (cond
       (refinement t tenv)
-      (let [{:keys [base pred]} (refinement t tenv)]
-        (boolean (and (conforms? base v tenv) (pred v))))
+      (let [{:keys [base pred]} (refinement t tenv)
+            base? (c base)]
+        (fn [v] (boolean (and (base? v) (pred v)))))
 
       (symbol? t)
       (case t
-        Nat (nat-int? v)
-        Int (int? v)
-        Bool (boolean? v)
-        String (string? v)
-        Char (char? v)
-        Keyword (keyword? v)
-        Symbol (symbol? v)
-        (Float Double Float! Double!) (number? v)
-        Unit (nil? v)
-        (Any Any!) true
+        Nat nat-int?
+        Int int?
+        Bool boolean?
+        String string?
+        Char char?
+        Keyword keyword?
+        Symbol symbol?
+        (Float Double Float! Double!) number?
+        Unit nil?
+        (Any Any!) (constantly true)
         (if-let [[d args] (data-decl t tenv)]
-          (conforms-data? d args v tenv)
-          true))
+          (fn [v] (conforms-data? d args v tenv))
+          (constantly true)))
 
       ;; a record: each key of its own type; an (Opt T) key may be absent,
       ;; and keys it does not name may be there too
       (map? t)
-      (and (map? v)
-           (every? (fn [[k kt]]
-                     (if (contains? v k)
-                       (conforms? kt (get v k) tenv)
-                       (opt-type? kt)))
-                   t))
+      (let [ks (mapv (fn [[k kt]] [k (c kt) (opt-type? kt)]) t)]
+        (fn [v] (and (map? v)
+                     (every? (fn [[k ok? opt]] (if (contains? v k) (ok? (get v k)) opt)) ks))))
 
       (and (kind/index-type? t) (not (data-decl t tenv)))
-      (let [{k :key r :of u :unique} (kind/index-parts t)]
-        (and (map? v)
-             (every? (fn [[i x]] (and (conforms? r x tenv) (= i (get x k)))) v)
-             (every? #(unique-by? % (vals v)) u)))
+      (let [{k :key r :of u :unique} (kind/index-parts t)
+            r? (c r)]
+        (fn [v] (and (map? v)
+                     (every? (fn [[i x]] (and (r? x) (= i (get x k)))) v)
+                     (every? #(unique-by? % (vals v)) u))))
 
       (seq? t)
-      (let [[h & as] t]
+      (let [[h & as] t
+            a? (delay (c (first as)))]
         (case h
-          Opt (or (nil? v) (conforms? (first as) v tenv))
-          List (and (or (nil? v) (sequential? v)) (every? #(conforms? (first as) % tenv) v))
-          Vec (and (vector? v) (every? #(conforms? (first as) % tenv) v))
-          Set (and (set? v) (every? #(conforms? (first as) % tenv) v))
-          Map (and (map? v) (every? (fn [[k x]] (and (conforms? (first as) k tenv)
-                                                     (conforms? (second as) x tenv))) v))
-          (Tuple &) (and (vector? v) (= (count as) (count v))
-                         (every? true? (map #(conforms? %1 %2 tenv) as v)))
-          -> (ifn? v)
+          Opt (fn [v] (or (nil? v) (@a? v)))
+          List (fn [v] (and (or (nil? v) (sequential? v)) (every? @a? v)))
+          Vec (fn [v] (and (vector? v) (every? @a? v)))
+          Set (fn [v] (and (set? v) (every? @a? v)))
+          Map (let [b? (delay (c (second as)))]
+                (fn [v] (and (map? v) (every? (fn [[k x]] (and (@a? k) (@b? x))) v))))
+          (Tuple &) (let [cs (delay (mapv c as))]
+                      (fn [v] (and (vector? v) (= (count as) (count v))
+                                   (every? true? (map #(%1 %2) @cs v)))))
+          -> ifn?
           (if-let [[d args] (data-decl t tenv)]
-            (conforms-data? d args v tenv)
-            true)))
+            (fn [v] (conforms-data? d args v tenv))
+            (constantly true))))
 
-      :else true)))
+      :else (constantly true))))
+
+(defn- conformer
+  "Type t's compiled check under tenv, compiled once."
+  [t tenv]
+  (let [cs @conformers
+        [_ m] (or (some #(when (identical? tenv (first %)) %) cs)
+                  (let [e [tenv (atom {})]]
+                    (swap! conformers #(conj (if (< (count %) 8) % (subvec % 1)) e))
+                    e))]
+    (or (get @m t)
+        (let [f (conformer* t tenv)]
+          (swap! m assoc t f)
+          f))))
+
+(defn conforms?
+  "Does value `v` fit type `t`?  Unknown types and type variables pass."
+  [t v tenv]
+  ((conformer t tenv) v))
 
 ;; --- generators ---------------------------------------------------------------
 ;; Values come from test.check generators built from the spec's types, so a
@@ -4044,13 +4077,16 @@
 (defn- checked
   ([nm f sig tenv argn] (checked nm f sig tenv argn nil))
   ([nm f sig tenv argn {:keys [requires ensures assumed]}]
+   (let [;; the signature's checks, compiled at the first call
+         params? (delay (mapv #(conformer % tenv) (:params sig)))
+         ret? (delay (conformer (:ret sig) tenv))]
    (fn [& args]
      (if (and assumed (not *in-code*))
        ;; writ's own call, or the dependency calling itself
        (apply f args)
        (do
-         (doseq [[i t a] (map vector (range) (:params sig) args)]
-           (when-not (conforms? t a tenv)
+         (doseq [[i t ok? a] (map vector (range) (:params sig) @params? args)]
+           (when-not (ok? a)
              (fail! "`" nm "` argument " (inc i) " (" (nth argn i (str "arg" i)) ") expects "
                     (pr-str t) ", got " (pr-str a))))
          (when (and requires (not ((:f requires) args)))
@@ -4058,7 +4094,7 @@
          ;; a target fn runs as code, whoever called it; an assumed fn
          ;; runs as the dependency's own
          (let [r (binding [*in-code* (not assumed)] (apply f args))]
-           (when-not (conforms? (:ret sig) r tenv)
+           (when-not (@ret? r)
              (fail! "`" nm "` returns " (pr-str (:ret sig)) ", but returned " (pr-str r)
                     " for arguments " (pr-str (vec args))
                     (when-let [w (try (why-not (:ret sig) r tenv) (catch Throwable _ nil))]
@@ -4066,7 +4102,7 @@
            (when (and ensures (not ((:f ensures) (concat args [r]))))
              (fail! "`" nm "` returns " (pr-str r) " for arguments " (pr-str (vec args))
                     ", which breaks its :ensures " (pr-str (:test ensures))))
-           r))))))
+           r)))))))
 
 (defn- default-proof-ns [spec-ns]
   (let [n (name spec-ns)]
@@ -4460,11 +4496,16 @@
   ["writ/lower.clj" "writ/types.clj" "writ/norm.clj" "writ/data.clj" "writ/spec.clj"
    "writ/prove.clj" "writ/prove/term.clj" "writ/prove/rewrite.clj" "writ/prove/translate.clj"
    "writ/prove/scheme.clj" "writ/prove/check.clj" "writ/prove/smt.clj" "writ/prove/symbolic.clj"
-   "writ/solve.clj" "writ/solve/pre.clj" "writ/solve/search.clj" "writ/solve/simplex.clj"
-   "writ/solve/cert.clj"])
+   "writ/solve.clj" "writ/solve/pre.clj" "writ/solve/search.clj" "writ/solve/simplex.clj" "writ/solve/lra.clj" "writ/rng.clj"
+   "writ/solve/cdcl.clj" "writ/solve/cert.clj"])
 
 (def ^:private writ-version
-  (delay (apply str (map #(or (some-> (io/resource %) slurp) "") writ-sources))))
+  "Which writ made a cache: each source by name, length and hash.  A cache
+  holds it, and a key the contracts are kept by, so it is short."
+  (delay (pr-str (mapv (fn [src]
+                         (let [text (or (some-> (io/resource src) slurp) "")]
+                           [src (count text) (hash text)]))
+                       writ-sources))))
 
 (defn- spit-whole!
   "Write text to file f whole: to a file of its own first, then renamed
@@ -4484,24 +4525,43 @@
   [dir [spec-ns target]]
   (io/file dir (str spec-ns "--" target ".edn")))
 
+(defn- traces-file
+  "The traces of a cache, in a file of their own: most of its bytes, and
+  read only when a law's result is not in the cache."
+  [dir [spec-ns target]]
+  (io/file dir (str spec-ns "--" target ".traces.edn")))
+
+(defn- read-cache
+  "The map in cache file f, when it was made by this writ, else nil."
+  [f version]
+  (try (when (.exists f)
+         (let [c (edn/read-string (slurp f))]
+           (when (= version (:version c)) c)))
+       (catch Throwable _ nil)))
+
 (defn- load-proofs
   "The proof cache for a spec and target, when it was made by this writ:
-  {:laws {key result} :traces {law trace}}, or empty.  A law's key holds
-  everything its proof can rest on -- the law, its hint, the lemmas it may
-  cite, and the definitions it reaches, whole -- so a result is never taken
-  for a different law or different code.  A trace is only a candidate:
-  the checker replays it against the code as it is now."
+  {:laws {key result}}, or empty.  A law's key holds everything its proof
+  can rest on -- the law, its hint, the lemmas it may cite, and the
+  definitions it reaches, whole -- so a result is never taken for a
+  different law or different code."
   [dir spec-ns version]
-  (or (try (let [f (cache-file dir spec-ns)]
-             (when (.exists f)
-               (let [c (edn/read-string (slurp f))]
-                 (when (= version (:version c)) (select-keys c [:laws :traces])))))
-           (catch Throwable _ nil))
-      {:laws {} :traces {}}))
+  {:laws (or (:laws (read-cache (cache-file dir spec-ns) version)) {})})
 
-(defn- save-proofs! [dir spec-ns version cache]
+(defn- load-traces
+  "The cached traces of a spec and target, {law trace}, or empty.  A trace
+  is only a candidate: the checker replays it against the code as it is
+  now."
+  [dir spec-ns version]
+  (or (:traces (read-cache (traces-file dir spec-ns) version)) {}))
+
+(defn- save-proofs!
+  "Keep the laws' results, and the traces when they were read or added."
+  [dir spec-ns version cache traces]
   (try (.mkdirs (io/file dir))
        (spit-whole! (cache-file dir spec-ns) (pr-str (assoc cache :version version)))
+       (when traces
+         (spit-whole! (traces-file dir spec-ns) (pr-str {:version version :traces traces})))
        (catch Throwable _ nil)))
 
 (defn- canonical-names
@@ -4817,36 +4877,45 @@
                                    (prover/contract-rules tenv assumed-sigs))))
           ;; a proof found before, from the same law, lemmas and the code it
           ;; reaches, by the same writ, is the same proof
-          cached (atom (if cache-dir (load-proofs cache-dir [spec-ns target] @writ-version) {:laws {} :traces {}}))
+          cached (atom (if cache-dir (load-proofs cache-dir [spec-ns target] @writ-version) {:laws {}}))
+          ;; read only when a law is not in the cache
+          traces (delay (atom (if cache-dir (load-traces cache-dir [spec-ns target] @writ-version) {})))
           fresh (atom false)]
       ;; a law proved here is a lemma for any law proved after it; one that
       ;; is only tested, or that a test refutes, never is.  Passes repeat
       ;; while they prove something new, so a law may cite one that comes
       ;; later in the spec, and no proof can lean on itself: each cites
       ;; only laws whose proofs were finished before it began
-      (let [attempt** (fn [r lemmas replay & [hint]]
-                      (try (let [[ds own] @defs
-                                 hint (or hint (get (::hints opts) (:law r)))]
-                             (prover/prove-law {:prop (erase-law (:prop r) refs spec-ns)
-                                                :replay replay
-                                                :prover (:prover opts)
-                                                :hint hint
-                                                :fuel (or (:fuel hint) (:fuel opts))
-                                                :total (:total r)
-                                                :lemma (:lemma r)
-                                                :sigs sigs :contracts @contracts
-                                                :defs ds :tenv tenv
-                                                :target target :own (merge own (nth @libs+refers 2))
-                                                ;; a lemma's types erased as the law's are, so a
-                                                ;; refinement in both is the same base type
-                                                :lemmas (mapv #(update % :prop erase-law refs spec-ns) lemmas)
-                                                :rets (into {} (for [[f sig] sigs] [f (:ret sig)]))
-                                                :guards (set (for [[_ r] refs] (symbol (str spec-ns) (str (:pred-name r)))))
-                                                ;; a law a test refuted is tried only to catch a
-                                                ;; prover that would prove it: briefly
-                                                :sym-budget (when (= :failed (:status r)) 500)}))
-                           (catch Throwable e
-                             {:proved false :reason (str "the prover failed: " (ex-message e))})))
+      (let [law-args (fn [r lemmas replay & [hint]]
+                       (let [[ds own] @defs
+                             hint (or hint (get (::hints opts) (:law r)))]
+                         {:prop (erase-law (:prop r) refs spec-ns)
+                          :replay replay
+                          :prover (:prover opts)
+                          :hint hint
+                          :fuel (or (:fuel hint) (:fuel opts))
+                          :total (:total r)
+                          :lemma (:lemma r)
+                          :sigs sigs :contracts @contracts
+                          :defs ds :tenv tenv
+                          :target target :own (merge own (nth @libs+refers 2))
+                          ;; a lemma's types erased as the law's are, so a
+                          ;; refinement in both is the same base type
+                          :lemmas (mapv #(update % :prop erase-law refs spec-ns) lemmas)
+                          :rets (into {} (for [[f sig] sigs] [f (:ret sig)]))
+                          :guards (set (for [[_ r] refs] (symbol (str spec-ns) (str (:pred-name r)))))
+                          ;; a law a test refuted is tried only to catch a
+                          ;; prover that would prove it: briefly
+                          :sym-budget (when (= :failed (:status r)) 500)
+                          ;; a law its tests passed, which the
+                          ;; solver's counterexample may refute
+                          :refutes? (when (= :tested (:status r))
+                                      #(some? (refuted ctx r %)))
+                          :counterexample-only (:counterexample-only r)}))
+            attempt** (fn [r lemmas replay & [hint]]
+                        (try (prover/prove-law (law-args r lemmas replay hint))
+                             (catch Throwable e
+                               {:proved false :reason (str "the prover failed: " (ex-message e))})))
             ;; that a step never throws is proved only by running it
             ;; symbolically, which a recursive fn defeats; its landing is
             ;; then proved by any strategy, and the report says the rest
@@ -4859,7 +4928,13 @@
                              (if (:proved pr2)
                                (update pr2 :summary str
                                        ", and it threw on no test (that it never throws is not proved)")
-                               pr)))))
+                               ;; what a lemma would need to change either search
+                               (assoc pr :asked (when (and (:asked pr) (:asked pr2))
+                                                  {:terms (into (:terms (:asked pr)) (:terms (:asked pr2)))
+                                                   :no-recursion (or (:no-recursion (:asked pr))
+                                                                     (:no-recursion (:asked pr2)))})))))))
+            ;; each law's last failed search, by law-id: {:lemmas :result}
+            searched (atom {})
             attempt (fn [r lemmas]
                       (let [law-id (pr-str [(:prop r) (get (::hints opts) (:law r)) (:total r)])
                             k (pr-str [(:prop r) (get (::hints opts) (:law r)) (:total r) lemmas (:fuel opts) (:prover opts)
@@ -4868,11 +4943,23 @@
                             ;; a search that failed is kept too: it can only
                             ;; say "not proved", and a counterexample in it is
                             ;; run on the code again before it is believed.
-                            ;; The law's last proof is replayed first
-                            (let [pr (attempt* r lemmas (get-in @cached [:traces law-id]))]
+                            ;; The law's last proof is replayed first.  A
+                            ;; search that failed with fewer lemmas, none of
+                            ;; the new ones able to change it, is this search
+                            (let [{before :lemmas prior :result} (get @searched law-id)
+                                  same-search? (and prior (every? (set lemmas) before)
+                                                    (not (prover/lemmas-matter?
+                                                           (:asked prior)
+                                                           (map #(update % :prop erase-law refs spec-ns)
+                                                                (remove (set before) lemmas))
+                                                           (try (law-args r lemmas nil)
+                                                                (catch Throwable _ nil)))))
+                                  pr (if same-search? prior (attempt* r lemmas (get @@traces law-id)))]
+                              (when (and (not (:proved pr)) (:asked pr))
+                                (swap! searched assoc law-id {:lemmas lemmas :result pr}))
                               (swap! cached assoc-in [:laws k]
                                      (select-keys pr [:proved :summary :lemmas :reason :counterexample :stuck]))
-                              (when (:trace pr) (swap! cached assoc-in [:traces law-id] (:trace pr)))
+                              (when (:trace pr) (swap! @traces assoc law-id (:trace pr)))
                               (reset! fresh true)
                               pr))))
             ;; an input that meets a law's hypotheses, from the solver: a
@@ -4886,7 +4973,7 @@
                     apart (for [w seen] (cons 'or (for [x vars] (list 'not= x (get w x)))))
                     h* (if (seq apart) (list* 'and h apart) h)
                     none (reduce (fn [p [x t]] (list 'forall [x t] p)) (list 'not h*) (reverse bs))
-                    cex (completed ctx bs (:counterexample (attempt** {:law (:law r) :prop none} [] nil)))]
+                    cex (completed ctx bs (:counterexample (attempt** {:law (:law r) :prop none :counterexample-only true} [] nil)))]
                 (when (and cex (every? #(contains? cex %) vars)
                            (every? (fn [[x t]] (conforms? t (get cex x) (:tenv ctx))) bs)
                            (= :pass (:result (try (holds (assoc ctx :vars vars) h* cex)
@@ -4985,7 +5072,7 @@
                              ;; a hypothesis no test met: where the solver
                              ;; finds the law false, running it there says so
                              (and (:no-hypothesis r) (not (:proved pr)) (refuted ctx r (:counterexample pr)))
-                             [(dissoc (refuted ctx r (:counterexample pr)) :no-hypothesis) nil]
+                             [(-> (refuted ctx r (:counterexample pr)) (dissoc :no-hypothesis) (assoc :unproved-final true)) nil]
 
                              ;; a law whose hypothesis never held would be
                              ;; true of every input and test nothing; the
@@ -5007,8 +5094,10 @@
                              (and (:proved pr) (not (thrown? r)))
                              [(assoc r :prover-bug true :proof (:summary pr)) nil]
 
+                             ;; refuted by the prover's own counterexample: no
+                             ;; later pass need try it again
                              (and (= :tested (:status r)) (refuted ctx r (:counterexample pr)))
-                             [(refuted ctx r (:counterexample pr)) nil]
+                             [(assoc (refuted ctx r (:counterexample pr)) :unproved-final true) nil]
 
                              (= :tested (:status r))
                              [(cond-> (assoc r :unproved (:reason pr))
@@ -5019,14 +5108,29 @@
                                           (assoc :unproved-final true))
                               nil]
                              :else [(assoc r :unproved-final true) nil]))))
-            pass (fn [[rs lemmas]]
-                   (let [steps (par-map #(step lemmas %) rs)]
-                     [(mapv first steps) (into lemmas (keep second steps))]))]
+            ;; the definitions a law or lemma reaches, by name
+            fns-of (memoize (fn [prop] (set (map first (first (reach (first @defs) prop))))))
+            ;; can one of the lemmas fresh help prove law r?  A lemma is a
+            ;; rewrite rule whose left side must match a term of the proof,
+            ;; so one that reaches none of the definitions r reaches never
+            ;; applies; one about clojure.core alone might
+            helps? (fn [fresh r]
+                     (let [mine (fns-of (:prop r))]
+                       (some (fn [l] (let [theirs (fns-of (:prop l))]
+                                       (or (empty? theirs) (some mine theirs))))
+                             fresh)))
+            ;; a later pass tries again only the laws a lemma proved in the
+            ;; pass before it might help: the rest would search as before
+            pass (fn [[rs lemmas] fresh]
+                   (let [steps (par-map #(if (and fresh (not (helps? fresh %))) [% nil] (step lemmas %)) rs)]
+                     [(mapv first steps) (into lemmas (keep second steps))]))
+            init (into (vec (::imports opts)) (:lemmas assumed))]
         ;; the proved laws of the specs this one uses come first
-        (loop [[rs lemmas] (pass [results (into (vec (::imports opts)) (:lemmas assumed))])]
-          (let [[rs2 lemmas2] (pass [rs lemmas])]
+        (loop [[rs lemmas] (pass [results init] nil), before (count init)]
+          (let [[rs2 lemmas2] (pass [rs lemmas] (subvec lemmas before))]
             (if (= (count lemmas2) (count lemmas))
-              (do (when (and cache-dir @fresh) (save-proofs! cache-dir [spec-ns target] @writ-version @cached))
+              (do (when (and cache-dir @fresh) (save-proofs! cache-dir [spec-ns target] @writ-version @cached
+                                                            (when (realized? traces) @@traces)))
                   (let [rs2 (mapv #(dissoc % :unproved-final) rs2)
                         rs2 (if (false? (:prove opts))
                               rs2
@@ -5047,7 +5151,7 @@
                                %)
                             rs2)
                       rs2)))
-              (recur [rs2 lemmas2]))))))))
+              (recur [rs2 lemmas2] (count lemmas)))))))))
 
 (def ^:private evidence-of
   {:proved :proof, :evaluated :proof, :witnessed :proof, :tested :test})
@@ -5511,55 +5615,139 @@
   run, and the most time they may take, per law."
   {:trials 900 :ms 20000})
 
+(defn- more-trials?
+  "Does law r get more trials: it is only tested, or no trial met its
+  hypothesis?"
+  [r opts]
+  (let [{extra :trials} (merge more-trials-default (when (map? (:more-trials opts)) (:more-trials opts)))]
+    (and (or (= :tested (:status r)) (and (= :failed (:status r)) (:no-hypothesis r)))
+         (not (:lemma r)) (:prop r) (not (false? (:more-trials opts))) (pos? extra))))
+
+(defn- law-atoms-of [r]
+  (let [[bs body] (leading-foralls (:prop r))] (law-atoms body (map first bs))))
+
+(defn- extra-trials
+  "Law r's further trials, a hundred at a time with the seeds after its
+  own, until it has had :trials more or :ms have passed, or its clauses
+  have each been seen both ways often enough.  {:ran :held :coverage},
+  counting those trials alone, or {:failure t :after-trials n} at the
+  first that fails."
+  [ctx r opts]
+  (let [{extra :trials ms :ms} (merge more-trials-default
+                                     (when (map? (:more-trials opts)) (:more-trials opts)))
+        starved? (= :failed (:status r))
+        t0 (System/currentTimeMillis)
+        base (or (:seed r) 0)
+        first-run (or (:trials r) (:trials opts) 100)
+        atoms (law-atoms-of r)
+        ;; every clause seen both ways, often enough: more trials of the
+        ;; same would say little more
+        covered? (fn [cov ran held] (and (seq atoms) (>= ran 300) (>= held thin-tests)
+                                    (every? #(and (<= 5 (get-in cov [% true] 0)) (<= 5 (get-in cov [% false] 0)))
+                                            atoms)))
+        held0 (if starved? 0 (- first-run (or (:discarded r) 0)))]
+    (loop [k 1, ran 0, held 0, cov {}]
+      (if (or (> (* 100 k) extra) (> (- (System/currentTimeMillis) t0) ms)
+              (covered? (merge-with (partial merge-with +) (or (:coverage r) {}) cov)
+                        (+ first-run ran) (+ held0 held)))
+        {:ran ran :held held :coverage cov}
+        (let [t (try (test-law ctx {:name (:law r) :prop (:prop r)}
+                               {:trials 100 :seed (+ base k) :max-size (or (:max-size opts) 50)})
+                     ;; as the first run: a law that cannot be run fails with the reason
+                     (catch Throwable ex
+                       {:status :failed :counterexample {} :detail [] :seed (+ base k)
+                        :error (or (ex-message ex) (str ex))}))]
+          (if (and (= :failed (:status t)) (not (:no-hypothesis t)))
+            {:failure t :after-trials (+ first-run ran)}
+            (recur (inc k) (+ ran 100)
+                   (+ held (if (:no-hypothesis t) 0 (- (or (:trials t) 100) (or (:discarded t) 0))))
+                   (merge-with (partial merge-with +) cov (:coverage t)))))))))
+
+(defn- with-extra-trials
+  "Law r with its further trials x counted in.  A failure among them is
+  the law's result, with the seed that replays it.  :held counts the
+  trials whose hypothesis held."
+  [r x opts]
+  (if-let [t (:failure x)]
+    (merge (dissoc r :unproved :stuck :trials :discarded :no-hypothesis)
+           (select-keys t [:status :counterexample :original :trial :seed :detail :error])
+           {:after-trials (:after-trials x)})
+    (let [starved? (= :failed (:status r))
+          first-run (or (:trials r) (:trials opts) 100)
+          ran (+ first-run (:ran x))
+          held (+ (if starved? 0 (- first-run (or (:discarded r) 0))) (:held x))
+          cov (merge-with (partial merge-with +) (or (:coverage r) {}) (:coverage x))]
+      (cond
+        (not starved?) (assoc r :trials ran :discarded (- ran held) :held held :coverage cov
+                              :one-sided (vec (for [a (law-atoms-of r), side [false true]
+                                                    :when (zero? (get-in cov [a side] 0))]
+                                                [a side])))
+        (pos? held) (-> r (dissoc :counterexample :detail :no-hypothesis)
+                        (assoc :status :tested :trials ran :discarded (- ran held) :held held
+                               :coverage cov))
+        :else r))))
+
+(defn- trials-file
+  "The further trials of a spec's laws on a target, in a file of their own."
+  [dir [spec-ns target]]
+  (io/file dir (str spec-ns "--" target ".trials.edn")))
+
+(defn- code-of
+  "Every source a law's trials can run: the project namespaces the spec,
+  its target and its proof namespace require, transitively, each by name
+  and hash.  A library's source is in a jar of a fixed version."
+  [spec-ns target proof-ns]
+  (pr-str (vec (sort-by first
+                        (for [n (distinct (mapcat #(map first (lib-pairs %)) (remove nil? [spec-ns target proof-ns])))]
+                          [n (hash (try (slurp (source-url n)) (catch Throwable _ "")))])))))
+
 (defn- more-trials
   "A law that is only tested runs again, a hundred trials at a time
   with the seeds after its own, until it has had :trials more or :ms
   have passed.  So does one whose hypothesis no trial met, where the
   solver found no input either: a rare hypothesis is met in more trials.
-  A failure among them is the law's result, with the seed that replays
-  it.  :held counts the trials whose hypothesis held."
-  [ctx r opts]
-  (let [{extra :trials ms :ms} (merge more-trials-default
-                                     (when (map? (:more-trials opts)) (:more-trials opts)))
-        starved? (and (= :failed (:status r)) (:no-hypothesis r))]
-    (if (or (not (or (= :tested (:status r)) starved?)) (:lemma r) (not (:prop r))
-            (false? (:more-trials opts)) (not (pos? extra)))
-      r
-      (let [t0 (System/currentTimeMillis)
-            base (or (:seed r) 0)
-            first-run (or (:trials r) (:trials opts) 100)
-            [bs body] (leading-foralls (:prop r))
-            atoms (law-atoms body (map first bs))
-            ;; every clause seen both ways, often enough: more trials of the
-            ;; same would say little more
-            covered? (fn [cov ran held] (and (seq atoms) (>= ran 300) (>= held thin-tests)
-                                        (every? #(and (<= 5 (get-in cov [% true] 0)) (<= 5 (get-in cov [% false] 0)))
-                                                atoms)))]
-        (loop [k 1, ran first-run, held (if starved? 0 (- first-run (or (:discarded r) 0))),
-               cov (or (:coverage r) {})]
-          (if (or (> (* 100 k) extra) (> (- (System/currentTimeMillis) t0) ms) (covered? cov ran held))
-            (cond
-              (not starved?) (assoc r :trials ran :discarded (- ran held) :held held :coverage cov
-                                    :one-sided (vec (for [a atoms, side [false true]
-                                                          :when (zero? (get-in cov [a side] 0))]
-                                                      [a side])))
-              (pos? held) (-> r (dissoc :counterexample :detail :no-hypothesis)
-                              (assoc :status :tested :trials ran :discarded (- ran held) :held held
-                                     :coverage cov))
-              :else r)
-            (let [t (try (test-law ctx {:name (:law r) :prop (:prop r)}
-                                   {:trials 100 :seed (+ base k) :max-size (or (:max-size opts) 50)})
-                         ;; as the first run: a law that cannot be run fails with the reason
-                         (catch Throwable ex
-                           {:status :failed :counterexample {} :detail [] :seed (+ base k)
-                            :error (or (ex-message ex) (str ex))}))]
-              (if (and (= :failed (:status t)) (not (:no-hypothesis t)))
-                (merge (dissoc r :unproved :stuck :trials :discarded :no-hypothesis)
-                       (select-keys t [:status :counterexample :original :trial :seed :detail :error])
-                       {:after-trials ran})
-                (recur (inc k) (+ ran 100)
-                       (+ held (if (:no-hypothesis t) 0 (- (or (:trials t) 100) (or (:discarded t) 0))))
-                       (merge-with (partial merge-with +) cov (:coverage t)))))))))))
+  Over the results rs, a law's further trials kept in the
+  cache by the law, the options, writ and the code they ran.  Kept, they
+  are counted in with the law's first trials of this run, and not run
+  again: like a proof, they hold of the code until it changes.  Only
+  trials that passed are kept; a failure is reported, and run again.
+  The clauses each saw, which a law's forms -- a regex among them --
+  could not be written as, are kept by their place in the law."
+  [ctx rs opts spec-ns target proof-ns version]
+  (let [dir (when-not (= false (:cache opts)) (or (:cache-dir opts) ".writ-cache"))
+        f (when dir (trials-file dir [spec-ns target]))
+        kept (or (when f (:trials (read-cache f version))) {})
+        code (delay (code-of spec-ns target proof-ns))
+        fresh (atom {})
+        used (atom {})
+        out (par-map
+              (fn [r]
+                (if-not (more-trials? r opts)
+                  r
+                  (let [k (when dir
+                            (pr-str [@code (:prop r) (:status r)
+                                     (select-keys opts [:more-trials :max-size :trials])]))
+                        atoms (law-atoms-of r)
+                        idx (zipmap atoms (range))
+                        d (get kept k)
+                        x (if d
+                            (do (swap! used assoc k d)
+                                (assoc d :coverage (reduce (fn [m [i side n]] (assoc-in m [(nth atoms i) side] n))
+                                                           {} (:coverage d))))
+                            (let [x (extra-trials ctx r opts)]
+                              (when (and k (not (:failure x)) (every? #(contains? idx %) (keys (:coverage x))))
+                                (swap! fresh assoc k
+                                       (assoc x :coverage (vec (for [[a sides] (:coverage x), [side n] sides]
+                                                                 [(idx a) side n])))))
+                              x))]
+                    (with-extra-trials r x opts))))
+              rs)]
+    (when (and f (seq @fresh))
+      (try (.mkdirs (io/file dir))
+           ;; only what this run read or made: an entry for old code is dropped
+           (spit-whole! f (pr-str {:version version :trials (merge @used @fresh)}))
+           (catch Throwable _ nil)))
+    out))
 
 (defn- reachable-from
   "Every fn of graph g that f reaches through calls."
@@ -5712,7 +5900,7 @@
                          ;; tests alone, so it gets more of them
                          ((fn [rs] (timed :more-trials
                                           #(let [wrapped (wrap! e)]
-                                             (try (par-map (fn [r] (more-trials ctx r opts)) rs)
+                                             (try (more-trials ctx rs opts spec-ns target (:ns proof-e) @writ-version)
                                                   (finally (unwrap! wrapped)))))))
                          (require-evidence
                            ;; a lemma is there to be cited, so it must be proved

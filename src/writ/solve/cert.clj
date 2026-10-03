@@ -117,34 +117,103 @@
     (contains? p :farkas) (farkas! path (:farkas p))
     :else (reject! "not a proof step: " (pr-str p))))
 
+;; --- the clause database unit propagation runs over --------------------------
+;;
+;; Each literal is numbered once, its negation the same number with the low
+;; bit flipped, so propagation compares numbers, not literals.  A clause is a
+;; vector of numbers; occ holds, for each number, the clauses it is in.  A
+;; clause can turn unit or false only when one of its literals turns false,
+;; so propagation visits just the clauses of each literal it falsifies.
+
+(defn- numbering
+  "Each literal of the clauses cls a number: {literal n, (negate literal)
+  (bit-xor n 1)}."
+  [cls]
+  (reduce (fn [ids l]
+            (if (contains? ids l)
+              ids
+              (let [n (count ids)] (assoc ids l n (pre/negate l) (inc n)))))
+          {} (mapcat identity cls)))
+
+(defn- database
+  "An empty clause database over the literals numbered by ids."
+  [ids]
+  (let [n (count ids)]
+    {:ids ids :cls (volatile! []) :occ (object-array n) :units (volatile! [])
+     :empty (volatile! false) :val (object-array n)}))
+
+(defn- add!
+  "Add clause c to database db."
+  [db c]
+  (let [{:keys [ids cls occ units empty]} db
+        ns (mapv ids c)
+        i (count @cls)]
+    (vswap! cls conj ns)
+    (case (count ns)
+      0 (vreset! empty true)
+      1 (vswap! units conj (first ns))
+      nil)
+    (doseq [l (distinct ns)] (aset occ l (conj (or (aget occ l) []) i)))
+    db))
+
+(defn- propagates-to-conflict?
+  "With the literals numbered ns true, does unit propagation over db
+  falsify a clause, or force a literal and its negation?"
+  [db ns]
+  (let [{:keys [cls occ units empty val]} db
+        cls @cls
+        trail (volatile! [])
+        conflict (volatile! false)
+        ;; make literal l true; a literal already false is the conflict
+        assign! (fn [l]
+                  (cond (aget val l) nil
+                        (aget val (bit-xor l 1)) (vreset! conflict true)
+                        :else (do (aset val l true) (vswap! trail conj l))))]
+    (try
+      (if @empty
+        true
+        (do (run! assign! ns)
+            (run! assign! @units)
+            (loop [qi 0]
+              (cond
+                @conflict true
+                (>= qi (count @trail)) false
+                :else
+                (let [f (bit-xor (nth @trail qi) 1)]
+                  ;; each clause that has f, which is now false
+                  (reduce (fn [_ ci]
+                            (let [c (nth cls ci)
+                                  ;; the open literals, up to two; :sat when one is true
+                                  open (reduce (fn [open l]
+                                                 (cond (aget val l) (reduced :sat)
+                                                       (aget val (bit-xor l 1)) open
+                                                       (= 1 (count open)) (reduced (conj open l))
+                                                       :else (conj open l)))
+                                               [] c)]
+                              (cond (identical? :sat open) nil
+                                    (empty? open) (do (vreset! conflict true) (reduced nil))
+                                    (empty? (rest open)) (do (assign! (first open))
+                                                             (when @conflict (reduced nil)))
+                                    :else nil)))
+                          nil (or (aget occ f) []))
+                  (recur (inc qi)))))))
+      (finally
+        (doseq [l @trail] (aset val l nil))))))
+
 (defn- rup!
-  "With every literal of c false, unit propagation over clauses falsifies
-  one of them."
-  [clauses c]
-  (loop [true-lits (set (map pre/negate c))]
-    (let [r (reduce (fn [units cl]
-                      (if (some true-lits cl)
-                        units
-                        (let [open (remove #(contains? true-lits (pre/negate %)) cl)]
-                          (cond (empty? open) (reduced ::conflict)
-                                (empty? (rest open)) (conj units (first open))
-                                :else units))))
-                    #{} clauses)]
-      (cond
-        (= ::conflict r) true
-        ;; a literal and its negation both forced: that is the conflict
-        (some #(or (contains? r (pre/negate %)) (contains? true-lits (pre/negate %))) r) true
-        (empty? (remove true-lits r))
-        (reject! "the lemma " (pr-str c) " does not follow by unit propagation")
-        :else (recur (into true-lits r))))))
+  "With every literal of c false, unit propagation over the clauses of db
+  falsifies one of them."
+  [db c]
+  (or (propagates-to-conflict? db (mapv #(bit-xor ((:ids db) %) 1) c))
+      (reject! "the lemma " (pr-str c) " does not follow by unit propagation")))
 
 (defn- lemma!
-  "Lemma c follows from clauses by its justification j."
-  [clauses c j]
+  "Lemma c follows from the clauses of db by its justification j."
+  [db c j]
   (when-not (and (vector? c) (every? literal! c))
     (reject! "not a clause: " (pr-str c)))
   (cond
-    (:rup j) (rup! clauses c)
+    (:rup j) (rup! db c)
     (contains? j :farkas)
     (let [ls (map first (:farkas j))]
       (when-not (= (set c) (set (map pre/negate ls)))
@@ -164,7 +233,12 @@
   [clauses ls]
   (when-not (and (sequential? ls) (seq ls) (= [] (first (last ls))))
     (reject! "a lemma list must end with the empty clause"))
-  (reduce (fn [cls [c j]] (lemma! cls c j) (conj cls c)) clauses ls))
+  (doseq [l ls]
+    (let [c (when (and (vector? l) (= 2 (count l))) (first l))]
+      (when-not (and (vector? c) (every? literal! c))
+        (reject! "not a clause: " (pr-str c)))))
+  (let [db (reduce add! (database (numbering (concat clauses (map first ls)))) clauses)]
+    (reduce (fn [db [c j]] (lemma! db c j) (add! db c)) db ls)))
 
 (defn verify
   "True when certificate c proves its claim of formula f under decls;
