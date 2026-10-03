@@ -64,6 +64,26 @@
        (some? (namespace s))
        (boolean (re-find #"(?:^|\.)[A-Z][^.]*$" (namespace s)))))
 
+(defn host-name
+  "A host member by the name writ keys it by: `java.lang.Math/abs` is
+  `Math/abs`, as the code may write either."
+  [s]
+  (if (and (host-member? s) (.startsWith (namespace s) "java.lang."))
+    (symbol (subs (namespace s) 10) (name s))
+    s))
+
+(defn effect-member?
+  "A host member, by host-name, that is effect code however it is typed:
+  the clock, the environment, threads and processes, randomness."
+  [s]
+  (or (contains? '#{System Runtime Thread ProcessHandle ProcessBuilder} (symbol (namespace s)))
+      (contains? '#{Math/random StrictMath/random UUID/randomUUID java.util.UUID/randomUUID} s)))
+
+(def ^:dynamic *assumed-hosts*
+  "The host members, by host-name, a spec assumes signatures for: the code
+  may call them, typed by the signature, as it calls an assumed fn."
+  #{})
+
 (defn effect-head?
   "An effect or interop name as written in call position:
   clojure.core-qualified, or unqualified and not shadowed by a book name

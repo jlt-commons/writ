@@ -1790,6 +1790,23 @@ where it returns. Only the code's calls and the laws' are checked: writ's
 own calls to the fn, and the dependency's calls to itself, are not the
 spec's to type. The prover takes its result to be of its return type.
 
+A pure static member of a host class is assumed the same way, and the
+code may then call it, which the static check otherwise rejects as
+interop:
+
+```clojure
+(assume Math/sqrt [Double -> Double])
+(assume Math/abs [Double -> Double])
+```
+
+`Math/abs` and `java.lang.Math/abs` name the same member. The signature
+types the calls, and the laws run against the real member, but a member
+has no var to wrap, so what it returns is not checked against the
+signature. Assume only members that are pure. `assume` rejects the
+members that are plainly effects, those of `System`, `Runtime` and
+`Thread` and the random number sources, since they would make the laws'
+results depend on the machine and the clock.
+
 An assumed law is about such fns and never the target's: one that calls
 a fn of the target fails, directly or through a spec helper or project
 fn, since the target is what the spec checks. It
@@ -1918,7 +1935,9 @@ These rules apply to the plain implementation.
   and refs, futures, `eval`, var mutation, randomness), no reflection.
   Calls into other namespaces pass through unchecked. writ reads source
   without loading it, so a qualified name whose qualifier ends in a
-  capitalised segment is taken to be a class.
+  capitalised segment is taken to be a class. A static member the spec
+  assumes a signature for, `(assume Math/sqrt [Double -> Double])`, may
+  be called; see [Assumptions](#assumptions).
 - **Top-level forms.** Only `ns`, `comment`, `def` and `defn`. A
   `defmulti`, `defrecord`, `defmacro` or bare expression is rejected
   rather than skipped. Each fn has a single arity.

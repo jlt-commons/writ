@@ -115,3 +115,31 @@
     (let [r (spec/check 'writ.spec-demo.slug-law-misuse-spec {:seed 42})]
       (is (not (:ok r)))
       (is (has? r "`clojure.string/upper-case` argument 1") (:message r)))))
+
+(deftest a-host-member-is-interop-until-the-spec-assumes-it
+  (let [r (spec/check 'writ.spec-demo.hypot-bare-spec {:seed 42})]
+    (is (not (:ok r)))
+    (is (has? r "`Math/sqrt` is host interop") (:message r))
+    (is (has? r "(assume Math/sqrt [A -> R])") (:message r))))
+
+(deftest an-assumed-host-member-may-be-called
+  (let [r (spec/check 'writ.spec-demo.hypot-spec {:seed 42 :cache false})]
+    (is (:ok r) (:message r))
+    (testing "Math/abs and java.lang.Math/abs are one member"
+      (is (= '#{Math/sqrt Math/abs} (set (keep :fn (:assumptions r))))))
+    (is (every? #(= :held (:status %)) (:assumptions r)) (:message r))
+    (is (has? r "assumes, tested but not proved"))))
+
+(deftest an-assumed-host-member-is-typed-and-must-exist
+  (let [r (spec/check 'writ.spec-demo.hypot-wrong-spec {:seed 42 :cache false})]
+    (is (not (:ok r)))
+    (is (has? r "`Math/sqrt` expects String for argument 1") (:message r)))
+  (let [r (spec/check 'writ.spec-demo.hypot-missing-spec {:seed 42 :cache false})]
+    (is (not (:ok r)))
+    (is (= :failed (:status (first (filter #(= 'Math/cubert (:fn %)) (:assumptions r))))))
+    (is (has? r "`Math/cubert`, which does not resolve") (:message r))))
+
+(deftest an-effectful-host-member-cannot-be-assumed
+  (doseq [m '[System/currentTimeMillis java.lang.System/getenv Math/random Thread/sleep]]
+    (is (thrown-with-msg? Exception #"is effect code"
+          (macroexpand (list 'writ.spec/assume m '[-> Int]))))))

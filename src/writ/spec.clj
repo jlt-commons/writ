@@ -228,8 +228,9 @@
   of another namespace, whose alias in the spec namespace is resolved."
   [g]
   (if-let [n (namespace g)]
-    (let [a (get (ns-aliases *ns*) (symbol n))]
-      (symbol (if a (str (ns-name a)) n) (name g)))
+    (if-let [a (get (ns-aliases *ns*) (symbol n))]
+      (symbol (str (ns-name a)) (name g))
+      (l/host-name g))
     g))
 
 (defmacro calls
@@ -306,6 +307,10 @@
   proofs rest on."
   [nm x]
   (cond
+    (and (symbol? nm) (l/host-member? nm) (l/effect-member? (resolve-callee nm)))
+    (fail! "`assume " nm "`: `" nm "` is effect code (the clock, the environment, threads or "
+           "randomness), which no signature makes pure; keep it in the effect shell")
+
     (and (symbol? nm) (namespace nm) (vector? x))
     `(-register! '~(ns-name *ns*) :assume-fn '~[(resolve-callee nm) (parse-sig (str "`assume " nm "`") x)])
 
@@ -4098,9 +4103,10 @@
        (assoc e ::proof (proof-entry spec-ns proof))))))
 
 (defn- assumed-var
-  "The var of an assumed fn, its namespace loaded, or nil."
+  "The var of an assumed fn, its namespace loaded, or nil.  A host member
+  has no var: its value, when it resolves."
   [q]
-  (try (requiring-resolve q) (catch Throwable _ nil)))
+  (try (if (l/host-member? q) (eval q) (requiring-resolve q)) (catch Throwable _ nil)))
 
 (defn- wrap!
   "Wrap the signed fns not already wrapped, and the fns the spec assumes
@@ -4637,7 +4643,9 @@
                     [(symbol (name q)) q]))
          (into {} (for [[a lib] aliases, q assumed :when (= (str lib) (namespace q))]
                     [(symbol (str a) (name q)) q]))
-         (into {} (for [[r q] refers :when (contains? assumed q)] [r q]))))
+         (into {} (for [[r q] refers :when (contains? assumed q)] [r q]))
+         (into {} (for [q assumed :when (l/host-member? q)]
+                    [(symbol (str "java.lang." (namespace q)) (name q)) q]))))
 
 (defn- lib-pairs
   "The target and the project namespaces it requires, transitively, as
