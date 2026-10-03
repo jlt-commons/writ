@@ -996,64 +996,93 @@
 (defn- refinement [t tenv]
   (when (symbol? t) (get-in tenv [::refines (symbol (name t))])))
 
-(defn conforms?
-  "Does value `v` fit type `t`?  Unknown types and type variables pass."
-  [t v tenv]
-  (let [t (plain t)]
+(def ^:private conformers
+  "Each type's compiled check, by type, for the few type environments
+  seen last, each found by identity: a check runs the code thousands of
+  times, every value through the same few types."
+  (atom []))
+
+(declare conformer)
+
+(defn- conformer*
+  "Type t compiled to a predicate on values under tenv: what conforms?
+  says of a value, the type read once."
+  [t tenv]
+  (let [t (plain t)
+        c #(conformer % tenv)]
     (cond
       (refinement t tenv)
-      (let [{:keys [base pred]} (refinement t tenv)]
-        (boolean (and (conforms? base v tenv) (pred v))))
+      (let [{:keys [base pred]} (refinement t tenv)
+            base? (c base)]
+        (fn [v] (boolean (and (base? v) (pred v)))))
 
       (symbol? t)
       (case t
-        Nat (nat-int? v)
-        Int (int? v)
-        Bool (boolean? v)
-        String (string? v)
-        Char (char? v)
-        Keyword (keyword? v)
-        Symbol (symbol? v)
-        (Float Double Float! Double!) (number? v)
-        Unit (nil? v)
-        (Any Any!) true
+        Nat nat-int?
+        Int int?
+        Bool boolean?
+        String string?
+        Char char?
+        Keyword keyword?
+        Symbol symbol?
+        (Float Double Float! Double!) number?
+        Unit nil?
+        (Any Any!) (constantly true)
         (if-let [[d args] (data-decl t tenv)]
-          (conforms-data? d args v tenv)
-          true))
+          (fn [v] (conforms-data? d args v tenv))
+          (constantly true)))
 
       ;; a record: each key of its own type; an (Opt T) key may be absent,
       ;; and keys it does not name may be there too
       (map? t)
-      (and (map? v)
-           (every? (fn [[k kt]]
-                     (if (contains? v k)
-                       (conforms? kt (get v k) tenv)
-                       (opt-type? kt)))
-                   t))
+      (let [ks (mapv (fn [[k kt]] [k (c kt) (opt-type? kt)]) t)]
+        (fn [v] (and (map? v)
+                     (every? (fn [[k ok? opt]] (if (contains? v k) (ok? (get v k)) opt)) ks))))
 
       (and (kind/index-type? t) (not (data-decl t tenv)))
-      (let [{k :key r :of u :unique} (kind/index-parts t)]
-        (and (map? v)
-             (every? (fn [[i x]] (and (conforms? r x tenv) (= i (get x k)))) v)
-             (every? #(unique-by? % (vals v)) u)))
+      (let [{k :key r :of u :unique} (kind/index-parts t)
+            r? (c r)]
+        (fn [v] (and (map? v)
+                     (every? (fn [[i x]] (and (r? x) (= i (get x k)))) v)
+                     (every? #(unique-by? % (vals v)) u))))
 
       (seq? t)
-      (let [[h & as] t]
+      (let [[h & as] t
+            a? (delay (c (first as)))]
         (case h
-          Opt (or (nil? v) (conforms? (first as) v tenv))
-          List (and (or (nil? v) (sequential? v)) (every? #(conforms? (first as) % tenv) v))
-          Vec (and (vector? v) (every? #(conforms? (first as) % tenv) v))
-          Set (and (set? v) (every? #(conforms? (first as) % tenv) v))
-          Map (and (map? v) (every? (fn [[k x]] (and (conforms? (first as) k tenv)
-                                                     (conforms? (second as) x tenv))) v))
-          (Tuple &) (and (vector? v) (= (count as) (count v))
-                         (every? true? (map #(conforms? %1 %2 tenv) as v)))
-          -> (ifn? v)
+          Opt (fn [v] (or (nil? v) (@a? v)))
+          List (fn [v] (and (or (nil? v) (sequential? v)) (every? @a? v)))
+          Vec (fn [v] (and (vector? v) (every? @a? v)))
+          Set (fn [v] (and (set? v) (every? @a? v)))
+          Map (let [b? (delay (c (second as)))]
+                (fn [v] (and (map? v) (every? (fn [[k x]] (and (@a? k) (@b? x))) v))))
+          (Tuple &) (let [cs (delay (mapv c as))]
+                      (fn [v] (and (vector? v) (= (count as) (count v))
+                                   (every? true? (map #(%1 %2) @cs v)))))
+          -> ifn?
           (if-let [[d args] (data-decl t tenv)]
-            (conforms-data? d args v tenv)
-            true)))
+            (fn [v] (conforms-data? d args v tenv))
+            (constantly true))))
 
-      :else true)))
+      :else (constantly true))))
+
+(defn- conformer
+  "Type t's compiled check under tenv, compiled once."
+  [t tenv]
+  (let [cs @conformers
+        [_ m] (or (some #(when (identical? tenv (first %)) %) cs)
+                  (let [e [tenv (atom {})]]
+                    (swap! conformers #(conj (if (< (count %) 8) % (subvec % 1)) e))
+                    e))]
+    (or (get @m t)
+        (let [f (conformer* t tenv)]
+          (swap! m assoc t f)
+          f))))
+
+(defn conforms?
+  "Does value `v` fit type `t`?  Unknown types and type variables pass."
+  [t v tenv]
+  ((conformer t tenv) v))
 
 ;; --- generators ---------------------------------------------------------------
 ;; Values come from test.check generators built from the spec's types, so a
@@ -4044,13 +4073,16 @@
 (defn- checked
   ([nm f sig tenv argn] (checked nm f sig tenv argn nil))
   ([nm f sig tenv argn {:keys [requires ensures assumed]}]
+   (let [;; the signature's checks, compiled at the first call
+         params? (delay (mapv #(conformer % tenv) (:params sig)))
+         ret? (delay (conformer (:ret sig) tenv))]
    (fn [& args]
      (if (and assumed (not *in-code*))
        ;; writ's own call, or the dependency calling itself
        (apply f args)
        (do
-         (doseq [[i t a] (map vector (range) (:params sig) args)]
-           (when-not (conforms? t a tenv)
+         (doseq [[i t ok? a] (map vector (range) (:params sig) @params? args)]
+           (when-not (ok? a)
              (fail! "`" nm "` argument " (inc i) " (" (nth argn i (str "arg" i)) ") expects "
                     (pr-str t) ", got " (pr-str a))))
          (when (and requires (not ((:f requires) args)))
@@ -4058,7 +4090,7 @@
          ;; a target fn runs as code, whoever called it; an assumed fn
          ;; runs as the dependency's own
          (let [r (binding [*in-code* (not assumed)] (apply f args))]
-           (when-not (conforms? (:ret sig) r tenv)
+           (when-not (@ret? r)
              (fail! "`" nm "` returns " (pr-str (:ret sig)) ", but returned " (pr-str r)
                     " for arguments " (pr-str (vec args))
                     (when-let [w (try (why-not (:ret sig) r tenv) (catch Throwable _ nil))]
@@ -4066,7 +4098,7 @@
            (when (and ensures (not ((:f ensures) (concat args [r]))))
              (fail! "`" nm "` returns " (pr-str r) " for arguments " (pr-str (vec args))
                     ", which breaks its :ensures " (pr-str (:test ensures))))
-           r))))))
+           r)))))))
 
 (defn- default-proof-ns [spec-ns]
   (let [n (name spec-ns)]

@@ -408,6 +408,13 @@
         ctx (assoc ctx :memo (atom {}) :stuck (atom #{}) :int-memo (atom {}))]
     [ctx vacuous (when-not vacuous (rw/normalize ctx g))]))
 
+(defn vacuous?
+  "Is one of hyps false, read as case-context reads them, its goal left
+  unread?"
+  [opts hyps]
+  (let [[ctx vacuous] (take-all (rw/context (dissoc opts :ih)) hyps)]
+    (or vacuous (second (take-all ctx hyps)))))
+
 (defn case-context
   "[ctx vacuous? n]: the hyps taken as facts, the induction hypotheses read
   under them, and the goal g normalised there.  vacuous? when a hypothesis

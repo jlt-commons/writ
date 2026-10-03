@@ -104,24 +104,25 @@
   (aset ^objects @(:heap s) i a)
   (aset ^objects @(:hpos s) a i))
 
+;; the sifts take the arrays once: a step is two reads and two writes
 (defn- sift-up! [s i]
-  (let [^objects h @(:heap s) act @(:act s) a (aget h i)]
+  (let [^objects h @(:heap s) ^objects pos @(:hpos s) act @(:act s) a (aget h i)]
     (loop [i i]
       (let [p (quot (dec i) 2)]
         (if (and (pos? i) (above? act a (aget h p)))
-          (do (heap-set! s i (aget h p)) (recur p))
-          (heap-set! s i a))))))
+          (let [b (aget h p)] (aset h i b) (aset pos b i) (recur p))
+          (do (aset h i a) (aset pos a i)))))))
 
 (defn- sift-down! [s i]
-  (let [^objects h @(:heap s) act @(:act s) n @(:hsize s) a (aget h i)]
+  (let [^objects h @(:heap s) ^objects pos @(:hpos s) act @(:act s) n @(:hsize s) a (aget h i)]
     (loop [i i]
       (let [l (inc (* 2 i)) r (inc l)
             c (cond (>= l n) nil
                     (and (< r n) (above? act (aget h r) (aget h l))) r
                     :else l)]
         (if (and c (above? act (aget h c) a))
-          (do (heap-set! s i (aget h c)) (recur c))
-          (heap-set! s i a))))))
+          (let [b (aget h c)] (aset h i b) (aset pos b i) (recur c))
+          (do (aset h i a) (aset pos a i)))))))
 
 (defn- heap-insert! [s a]
   (when (nil? (aget ^objects @(:hpos s) a))

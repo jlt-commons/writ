@@ -523,8 +523,12 @@
   constructors, and running every case symbolically: small formulas, one
   per combination of tags, where one formula for all of them would make
   the solver search the tags too.  The same trace a case split on data
-  and a symbolic leaf make, so the checker replays it as those."
+  and a symbolic leaf make, so the checker replays it as those.  A case
+  whose tags make a hypothesis false -- a refinement's tag test -- holds
+  without running the code."
   [opts hyps g]
+  (if (and (seq hyps) (fuelled #(sc/vacuous? opts hyps)))
+    {:by :hypothesis-false}
   (if-let [v (first (filter #(sc/data-cases opts %)
                             (sort-by str (reduce into (t/vars g) (map t/vars hyps)))))]
     (let [ps (mapv (fn [[value types]]
@@ -535,7 +539,7 @@
         {:by :data-cases :on v :cases ps}))
     (when-let [[c used] (sym/prove opts hyps g)]
       (swap! (:unfolded opts) into used)
-      {:by :symbolic :certificate c})))
+      {:by :symbolic :certificate c}))))
 
 (defn- by-symbolic-cases
   "Every goal by symbolic-cases, when the code runs symbolically at all."

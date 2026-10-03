@@ -35,23 +35,37 @@
       b)
     a))
 
-(defn make
-  "A theory solver for one search: at most max-pivots pivots a check."
-  [max-pivots]
-  {:max-pivots max-pivots
-   :ids (volatile! {})          ; variable -> number
-   :names (volatile! [])        ; number -> variable ([:slack a] for a slack)
-   :val (volatile! (object-array 16))
-   :lo (volatile! (object-array 16)) :lo-lit (volatile! (object-array 16))
-   :hi (volatile! (object-array 16)) :hi-lit (volatile! (object-array 16))
-   :row (volatile! (object-array 16))   ; basic: {nonbasic coefficient}
-   :col (volatile! (object-array 16))   ; nonbasic: #{basic whose row holds it}
-   :slacks (volatile! {})       ; form -> slack number
-   :info (volatile! {})         ; literal -> [x side bound]
-   :trail (volatile! [])        ; [trail-pos x side old-bound old-lit]
-   :open (volatile! #{})})      ; basic variables that may be out of bounds
+(def ^:private slots
+  "Where each part of a solver's state sits in its array."
+  (zipmap [:max-pivots :ids :names :val :lo :lo-lit :hi :hi-lit :row :col
+           :slacks :info :trail :open]
+          (range)))
 
-(defn- arr [st k] @(k st))
+;; a part of the state, and a change to it: one read of the array at a
+;; place fixed when this is compiled
+(defmacro ^:private arr [st k] `(aget ~(with-meta st {:tag 'objects}) ~(get slots k)))
+(defmacro ^:private put! [st k v] `(aset ~(with-meta st {:tag 'objects}) ~(get slots k) ~v))
+(defn- part
+  "The part k of the state, k known only when it runs: :lo or :hi."
+  [^objects st k]
+  (aget st (get slots k)))
+(defmacro ^:private sw! [st k f & args]
+  `(let [st# ~st] (aset ^objects st# ~(get slots k) (~f (aget ^objects st# ~(get slots k)) ~@args))))
+
+(defn make
+  "A theory solver for one search: at most max-pivots pivots a check.  Its
+  state is an array: the variables by number (variable -> number, and
+  back), their values, bounds and the literals the bounds came from, rows
+  of the basic ones ({nonbasic coefficient}) and columns of the others
+  (#{basic whose row holds it}); the slack of each form, what each literal
+  bounds ([x side bound]), the trail of bounds replaced ([trail-pos x side
+  old-bound old-lit]), and the basic variables that may be out of bounds."
+  [max-pivots]
+  (object-array [max-pivots {} [] (object-array 16)
+                 (object-array 16) (object-array 16) (object-array 16) (object-array 16)
+                 (object-array 16) (object-array 16)
+                 {} {} [] #{}]))
+
 (defn- value [st x] (aget ^objects (arr st :val) x))
 (defn- row [st x] (aget ^objects (arr st :row) x))
 (defn- col [st x] (or (aget ^objects (arr st :col) x) #{}))
@@ -61,12 +75,13 @@
 (defn- var!
   "Variable v's number, a new nonbasic variable at 0 when it is new."
   [st v]
-  (or (get @(:ids st) v)
-      (let [n (count @(:names st))]
-        (doseq [k [:val :lo :lo-lit :hi :hi-lit :row :col]]
-          (vswap! (k st) grow (inc n)))
-        (vswap! (:ids st) assoc v n)
-        (vswap! (:names st) conj v)
+  (or (get (arr st :ids) v)
+      (let [n (count (arr st :names))]
+        (sw! st :val grow (inc n)) (sw! st :lo grow (inc n)) (sw! st :lo-lit grow (inc n))
+        (sw! st :hi grow (inc n)) (sw! st :hi-lit grow (inc n))
+        (sw! st :row grow (inc n)) (sw! st :col grow (inc n))
+        (sw! st :ids assoc v n)
+        (sw! st :names conj v)
         (set-val! st n 0)
         n)))
 
@@ -87,7 +102,7 @@
   variable whose row is a over the nonbasic variables: a basic variable
   of a is put in by its own row."
   [st a]
-  (or (get @(:slacks st) a)
+  (or (get (arr st :slacks) a)
       (let [s (var! st [:slack a])
             r (reduce-kv (fn [r v k]
                            (let [x (var! st v)]
@@ -97,21 +112,21 @@
                          {} a)]
         (aset ^objects (arr st :row) s r)
         (set-val! st s (reduce-kv (fn [t y k] (+ t (* k (value st y)))) 0 r))
-        (vswap! (:slacks st) assoc a s)
+        (sw! st :slacks assoc a s)
         s)))
 
 (defn- info!
   "What literal l, [:le a c], bounds: [x side bound]."
   [st [_ a c :as l]]
-  (or (get @(:info st) l)
+  (or (get (arr st :info) l)
       (let [i (if (and (= 1 (count a)) (#{1 -1} (val (first a))))
                 (let [[v k] (first a) x (var! st v)]
                   (if (= 1 k) [x :hi c] [x :lo (- c)]))
                 (let [n (into {} (map (fn [[x k]] [x (- k)])) a)]
-                  (if-let [s (get @(:slacks st) n)]
+                  (if-let [s (get (arr st :slacks) n)]
                     [s :lo (- c)]
                     [(slack! st a) :hi c])))]
-        (vswap! (:info st) assoc l i)
+        (sw! st :info assoc l i)
         i)))
 
 (defn- update!
@@ -120,7 +135,7 @@
   (let [d (- v (value st x))]
     (doseq [b (col st x)]
       (set-val! st b (+ (value st b) (* (get (row st b) x) d))))
-    (vswap! (:open st) into (col st x))
+    (sw! st :open into (col st x))
     (set-val! st x v)))
 
 (defn assert!
@@ -129,18 +144,18 @@
   other bound of its variable."
   [st l pos]
   (let [[x side c] (info! st l)
-        ^objects bs (arr st side)
-        ^objects ls (arr st (if (= side :lo) :lo-lit :hi-lit))
+        ^objects bs (part st side)
+        ^objects ls (part st (if (= side :lo) :lo-lit :hi-lit))
         old (aget bs x)]
     (when (or (nil? old) (if (= side :hi) (< c old) (> c old)))
-      (vswap! (:trail st) conj [pos x side old (aget ls x)])
+      (sw! st :trail conj [pos x side old (aget ls x)])
       (aset bs x c)
       (aset ls x l)
-      (let [other (aget ^objects (arr st (if (= side :lo) :hi :lo)) x)]
+      (let [other (aget ^objects (part st (if (= side :lo) :hi :lo)) x)]
         (if (and other (if (= side :lo) (> c other) (< c other)))
           [[(aget ^objects (arr st :lo-lit) x) 1] [(aget ^objects (arr st :hi-lit) x) 1]]
           (do (if (row st x)
-                (vswap! (:open st) conj x)
+                (sw! st :open conj x)
                 (when (if (= side :lo) (< (value st x) c) (> (value st x) c))
                   (update! st x c)))
               nil))))))
@@ -150,12 +165,12 @@
   trail or after."
   [st pos]
   (loop []
-    (let [t @(:trail st)]
+    (let [t (arr st :trail)]
       (when-let [[p x side old old-lit] (peek t)]
         (when (>= p pos)
-          (aset ^objects (arr st side) x old)
-          (aset ^objects (arr st (if (= side :lo) :lo-lit :hi-lit)) x old-lit)
-          (vswap! (:trail st) pop)
+          (aset ^objects (part st side) x old)
+          (aset ^objects (part st (if (= side :lo) :lo-lit :hi-lit)) x old-lit)
+          (sw! st :trail pop)
           (recur))))))
 
 (defn- violation [st x]
@@ -191,15 +206,15 @@
         (let [rb (row st b)
               c (get rb xj)]
           (aset ^objects (arr st :row) b (add-to-row st b (dissoc rb xj) c rj))))
-      (vswap! (:open st) into others)
-      (vswap! (:open st) conj xj))))
+      (sw! st :open into others)
+      (sw! st :open conj xj))))
 
 (defn- explain
   "The Farkas multipliers for basic x stuck below (side :lo) or above its
   bound: its own bound, and the bound of each variable of its row that
   stops it, weighted by the row's coefficient."
   [st x side]
-  (let [lit (fn [y s] (aget ^objects (arr st (if (= s :lo) :lo-lit :hi-lit)) y))
+  (let [lit (fn [y s] (aget ^objects (part st (if (= s :lo) :lo-lit :hi-lit)) y))
         other {:lo :hi :hi :lo}]
     (into [[(lit x side) 1]]
           (for [[y a] (sort-by key (row st x))]
@@ -213,21 +228,21 @@
   Throws ::simplex/budget after max-pivots pivots."
   [st]
   (loop [n 0]
-    (when (> n (:max-pivots st))
+    (when (> n (arr st :max-pivots))
       (throw (ex-info "simplex pivot budget exhausted" {::simplex/budget true})))
     ;; the violated basic variable first in order (Bland's rule); one
     ;; within its bounds stays so until a move makes it open again
-    (let [open (into #{} (filter #(and (row st %) (violation st %))) @(:open st))]
-      (vreset! (:open st) open)
+    (let [open (into #{} (filter #(and (row st %) (violation st %))) (arr st :open))]
+      (put! st :open open)
       (if (empty? open)
         nil
         (let [x (reduce min open)
               side (violation st x)
-              target (aget ^objects (arr st side) x)
+              target (aget ^objects (part st side) x)
               ;; below its lower bound it must rise, above its upper it must fall
               y (reduce-kv (fn [m y a]
                              (let [up (if (= side :lo) (pos? a) (neg? a))
-                                   b (aget ^objects (arr st (if up :hi :lo)) y)]
+                                   b (aget ^objects (part st (if up :hi :lo)) y)]
                                (if (and (or (nil? b) (if up (< (value st y) b) (> (value st y) b)))
                                         (or (nil? m) (< y m)))
                                  y m)))
@@ -239,7 +254,7 @@
 (defn model
   "The values of the variables, slacks left out."
   [st]
-  (into {} (for [[v x] @(:ids st) :when (not (and (vector? v) (= :slack (first v))))]
+  (into {} (for [[v x] (arr st :ids) :when (not (and (vector? v) (= :slack (first v))))]
              [v (value st x)])))
 
 (defn gomory
@@ -249,7 +264,7 @@
   see writ.solve.simplex/gomory."
   [st]
   (let [frac #(- % (simplex/floor-value %))
-        n (count @(:names st))]
+        n (count (arr st :names))]
     (first
       (for [x (range n)
             :let [r (row st x)]
