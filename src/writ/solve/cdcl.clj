@@ -11,9 +11,10 @@
     search keeps to the atoms recent conflicts were about.  An atom is
     decided with the value it last had (phase saving).
   - Restarts follow Luby's sequence; learned clauses survive them.
-  - After each propagation the simplex checks the inequalities that hold,
-    from the tableau of the level below.  An infeasible set is a theory
-    conflict: its Farkas combination refutes the clause of their negations,
+  - Each inequality made true goes to the simplex (writ.solve.lra) as a
+    bound, and after each propagation the simplex checks them; a backjump
+    takes the bounds of the literals it undoes back out.  An infeasible
+    set is a theory conflict: its Farkas combination refutes the clause of their negations,
     which is learned like any other.  A fractional value is branched on
     (x <= floor v, as a decision) or cut (a Gomory cut, learned as a lemma).
 
@@ -36,6 +37,7 @@
   top; an atom assigned stays in it until a decision finds it there."
   (:require [writ.solve.pre :refer [negate]]
             [writ.solve.simplex :as simplex]
+            [writ.solve.lra :as lra]
             [writ.solve.cert :as cert]))
 
 ;; --- atoms -----------------------------------------------------------------------
@@ -69,7 +71,9 @@
    :hpos (volatile! (object-array 32)) :heap (volatile! (object-array 32)) :hsize (volatile! 0)
    :trail (volatile! (object-array 32)) :tsize (volatile! 0) :qhead (volatile! 0)
    :clauses (volatile! []) :lemmas (volatile! [])
-   :lims (volatile! []) :tabs (volatile! [nil])
+   :lims (volatile! [])
+   ;; the theory, and the place on the trail up to which it has the literals
+   :lra (lra/make max-pivots) :apos (volatile! 0)
    :inc (volatile! 1.0) :conflicts (volatile! 0) :decisions (volatile! 0) :cuts (volatile! 0)
    :budget budget :max-pivots max-pivots})
 
@@ -308,7 +312,8 @@
         (vreset! (:tsize s) cut)
         (vreset! (:qhead s) cut)
         (vreset! (:lims s) (truncate lims k))
-        (vswap! (:tabs s) truncate (inc k))))))
+        (lra/backtrack! (:lra s) cut)
+        (vswap! (:apos s) min cut)))))
 
 (defn- learn!
   "Learn clause c (justified by just) after a conflict, jump back and assert
@@ -331,17 +336,18 @@
 ;; --- the theory -------------------------------------------------------------------
 
 (defn- theory
-  "The simplex over the inequalities that hold, from the level's tableau."
+  "The simplex given the inequalities assigned since it last looked, and
+  checked: nil, or the Farkas certificate of a conflict."
   [s]
-  (let [from (peek @(:tabs s))
-        ^objects tr @(:trail s)
-        ;; the level's tableau holds the inequalities of the trail up to the
-        ;; place it was made at: only those after are new
-        lits (for [i (range (or (:pos from) 0) @(:tsize s))
-                   :let [l (literal s (aget tr i))]
-                   :when (= :le (first l))]
-               l)]
-    (simplex/check lits (:max-pivots s) from)))
+  (let [st (:lra s) ^objects tr @(:trail s) end @(:tsize s)]
+    (or (loop []
+          (let [i @(:apos s)]
+            (when (< i end)
+              (vreset! (:apos s) (inc i))
+              (let [l (literal s (aget tr i))]
+                (or (when (= :le (first l)) (lra/assert! st l i))
+                    (recur))))))
+        (lra/check! st))))
 
 ;; --- the search -------------------------------------------------------------------
 
@@ -406,7 +412,6 @@
   [s l]
   (vswap! (:decisions s) inc)
   (vswap! (:lims s) conj @(:tsize s))
-  (vswap! (:tabs s) #(conj % (peek %)))
   (assign! s l nil))
 
 (defn- search
@@ -423,8 +428,8 @@
         (budget! s)
         (if-let [ci (propagate! s)]
           (if (conflict-step! s ci) (unsat) (recur restarts until))
-          (let [t (theory s)]
-            (if-let [fk (:conflict t)]
+          (let [fk (theory s)]
+            (if fk
               ;; a theory conflict: learn the negations of the bounds, whose
               ;; Farkas combination refutes them
               (let [fk (vec (remove #(zero? (second %)) fk))
@@ -432,7 +437,6 @@
                     i (add-clause! s (mapv #(intern! s %) c) {:farkas fk})]
                 (if (conflict-step! s i) (unsat) (recur restarts until)))
               (do
-                (vswap! (:tabs s) #(conj (pop %) (assoc (:tableau t) :pos @(:tsize s))))
                 (cond
                   ;; restart: back to level 0, keeping what was learned
                   (>= @(:conflicts s) until)
@@ -444,8 +448,8 @@
                   (if-let [l (decide! s)]
                     (do (decide-on! s l) (recur restarts until))
                     ;; every atom assigned and the theory agrees: integral?
-                    (if-let [[x v] (first (remove #(integer? (val %)) (sort-by (comp str key) (force (:sat t)))))]
-                      (let [terms (when (< @(:cuts s) 12) (simplex/gomory (:tableau t)))
+                    (if-let [[x v] (first (remove #(integer? (val %)) (sort-by (comp str key) (lra/model (:lra s)))))]
+                      (let [terms (when (< @(:cuts s) 12) (lra/gomory (:lra s)))
                             cl (when terms (cert/cut (set (map #(literal s %) (trail s))) terms))]
                         (if (and terms (nil? (some->> (known s cl) (value s))))
                           ;; a Gomory cut: the bounds it combines imply it
@@ -457,7 +461,7 @@
                           ;; branch: x <= floor v, a new atom, decided
                           (do (decide-on! s (intern! s [:le {x 1} (simplex/floor-value v)]))
                               (recur restarts until))))
-                      {:sat true :assign (set (map #(literal s %) (trail s))) :values (force (:sat t))
+                      {:sat true :assign (set (map #(literal s %) (trail s))) :values (lra/model (:lra s))
                        :spent (spent)})))))))))))
 
 ;; --- constraint independence -------------------------------------------------------

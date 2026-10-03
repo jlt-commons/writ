@@ -365,10 +365,29 @@
       {:c (quot (- c (mod c g)) g) :m (into {} (map (fn [[x k]] [x (quot k g)])) m)}
       {:c c :m m})))
 
+(def ^:private infeasible-memo
+  "infeasible?'s answers, by its constraints in order: a search asks the
+  same question many times over, under facts that come and go with its
+  case splits.  A pure function's answers, so shared by every search;
+  emptied when it grows large."
+  (atom {}))
+
+(declare infeasible*)
+
 (defn- infeasible?
   "Do these integer constraints, each c + sum k*x >= 0, have no solution?
   Fourier-Motzkin elimination, tightened at each step for integers: a
   true answer is a proof, a false one only means no proof was found."
+  [cs]
+  (let [cs (vec cs)
+        hit (find @infeasible-memo cs)]
+    (if hit
+      (val hit)
+      (let [r (infeasible* cs)]
+        (swap! infeasible-memo #(assoc (if (< (count %) 20000) % {}) cs r))
+        r))))
+
+(defn- infeasible*
   [cs]
   ;; an atom is a term, and equal terms made apart are apart objects: each
   ;; is put in once, so a map holding it finds it by identity, not by
@@ -407,23 +426,46 @@
         quot (when-let [ln (lin-of ctx n)]
                (between (lin+ ln (lin* (- k) self)) (- j) j))))))
 
+(declare ^:dynamic *provisional*)
+
+(defn- fact-constraints
+  "The integer facts in ctx as constraints, the atoms they mention, and
+  what is known of those atoms: {:facts :atoms :nat :div}.  Kept in the
+  context's :int-memo while its facts, hypotheses, lemmas and types are
+  the ones it was worked out under, and no answer it rests on is
+  provisional."
+  [ctx]
+  (let [memo (:int-memo ctx)
+        under [(:facts ctx) (:ih ctx) (:lemmas ctx) (:types ctx)]
+        hit (some-> memo deref (get ::fact-constraints))]
+    (if (and hit (every? true? (map identical? (:under hit) under)))
+      (:v hit)
+      (let [facts (vec (for [[f v] (:facts ctx)
+                             :when (true? v)
+                             lf (case (head f)
+                                  :le (when-let [e (lin-of ctx (second f))] [e])
+                                  :ieq (when-let [e (lin-of ctx (second f))] [e (lin* -1 e)])
+                                  nil)]
+                         lf))
+            atoms (vec (distinct (mapcat (comp keys :m) facts)))
+            v {:facts facts :atoms atoms
+               :nat (vec (for [a atoms :when (nat-atom? ctx a)] {:c 0 :m {a 1}}))
+               :div (vec (mapcat #(division-bounds ctx %) atoms))}]
+        (when (and memo (not *provisional*))
+          (swap! memo assoc ::fact-constraints {:under under :v v}))
+        v))))
+
 (defn- known-constraints
   "The integer facts in ctx, as constraints c + sum k*x >= 0, with each
   Nat atom they or `extra` mention known to be at least 0."
   [ctx extra]
-  (let [facts (for [[f v] (:facts ctx)
-                    :when (true? v)
-                    lf (case (head f)
-                         :le (when-let [e (lin-of ctx (second f))] [e])
-                         :ieq (when-let [e (lin-of ctx (second f))] [e (lin* -1 e)])
-                         nil)]
-                lf)
-        atoms (distinct (mapcat (comp keys :m) (concat facts extra)))]
+  (let [{:keys [facts atoms nat div]} (fact-constraints ctx)
+        ;; the atoms of extra the facts do not mention, after theirs
+        seen (set atoms)
+        more (remove seen (distinct (mapcat (comp keys :m) extra)))]
     (concat facts
-            (for [a atoms :when (nat-atom? ctx a)] {:c 0 :m {a 1}})
-            (mapcat #(division-bounds ctx %) atoms))))
-
-(declare ^:dynamic *provisional*)
+            nat (for [a more :when (nat-atom? ctx a)] {:c 0 :m {a 1}})
+            div (mapcat #(division-bounds ctx %) more))))
 
 (declare decide-le*)
 
@@ -1384,6 +1426,60 @@
       (some-> memo (swap! assoc k r)))
     r))
 
+(defn- rule-root
+  "The head of term t, and the fn a call names: what a rule's left side
+  and a term it matches share.  nil for a left side that could match a
+  term of any head -- a variable, or a call of a fn named by one."
+  [t]
+  (when (vector? t)
+    (if (contains? #{:call :app} (head t))
+      (when-not (pvar? (second t)) [(head t) (second t)])
+      [(head t)])))
+
+(defn inert-rule?
+  "Does rule rewrite every term it matches to that term itself?  Its
+  sides are the same, and a match binds every variable of its left side
+  to the part of the term where it stands -- except inside a fn literal,
+  matched up to its parameters' names, or an =, matched either way
+  round.  Such a rule never rewrites anything."
+  [{:keys [lhs rhs]}]
+  (and (= lhs rhs)
+       (not-any? #(or (= :fn (head %)) (and (= :call (head %)) (= '= (second %))))
+                 (t/subterms lhs))))
+
+(defn- index-rules
+  "Rules by the root of their left side, each list in the rules' order,
+  with the rules that could match any root in their places.  An inert
+  rule is left out: trying it would only check its types."
+  [rules]
+  (let [rules (remove inert-rule? rules)
+        any? #(nil? (rule-root (:lhs %)))]
+    {:any (filterv any? rules)
+     :by (into {} (for [k (distinct (keep (comp rule-root :lhs) rules))]
+                    [k (filterv #(or (any? %) (= k (rule-root (:lhs %)))) rules)]))}))
+
+(defn- rules-for
+  "The lemma rules of ctx whose left side could match a term of root k
+  (a head, and the fn a call names), in their order."
+  [ctx k]
+  (let [{:keys [any by]} @(:lemma-index ctx)]
+    (get by k any)))
+
+(def asked-limit
+  "The most terms a search notes lemmas were tried on; past it, it notes
+  ::too-many, and any lemma might have changed it."
+  50000)
+
+(defn- asked!
+  "Note, in ctx's :asked, that lemmas were tried on term x: a lemma whose
+  left side matches none of the terms noted could not have changed the
+  search."
+  [ctx x]
+  (when-let [a (:asked ctx)]
+    (let [s @a]
+      (when-not (contains? s x)
+        (swap! a #(if (< (count %) asked-limit) (conj % x) (conj % ::too-many)))))))
+
 (defn- proved-integer?
   "Does a fact, an induction hypothesis or a proved lemma say (integer? t)?"
   [ctx t]
@@ -1409,17 +1505,19 @@
     (if (some? hit)
       hit
       (provisionally memo k
-        #(boolean
-                (some (fn [{:keys [vars hyp lhs rhs name types]}]
-                        (when (and (= [:lit true] rhs) (= :call (head lhs))
-                                   (= '<= (second lhs)) (= [:lit 0] (nth lhs 2 nil)) (= 4 (count lhs)))
-                          (when-let [m (match-term (nth lhs 3) t vars)]
-                            ;; a law's hypothesis must hold here too
-                            (when (and (typed? ctx types m)
-                                       (or (nil? hyp) (true? (truthiness ctx (normalize ctx (t/subst hyp m))))))
-                              (swap! (:lemmas-used ctx) conj name)
-                              true))))
-                      (:lemmas ctx)))))))
+        #(do
+           (asked! ctx [::nat t])
+           (boolean
+             (some (fn [{:keys [vars hyp lhs rhs name types]}]
+                     (when (and (= [:lit true] rhs) (= :call (head lhs))
+                                (= '<= (second lhs)) (= [:lit 0] (nth lhs 2 nil)) (= 4 (count lhs)))
+                       (when-let [m (match-term (nth lhs 3) t vars)]
+                         ;; a law's hypothesis must hold here too
+                         (when (and (typed? ctx types m)
+                                    (or (nil? hyp) (true? (truthiness ctx (normalize ctx (t/subst hyp m))))))
+                           (swap! (:lemmas-used ctx) conj name)
+                           true))))
+                   (rules-for ctx [:call '<=]))))))))
 
 (defn- conjuncts
   "The parts of a normalised conjunction: (if a b false) and (if a b a),
@@ -1455,6 +1553,7 @@
   The law holds only at its own types, so each term its variables take
   must be shown to be of the variable's type."
   [ctx x]
+  (asked! ctx x)
   (some (fn [{:keys [vars hyp lhs rhs name types]}]
           (when-let [m0 (match-term lhs x vars)]
             (some (fn [m]
@@ -1471,7 +1570,7 @@
                   (if (and hyp (some #(and (contains? vars %) (not (contains? m0 %))) (t/vars hyp)))
                     (bind-free ctx hyp vars m0)
                     [m0]))))
-        (:lemmas ctx)))
+        (rules-for ctx (if (contains? #{:call :app} (head x)) [(head x) (second x)] [(head x)]))))
 
 (def ^:private boolean-fns
   '#{writ.prove.term/same number? fn? = not= not < <= > >= empty? zero? pos? neg? even? odd? nil? some? true? false? every? boolean})
@@ -1524,6 +1623,16 @@
       (recognizer-rule ctx x)
       (when (= :app (head x)) (unfold ctx x))))
 
+(defn- facts-vars
+  "The variables of ctx's facts.  assume keeps them, with the facts they
+  are of, as it adds each fact; a ctx whose facts came otherwise reads
+  them afresh."
+  [ctx]
+  (let [[facts vs] (:facts-vars ctx)]
+    (if (identical? facts (:facts ctx))
+      @vs
+      (into #{} (mapcat (comp t/vars key)) (:facts ctx)))))
+
 (defn assume
   "ctx with condition c taken to be v.  A false 0 <= d is also kept as
   0 <= -d-1, the form the integer reasoning reads."
@@ -1534,7 +1643,9 @@
         facts (if (and (= :le (head c)) (false? v) (lin-of ctx (second c)))
                 (assoc facts [:le (lin->term (lin+ (lin* -1 (lin-of ctx (second c))) {:c -1 :m {}}))] true)
                 facts)]
-    (assoc ctx :facts facts :memo (atom {}) :stuck (atom #{}) :int-memo (atom {})))))
+    (assoc ctx :facts facts :memo (atom {}) :stuck (atom #{}) :int-memo (atom {})
+           ;; the 0 <= -d-1 fact's variables are c's
+           :facts-vars [facts (delay (into (facts-vars ctx) (t/vars c)))]))))
 
 (defn- fn-height
   "How deep fn literals nest in t: 0 with none."
@@ -1592,7 +1703,7 @@
                                    ;; some other value of that name: the body
                                    ;; must not read it as about its own
                                    bound (set ps*)
-                                   ctx* (if (some #(some bound (t/vars (key %))) (:facts ctx))
+                                   ctx* (if (some bound (facts-vars ctx))
                                           (assoc ctx :facts (into {} (remove #(some bound (t/vars (key %)))) (:facts ctx))
                                                  :memo (atom {}) :stuck (atom #{}) :int-memo (atom {}))
                                           ctx)]
@@ -1615,11 +1726,14 @@
 (defn context
   "A fresh normalising context.  defs: name -> {:params :body :recursive?};
   types: variable -> type; tenv: data declarations."
-  [{:keys [defs types tenv facts ih fuel lemmas lemmas-used recognizers burned unfolded]}]
+  [{:keys [defs types tenv facts ih fuel lemmas lemmas-used recognizers burned unfolded asked]}]
   {:defs (or defs {}) :types (or types {}) :tenv (or tenv {})
    :recognizers (or recognizers {})
    :facts (or facts {}) :ih (or ih []) :lemmas (or lemmas [])
+   :lemma-index (delay (index-rules (or lemmas [])))
    :lemmas-used (or lemmas-used (atom #{}))
+   ;; the terms lemmas were tried on, when an atom
+   :asked asked
    :memo (atom {}) :stuck (atom #{}) :unfolded (or unfolded (atom #{})) :used-ih (atom 0) :int-memo (atom {})
    :held (atom #{})
    ;; every rewrite of an attempt, across its contexts, for its telemetry

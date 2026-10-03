@@ -371,21 +371,18 @@
 
 ;; --- the steps a proof takes ------------------------------------------------------
 
-(defn case-context
-  "[ctx vacuous? n]: the hyps taken as facts, the induction hypotheses read
-  under them, and the goal g normalised there.  vacuous? when a hypothesis
-  is false, and then there is nothing to prove."
-  [opts g hyps]
-  (let [take-all (fn [ctx0 hs]
-                   (reduce (fn [[c vac] h]
-                             (if vac [c vac] (assume-hyp c (rw/normalize c h))))
-                           [ctx0 false] hs))
-        [ctx vacuous] (take-all (rw/context (dissoc opts :ih)) hyps)
-        ;; a hypothesis read before a later one decided its test (an or
-        ;; whose first case a split ruled out) is read again under all of
-        ;; them
-        [ctx vacuous] (if vacuous [ctx vacuous] (take-all ctx hyps))
-        ctx (assoc ctx :ih (mapv (fn [i] (update i :lhs #(rw/normalize (rw/hold-calls! ctx %) %))) (:ih opts)))
+(defn- take-all
+  "[ctx vacuous?] with each of hs, normalised in turn, taken as true."
+  [ctx0 hs]
+  (reduce (fn [[c vac] h]
+            (if vac [c vac] (assume-hyp c (rw/normalize c h))))
+          [ctx0 false] hs))
+
+(defn- under-ih
+  "[ctx vacuous? n]: ctx, its hypotheses taken, with the induction
+  hypotheses ihs read under them, and the goal term g normalised there."
+  [opts ctx vacuous ihs g]
+  (let [ctx (assoc ctx :ih (mapv (fn [i] (update i :lhs #(rw/normalize (rw/hold-calls! ctx %) %))) ihs))
         ;; an unconditional hypothesis that is a linear comparison is a
         ;; fact too: the arithmetic reads facts, and a rewrite of the
         ;; comparison itself never meets 0 <= h + (f t) with 0 <= (f t)
@@ -410,6 +407,34 @@
                               [ctx vacuous] (if vacuous [] (:ih ctx)))
         ctx (assoc ctx :memo (atom {}) :stuck (atom #{}) :int-memo (atom {}))]
     [ctx vacuous (when-not vacuous (rw/normalize ctx g))]))
+
+(defn case-context
+  "[ctx vacuous? n]: the hyps taken as facts, the induction hypotheses read
+  under them, and the goal g normalised there.  vacuous? when a hypothesis
+  is false, and then there is nothing to prove."
+  [opts g hyps]
+  (let [[ctx vacuous] (take-all (rw/context (dissoc opts :ih)) hyps)
+        ;; a hypothesis read before a later one decided its test (an or
+        ;; whose first case a split ruled out) is read again under all of
+        ;; them
+        [ctx vacuous] (if vacuous [ctx vacuous] (take-all ctx hyps))]
+    (under-ih opts ctx vacuous (:ih opts) g)))
+
+(defn case-context-after
+  "case-context for hyps, the last of them a split's new case, built on
+  parent, the [ctx vacuous? n] case-context gave the hyps before it.  The
+  parent's facts stand, and its goal and induction hypotheses are already
+  normal under them: they are normalised again under the new fact, not
+  from the start.  An equal term under fewer facts is equal under more,
+  so this is the same goal; it is a search's shortcut, and the checker
+  still reads each case from the start."
+  [opts parent hyps]
+  (let [[pctx _ n] parent
+        base (assoc pctx :ih [] :memo (atom {}) :stuck (atom #{}) :int-memo (atom {})
+                    :held (atom #{}) :used-ih (atom 0) :fuel (atom (or (:fuel opts) 20000)))
+        [ctx vacuous] (take-all base [(peek hyps)])
+        [ctx vacuous] (if vacuous [ctx vacuous] (take-all ctx hyps))]
+    (under-ih opts ctx vacuous (:ih pctx) n)))
 
 (defn data-cases
   "One case per constructor of v's data type, as [[value types] ...]; nil
