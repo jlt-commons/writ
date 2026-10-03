@@ -114,6 +114,9 @@
 (defn- cache-file-of [dir]
   (java.io.File. dir "writ.spec-demo.index-spec--writ.spec-demo.index.edn"))
 
+(defn- traces-file-of [dir]
+  (java.io.File. dir "writ.spec-demo.index-spec--writ.spec-demo.index.traces.edn"))
+
 (defn- temp-dir []
   (let [d (java.io.File. (System/getProperty "java.io.tmpdir") (str "writ-cache-test-" (System/nanoTime)))]
     (.mkdirs d)
@@ -139,7 +142,9 @@
         proved #(set (keep (fn [l] (when (= :proved (:status l)) (:law l))) (:laws %)))
         first-run (check)
         f (cache-file-of dir)
+        tf (traces-file-of dir)
         c (clojure.edn/read-string (slurp f))
+        t (clojure.edn/read-string (slurp tf))
         forget (fn [c] (assoc c :laws {}))]
     (is (= 4 (count (proved first-run))))
     (testing "with the results gone, each law's old proof is replayed, and nothing is searched"
@@ -149,16 +154,18 @@
         (is (every? #(= [:replay] (mapv :name (:attempts %))) (filter #(= :proved (:status %)) (:laws r))))
         (is (every? :replayed (filter #(= :proved (:status %)) (:laws r))))))
     (testing "a proof of some other law is rejected, and the law is searched for again"
-      (let [ks (vec (keys (:traces c)))
-            rotated (zipmap ks (map (:traces c) (concat (rest ks) [(first ks)])))]
-        (spit f (pr-str (assoc (forget c) :traces rotated)))
+      (let [ks (vec (keys (:traces t)))
+            rotated (zipmap ks (map (:traces t) (concat (rest ks) [(first ks)])))]
+        (spit f (pr-str (forget c)))
+        (spit tf (pr-str (assoc t :traces rotated)))
         (let [r (check)]
           (is (= (proved first-run) (proved r)))
           (doseq [l (:laws r) :when (= :proved (:status l))]
             (is (= {:name :replay :outcome :rejected} (select-keys (first (:attempts l)) [:name :outcome])) (str (:law l)))
             (is (not (:replayed l)))))))
     (testing "a bogus proof never proves anything"
-      (spit f (pr-str (assoc (forget c) :traces (zipmap (keys (:traces c)) (repeat {:by :cases :proofs [{:by :rewriting}]})))))
+      (spit f (pr-str (forget c)))
+      (spit tf (pr-str (assoc t :traces (zipmap (keys (:traces t)) (repeat {:by :cases :proofs [{:by :rewriting}]})))))
       (is (every? #(not (:replayed %)) (:laws (check)))))))
 
 ;; --- suggestions ----------------------------------------------------------------

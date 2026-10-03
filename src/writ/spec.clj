@@ -4461,10 +4461,15 @@
    "writ/prove.clj" "writ/prove/term.clj" "writ/prove/rewrite.clj" "writ/prove/translate.clj"
    "writ/prove/scheme.clj" "writ/prove/check.clj" "writ/prove/smt.clj" "writ/prove/symbolic.clj"
    "writ/solve.clj" "writ/solve/pre.clj" "writ/solve/search.clj" "writ/solve/simplex.clj"
-   "writ/solve/cert.clj"])
+   "writ/solve/cdcl.clj" "writ/solve/cert.clj"])
 
 (def ^:private writ-version
-  (delay (apply str (map #(or (some-> (io/resource %) slurp) "") writ-sources))))
+  "Which writ made a cache: each source by name, length and hash.  A cache
+  holds it, and a key the contracts are kept by, so it is short."
+  (delay (pr-str (mapv (fn [src]
+                         (let [text (or (some-> (io/resource src) slurp) "")]
+                           [src (count text) (hash text)]))
+                       writ-sources))))
 
 (defn- spit-whole!
   "Write text to file f whole: to a file of its own first, then renamed
@@ -4484,24 +4489,43 @@
   [dir [spec-ns target]]
   (io/file dir (str spec-ns "--" target ".edn")))
 
+(defn- traces-file
+  "The traces of a cache, in a file of their own: most of its bytes, and
+  read only when a law's result is not in the cache."
+  [dir [spec-ns target]]
+  (io/file dir (str spec-ns "--" target ".traces.edn")))
+
+(defn- read-cache
+  "The map in cache file f, when it was made by this writ, else nil."
+  [f version]
+  (try (when (.exists f)
+         (let [c (edn/read-string (slurp f))]
+           (when (= version (:version c)) c)))
+       (catch Throwable _ nil)))
+
 (defn- load-proofs
   "The proof cache for a spec and target, when it was made by this writ:
-  {:laws {key result} :traces {law trace}}, or empty.  A law's key holds
-  everything its proof can rest on -- the law, its hint, the lemmas it may
-  cite, and the definitions it reaches, whole -- so a result is never taken
-  for a different law or different code.  A trace is only a candidate:
-  the checker replays it against the code as it is now."
+  {:laws {key result}}, or empty.  A law's key holds everything its proof
+  can rest on -- the law, its hint, the lemmas it may cite, and the
+  definitions it reaches, whole -- so a result is never taken for a
+  different law or different code."
   [dir spec-ns version]
-  (or (try (let [f (cache-file dir spec-ns)]
-             (when (.exists f)
-               (let [c (edn/read-string (slurp f))]
-                 (when (= version (:version c)) (select-keys c [:laws :traces])))))
-           (catch Throwable _ nil))
-      {:laws {} :traces {}}))
+  {:laws (or (:laws (read-cache (cache-file dir spec-ns) version)) {})})
 
-(defn- save-proofs! [dir spec-ns version cache]
+(defn- load-traces
+  "The cached traces of a spec and target, {law trace}, or empty.  A trace
+  is only a candidate: the checker replays it against the code as it is
+  now."
+  [dir spec-ns version]
+  (or (:traces (read-cache (traces-file dir spec-ns) version)) {}))
+
+(defn- save-proofs!
+  "Keep the laws' results, and the traces when they were read or added."
+  [dir spec-ns version cache traces]
   (try (.mkdirs (io/file dir))
        (spit-whole! (cache-file dir spec-ns) (pr-str (assoc cache :version version)))
+       (when traces
+         (spit-whole! (traces-file dir spec-ns) (pr-str {:version version :traces traces})))
        (catch Throwable _ nil)))
 
 (defn- canonical-names
@@ -4817,7 +4841,9 @@
                                    (prover/contract-rules tenv assumed-sigs))))
           ;; a proof found before, from the same law, lemmas and the code it
           ;; reaches, by the same writ, is the same proof
-          cached (atom (if cache-dir (load-proofs cache-dir [spec-ns target] @writ-version) {:laws {} :traces {}}))
+          cached (atom (if cache-dir (load-proofs cache-dir [spec-ns target] @writ-version) {:laws {}}))
+          ;; read only when a law is not in the cache
+          traces (delay (atom (if cache-dir (load-traces cache-dir [spec-ns target] @writ-version) {})))
           fresh (atom false)]
       ;; a law proved here is a lemma for any law proved after it; one that
       ;; is only tested, or that a test refutes, never is.  Passes repeat
@@ -4874,10 +4900,10 @@
                             ;; say "not proved", and a counterexample in it is
                             ;; run on the code again before it is believed.
                             ;; The law's last proof is replayed first
-                            (let [pr (attempt* r lemmas (get-in @cached [:traces law-id]))]
+                            (let [pr (attempt* r lemmas (get @@traces law-id))]
                               (swap! cached assoc-in [:laws k]
                                      (select-keys pr [:proved :summary :lemmas :reason :counterexample :stuck]))
-                              (when (:trace pr) (swap! cached assoc-in [:traces law-id] (:trace pr)))
+                              (when (:trace pr) (swap! @traces assoc law-id (:trace pr)))
                               (reset! fresh true)
                               pr))))
             ;; an input that meets a law's hypotheses, from the solver: a
@@ -5047,7 +5073,8 @@
         (loop [[rs lemmas] (pass [results init] nil), before (count init)]
           (let [[rs2 lemmas2] (pass [rs lemmas] (subvec lemmas before))]
             (if (= (count lemmas2) (count lemmas))
-              (do (when (and cache-dir @fresh) (save-proofs! cache-dir [spec-ns target] @writ-version @cached))
+              (do (when (and cache-dir @fresh) (save-proofs! cache-dir [spec-ns target] @writ-version @cached
+                                                            (when (realized? traces) @@traces)))
                   (let [rs2 (mapv #(dissoc % :unproved-final) rs2)
                         rs2 (if (false? (:prove opts))
                               rs2
