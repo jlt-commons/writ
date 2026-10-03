@@ -618,6 +618,25 @@
                   (recur (into todo (keep (fn [[_ d ps]] (when (:body d) [(:body d) ps])) fresh))
                          (into seen (map (fn [[q _ ps]] [q ps]) fresh))))))))))))
 
+(defn- reaches-recursion?
+  "Can terms reach a call of a recursive definition: is one named in them,
+  in a rewrite rule normalizing them may apply, or in the body of a
+  definition named there, and so on?  A loop's guards come only from such
+  calls, so when none is reachable no loop of the code climbs on a law's
+  integer, and the terms need not be normalized to find that out."
+  [defs rules terms]
+  (let [named (fn [x] (for [s (tree-seq coll? seq x)
+                            :when (and (vector? s) (contains? #{:app :dfn} (first s)))]
+                        (second s)))]
+    (loop [todo (into (vec (mapcat named terms)) (mapcat named rules)), seen #{}]
+      (if-let [f (peek todo)]
+        (let [todo (pop todo)
+              d (get defs f)]
+          (cond (contains? seen f) (recur todo seen)
+                (:recursive? d) true
+                :else (recur (into todo (named (:body d))) (conj seen f))))
+        false))))
+
 (defn prove-law
   "Try to prove a law.  prop is the desugared law, its names qualified;
   defs are the translated definitions; target the implementation's ns;
@@ -704,9 +723,11 @@
           ;; a loop of the code that climbs on a law's integer names the
           ;; induction its recursion follows: that one goes first, before
           ;; rewriting unrolls the loop a split at a time
-          loop-climbs? (some (fn [[v ty]] (and (contains? '#{Nat Int} ty)
-                                                (seq (fuelled #(climbing-bounds opts @terms v :loops-only true)))))
-                             bs)
+          loop-climbs? (and (some (fn [[_ ty]] (contains? '#{Nat Int} ty)) bs)
+                            (reaches-recursion? (:defs opts) (:lemmas opts) (concat (:hyps g) (:goals g)))
+                            (some (fn [[v ty]] (and (contains? '#{Nat Int} ty)
+                                                    (seq (fuelled #(climbing-bounds opts @terms v :loops-only true)))))
+                                  bs))
           structural (for [[v ty] bs-order :when (on-int? v ty)] [[:induct v] #(by-induction opts g v ty)])
           induction (concat climbing structural)
           groups {:symbolic-cases [(first symbolic)] :symbolic [(second symbolic)] :rewriting rewriting
