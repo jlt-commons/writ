@@ -4844,7 +4844,11 @@
                                                 :guards (set (for [[_ r] refs] (symbol (str spec-ns) (str (:pred-name r)))))
                                                 ;; a law a test refuted is tried only to catch a
                                                 ;; prover that would prove it: briefly
-                                                :sym-budget (when (= :failed (:status r)) 500)}))
+                                                :sym-budget (when (= :failed (:status r)) 500)
+                                                ;; a law its tests passed, which the
+                                                ;; solver's counterexample may refute
+                                                :refutes? (when (= :tested (:status r))
+                                                            #(some? (refuted ctx r %)))}))
                            (catch Throwable e
                              {:proved false :reason (str "the prover failed: " (ex-message e))})))
             ;; that a step never throws is proved only by running it
@@ -4985,7 +4989,7 @@
                              ;; a hypothesis no test met: where the solver
                              ;; finds the law false, running it there says so
                              (and (:no-hypothesis r) (not (:proved pr)) (refuted ctx r (:counterexample pr)))
-                             [(dissoc (refuted ctx r (:counterexample pr)) :no-hypothesis) nil]
+                             [(-> (refuted ctx r (:counterexample pr)) (dissoc :no-hypothesis) (assoc :unproved-final true)) nil]
 
                              ;; a law whose hypothesis never held would be
                              ;; true of every input and test nothing; the
@@ -5007,8 +5011,10 @@
                              (and (:proved pr) (not (thrown? r)))
                              [(assoc r :prover-bug true :proof (:summary pr)) nil]
 
+                             ;; refuted by the prover's own counterexample: no
+                             ;; later pass need try it again
                              (and (= :tested (:status r)) (refuted ctx r (:counterexample pr)))
-                             [(refuted ctx r (:counterexample pr)) nil]
+                             [(assoc (refuted ctx r (:counterexample pr)) :unproved-final true) nil]
 
                              (= :tested (:status r))
                              [(cond-> (assoc r :unproved (:reason pr))

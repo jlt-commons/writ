@@ -72,8 +72,8 @@
                     c))))
        (first (filter #(and (contains? #{:le :ieq} (head %)) (own? %))
                       (concat (rw/open-conditions n)
-                              (for [[f v] (t/sort-printed key (:facts ctx))
-                                    :when (and (true? v) (= :if (head f)))
+                              (for [[f _] (t/sort-printed key (filter (fn [[f v]] (and (true? v) (= :if (head f))))
+                                                                      (:facts ctx)))
                                     c (rw/open-conditions f)
                                     :when (not (contains? (:facts ctx) c))]
                                 c)
@@ -123,9 +123,10 @@
   computes."
   [ctx n limit]
   (first
-    (for [x (t/sort-printed (distinct (t/subterms n)))
-          :when (and (= :call (head x))
-                     (not (contains? '#{= not not= < <= > >= + - * inc dec zero? pos? neg?} (second x))))
+    ;; filtered before the sort: the same order, printing fewer terms
+    (for [x (t/sort-printed (filter #(and (= :call (head %))
+                                          (not (contains? '#{= not not= < <= > >= + - * inc dec zero? pos? neg?} (second %))))
+                                    (distinct (t/subterms n))))
           v (drop 2 x)
           :when (and (symbol? v) (rw/int-term? ctx v))
           :let [bound (fn [sign]
@@ -154,8 +155,8 @@
   "A variable of a data type the goal or a fact takes apart, as (first v)
   or (= v ...): splitting it into its constructors reveals the tag."
   [opts n ctx]
-  (first (for [x (t/sort-printed (distinct (mapcat t/subterms (cons n (keys (:facts ctx))))))
-               :when (and (= :call (head x)) (contains? '#{first =} (second x)))
+  (first (for [x (t/sort-printed (filter #(and (= :call (head %)) (contains? '#{first =} (second %)))
+                                         (distinct (mapcat t/subterms (cons n (keys (:facts ctx)))))))
                v (drop 2 x)
                :when (and (symbol? v) (sc/data-cases opts v))]
            v)))
@@ -643,11 +644,13 @@
   lemmas are the laws proved before it, as {:name :prop}; lemma, true
   for a lemma of a proof namespace, which may be about clojure.core alone;
   sigs, the target's signatures, {name {:params :ret}}; contracts, the
-  rules prove-contracts gave for them.
+  rules prove-contracts gave for them; refutes?, when given, says whether
+  a counterexample (values of the law's variables) is one running the code
+  confirms.
   Returns {:proved true :trace :summary :lemmas} or {:proved false :reason
   :stuck}, and :attempts, what each strategy tried did: {:name :outcome
   :fuel :ms}, the outcome :proved, :failed, :fuel or :rejected."
-  [{:keys [prop defs tenv target own fuel lemmas rets total hint lemma sigs contracts replay prover guards sym-budget]}]
+  [{:keys [prop defs tenv target own fuel lemmas rets total hint lemma sigs contracts replay prover guards sym-budget refutes?]}]
   (try
     (let [cfg (merge default-config prover)
           [bs0 body] (split-foralls prop)
@@ -744,7 +747,20 @@
                   loop-climbs? (in-order (:loop-order cfg))
                   :else (in-order (:order cfg)))
           ;; one attempt at a time: the first that proves it ends the search
-          first-proof (fn [ts] (some #(let [r (attempt %)] (when (first r) r)) ts))
+          ;; the solver's counterexample, of the law's variables, or nil
+          cex (delay (when (seq bs)
+                       (some->> (first (keep #(sym/counterexample opts (:hyps g) %) (:goals g)))
+                                (recompose bs0))))
+          ;; a law the code refutes has no proof to find: once a strategy
+          ;; fails, the counterexample, confirmed by running the code there,
+          ;; ends the search
+          refuted (delay (boolean (and refutes? @cex (refutes? @cex))))
+          first-proof (fn [ts] (loop [[t & more] ts]
+                                 (when t
+                                   (let [r (attempt t)]
+                                     (cond (first r) r
+                                           @refuted nil
+                                           :else (recur more))))))
           ;; a proof found before is checked first: the checker, not the
           ;; search, is what a proof rests on, so an old one the code still
           ;; bears out needs no search
@@ -761,7 +777,7 @@
                          [replay (:unfolded replayed)]
                          (or (first-proof tries) [nil #{}]))
           ;; a fold into an accumulator: prove it adds, then try again with that
-          [trace used] (if trace
+          [trace used] (if (or trace @refuted)
                          [trace used]
                          (or (first
                                (for [cand (accumulators opts (fuelled
@@ -787,8 +803,7 @@
                                   :stuck (stuck-report @stuck @attempts)
                                   ;; the terms themselves, for proposing lemmas; not cached
                                   :stuck-raw (vec (take 6 (stuck-ranked @stuck @attempts)))}
-                           (seq bs) (merge (when-let [cex (first (keep #(sym/counterexample opts (:hyps g) %) (:goals g)))]
-                                             {:counterexample (recompose bs0 cex)})))
+                           @cex (assoc :counterexample @cex))
             (and (empty? target-used) (not lemma)) {:proved false :reason "the proof does not use the code"}
             (not (:ok checked)) (do (swap! attempts #(conj (pop %) (assoc (peek %) :outcome :rejected)))
                                     {:proved false
@@ -825,7 +840,7 @@
   (distinct
     (for [{:keys [goal facts types]} stuck
           generalize? [true false]
-          :let [fact-terms (for [[f v] (t/sort-printed key facts) :when (boolean? v)]
+          :let [fact-terms (for [[f v] (t/sort-printed key (filter (comp boolean? val) facts))]
                              (if v f [:call 'not f]))
                 calls (when generalize?
                         (distinct (for [x (t/subterms goal)

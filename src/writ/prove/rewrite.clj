@@ -7,14 +7,14 @@
   (well-typed code returns a value of its type, or throws), and writ's
   law checking catches the throwing cases by running every proved law.
 
-  Structural rules are pattern -> template pairs matched by core.logic
-  unification.  The rest are computed: literals, equality, and integer
+  Structural rules are pattern -> template pairs: a left side's pattern
+  variables are bound by matching it against a term, and the right side
+  is built from them.  The rest are computed: literals, equality, and integer
   arithmetic, which is kept in a linear normal form so that + is
   associative and commutative only where it truly is -- on integers,
   never on floats.  `self-test` checks every pattern rule against the
   runtime with test.check."
-  (:require [clojure.core.logic :as l]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [clojure.test.check :as tc]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
@@ -178,7 +178,9 @@
 
 (defn- pvars [pat] (distinct (filter pvar? (tree-seq vector? seq pat))))
 
-(defn- ->logic [pat m]
+(defn- ->logic
+  "Pattern pat with its variables put in from bindings m."
+  [pat m]
   (cond (pvar? pat) (get m pat)
         (vector? pat) (mapv #(->logic % m) pat)
         :else pat))
@@ -190,35 +192,27 @@
 (def ^:private indexed
   (delay (group-by (comp rule-key second) pattern-rules)))
 
-(defn- skeleton
-  "t cut down to what `pat` inspects: each subterm under a pattern variable
-  becomes a placeholder, recorded in `holes`.  core.logic's unification is
-  exponential in term size on jolt, so it only ever sees the skeleton."
-  [pat x holes]
+(defn- match
+  "The bindings m extended so that pattern pat is term t, or nil.  A
+  pattern variable binds the subterm where it stands; every rule's left
+  side names each of its variables once."
+  [pat t m]
   (cond
-    (pvar? pat) (if (vector? x)
-                  (let [h (symbol (str "\u00a7" (count @holes)))]
-                    (swap! holes assoc h x)
-                    h)
-                  x)
-    (and (vector? pat) (vector? x) (= (count pat) (count x)))
-    (mapv #(skeleton %1 %2 holes) pat x)
-    :else x))
-
-(defn- fill-holes [x holes]
-  (cond (and (symbol? x) (contains? holes x)) (get holes x)
-        (vector? x) (mapv #(fill-holes % holes) x)
-        :else x))
+    (pvar? pat) (if (contains? m pat) (when (= (get m pat) t) m) (assoc m pat t))
+    (vector? pat) (when (and (sequential? t) (= (count pat) (count t)))
+                    (loop [ps (seq pat), ts (seq t), m m]
+                      (if ps
+                        (when-let [m (match (first ps) (first ts) m)]
+                          (recur (next ps) (next ts) m))
+                        m)))
+    :else (when (= pat t) m)))
 
 (defn match-rule
-  "Rewrite t by one pattern rule, or nil: core.logic unifies the rule's
-  left side with t's skeleton and reifies its right side."
+  "Rewrite t by one pattern rule, or nil: the rule's left side matched
+  against t, and its right side built from what that bound."
   [[_ lhs rhs] t]
-  (let [holes (atom {})
-        sk (skeleton lhs t holes)
-        m (zipmap (pvars lhs) (repeatedly l/lvar))
-        r (l/run 1 [q] (l/== (->logic lhs m) sk) (l/== q (->logic rhs m)))]
-    (when (seq r) (fill-holes (first r) @holes))))
+  (when-let [m (match lhs t {})]
+    (->logic rhs m)))
 
 (defn- apply-patterns [rules t]
   (some #(match-rule % t) rules))

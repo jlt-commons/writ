@@ -190,7 +190,7 @@
                                                        (= 1 (count open)) (reduced (conj open l))
                                                        :else (conj open l)))
                                                [] c)]
-                              (cond (= :sat open) nil
+                              (cond (identical? :sat open) nil
                                     (empty? open) (do (vreset! conflict true) (reduced nil))
                                     (empty? (rest open)) (do (assign! (first open))
                                                              (when @conflict (reduced nil)))
