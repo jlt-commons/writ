@@ -85,7 +85,10 @@
   their own, and this one is the same on every run.  Each is printed once;
   sort-by with pr-str prints both sides of every comparison."
   ([xs] (sort-printed identity xs))
-  ([kf xs] (map peek (sort-by first (map (fn [x] [(pr-str (kf x)) x]) xs)))))
+  ([kf xs] (if (next xs)
+             (map peek (sort-by first (map (fn [x] [(pr-str (kf x)) x]) xs)))
+             ;; one, or none, is in order: nothing to print
+             (or (seq xs) ()))))
 
 (defn var? [t] (symbol? t))
 

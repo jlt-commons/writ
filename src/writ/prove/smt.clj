@@ -69,8 +69,7 @@
   "{:formula :decls} saying the facts of ctx imply goal n is truthy."
   [ctx n]
   (let [atoms (atom {:names {} :decls {}})
-        facts (vec (for [[c v] (t/sort-printed key (:facts ctx))
-                         :when (boolean? v)]
+        facts (vec (for [[c v] (t/sort-printed key (filter (comp boolean? val) (:facts ctx)))]
                      (let [f (truth ctx atoms c)] (if v f [:not f]))))
         g (truth ctx atoms n)]
     {:formula [:=> (into [:and true] facts) g]

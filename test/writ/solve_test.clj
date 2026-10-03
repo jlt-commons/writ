@@ -305,17 +305,15 @@
 
 (deftest a-backjump-past-a-thousand-assignments-keeps-the-trail-whole
   ;; jolt's subvec just past a trie boundary (1025 of more) leaves a vector
-  ;; whose next conj fails; the search truncates by popping instead
-  (let [backjump @#'writ.solve.cdcl/backjump
+  ;; whose next conj fails; a backjump truncates the levels' limits and
+  ;; tableaus by popping instead
+  (let [truncate @#'writ.solve.cdcl/truncate
         n 1100
-        lits (vec (for [i (range n)] [:bool (symbol (str "b" i)) true]))
-        st {:trail lits :lims (vec (range 0 n 1)) :tabs (vec (repeat (inc n) :t))
-            :val {} :level {} :reason {}}
-        st2 (backjump st 1025)]
-    (is (= 1025 (count (:trail st2))))
-    (is (= 1100 (count (reduce conj (:trail st2) (range 75)))))
-    (is (= 1100 (count (reduce conj (:lims st2) (range 75)))))
-    (is (= 1100 (count (reduce conj (:tabs st2) (range 74)))))))
+        lims (truncate (vec (range 0 n 1)) 1025)
+        tabs (truncate (vec (repeat (inc n) :t)) 1026)]
+    (is (= 1025 (count lims)))
+    (is (= 1100 (count (reduce conj lims (range 75)))))
+    (is (= 1100 (count (reduce conj tabs (range 74)))))))
 
 ;; --- congruence on demand --------------------------------------------------------
 
