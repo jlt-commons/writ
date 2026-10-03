@@ -2413,8 +2413,9 @@
       (if (::outside (ex-data e)) :outside (throw e)))))
 
 (def budget
-  "Decisions the solver may make on a goal evaluated whole."
-  5000)
+  "Decisions the solver may make on a goal evaluated whole.  pong's
+  win and play-step laws take more than 5000."
+  20000)
 
 (defn- key-of
   "[key rest-of-ints]: the value of key type kt the integers ints begin with."
