@@ -561,7 +561,11 @@ of the algorithm (that is the code).
   circular.
 - **Give an example or two.** `(example price [6000] 12000)` is checked as
   a law, and the other laws must pin `price` down at 6000 as well: a
-  stand-in that agrees everywhere but there must break one of them.
+  stand-in that agrees everywhere but there must break one of them. A
+  law is run there when it calls the fn on its variables, or on a value
+  built of them that the example's arguments fit: `(size [:add a b])`
+  is run at `(example size [[:add [:num 1] [:var :x]]] 3)` with `a` and
+  `b` taken from it. Keep the examples; add the law that reaches them.
 - **Reach for the strong kinds of law.** Hughes ("How to Specify It!",
   2019) planted eight bugs in a search tree: laws that only said the
   result was valid caught three; every bug was caught by each of these:
@@ -666,10 +670,23 @@ as a literal and take it apart with `case` on the tag:
 ```
 
 The `case` must list every constructor, or carry a default, and name no
-others. A clause destructures only its constructor's fields. A literal
-`[:Node ...]` carries exactly the declared fields, of fitting types. Read
-the tag with `case (first t)` only: `first`, `second` or `nth` of a data
-value anywhere else is rejected.
+others. A clause destructures only its constructor's fields, or reads
+them by position, `(second t)` or `(nth t 2)`; a clause of several
+constructors, `(:add :mul) ...`, reads a field where they agree on its
+type. A literal `[:Node ...]` carries exactly the declared fields, of
+fitting types. Read the tag with `case (first t)` only: `first`,
+`second` or `nth` of a data value outside a clause that fixed its
+constructor is rejected. A case with no default never reaches its
+no-match throw on a value of the type, so its last test is no coverage
+note.
+
+The prover reads a value of a data type -- a variable of it, or a call
+whose signature's return type it proved from the code -- by its
+constructor: under a test of the tag, its fields have their declared
+types, and when the tests rule out every constructor but one, it is
+that one. Laws like `(= (simplify [:mul [:num 0] x]) [:num 0])` or
+`(= (evaluate [:add a b] env) (+ (evaluate a env) (evaluate b env)))`
+are proved, not only tested.
 
 ### Records
 
