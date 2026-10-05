@@ -727,7 +727,13 @@ test no law took both ways is listed: `` `place-order`: (priced? items
 prices) was never false``. Each is a case the laws never try: if it can
 happen, add a law that says what the code does then (often an input the
 law built to meet a hypothesis leaves it out); if it cannot, the branch is
-dead. `{:coverage false}` skips it.
+dead. Each operand of an `and` or `or` is run in every trial too, the
+value the code sees unchanged, so a case one operand alone decides is
+seen: `` `orderable?`: in (and (priced? ...) (stocked? ...)), (priced?
+...) was never false while the others were true`` means no law tried an
+unpriced item that was in stock, so nothing says what happens then. A
+nil test that guards the operands after it is not named.
+`{:coverage false}` skips it.
 
 `:static` fails first. A static failure is a single `Writ:` message, and no
 law runs until it is fixed. After that, each law has a `:status`:

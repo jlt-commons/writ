@@ -6126,6 +6126,51 @@
   (swap! coverage update [target id] (fnil conj #{}) (boolean v))
   v)
 
+(def ^:private combos
+  "[target id] -> the truth of each operand of an `and` or an `or`, one
+  vector per evaluation, :throw for an operand that threw run on its own."
+  (atom {}))
+
+(defn -combo
+  "An `and` (op :and) or `or` of the thunks fs, as Clojure evaluates it:
+  the value it gives, its throws.  Each operand it would skip is run too,
+  its throw caught, so the trial notes how every operand came out."
+  [target id op fs]
+  (let [n (count fs)
+        decided (fn [v] (if (= :and op) (not v) (boolean v)))]
+    (loop [i 0, outs [], result (if (= :and op) true nil), done false]
+      (if (= i n)
+        (do (swap! combos update [target id] (fnil conj #{}) outs)
+            result)
+        (if done
+          (let [o (try (boolean ((nth fs i))) (catch Throwable _ :throw))]
+            (recur (inc i) (conj outs o) result true))
+          (let [v ((nth fs i))]
+            (recur (inc i) (conj outs (boolean v)) v (decided v))))))))
+
+(defn- probe-combos
+  "form with each `and` and `or` of two or more operands run by -combo:
+  [form' combos], combos id -> {:op :parts}, the operands as written."
+  [form target ids]
+  (let [found (atom {})
+        walk (fn walk [f]
+               (cond
+                 (and (seq? f) (= 'quote (first f))) f
+                 ;; an operand that recurs is in the tail of the fn around it,
+                 ;; and a thunk would take the recur: that one is left as it is
+                 (and (seq? f) (contains? '#{and or} (first f)) (< 2 (count f))
+                      (not-any? #(= 'recur %) (tree-seq coll? seq f)))
+                 (let [id (swap! ids inc)
+                       parts (vec (rest f))]
+                   (swap! found assoc id {:op (keyword (name (first f))) :parts parts})
+                   (list `-combo (list 'quote target) id (keyword (name (first f)))
+                         (vec (for [p parts] (list 'fn [] (walk p))))))
+                 (seq? f) (apply list (map walk f))
+                 (vector? f) (mapv walk f)
+                 (map? f) (into {} (map (fn [[k v]] [(walk k) (walk v)])) f)
+                 :else f))]
+    [(walk form) @found]))
+
 (defn- probe-tests
   "form, its macros expanded, with each if's test noted by -cov: [form'
   tests], tests id -> the test as written.  A test on a local that an
@@ -6174,23 +6219,56 @@
                           :let [{:keys [name params body]} (defn-parts f)
                                 v (ns-resolve tns name)]
                           :when (and (var? v) (fn? @v) (vector? params))
-                          :let [expanded (binding [*ns* tns] (walk/macroexpand-all (cons 'do body)))
+                          :let [[combined cs] (probe-combos (cons 'do body) target ids)
+                                expanded (binding [*ns* tns] (walk/macroexpand-all combined))
                                 [probed tests] (probe-tests expanded target ids)
                                 g (binding [*ns* tns] (eval (list 'fn params probed)))]]
-                      [v @v g (into {} (for [[id t] tests] [id {:fn name :test t}]))]))]
+                      [v @v g (into {} (for [[id t] tests] [id {:fn name :test t}]))
+                       (into {} (for [[id c] cs] [id (assoc c :fn name)]))]))]
       (doseq [[v _ g] made] (alter-var-root v (constantly g)))
       {:restore (mapv (fn [[v f]] [v f]) made)
-       :tests (apply merge {} (map #(nth % 3) made))})
+       :tests (apply merge {} (map #(nth % 3) made))
+       :combos (apply merge {} (map #(nth % 4) made))})
     (catch Throwable _ nil)))
+
+(defn- undecided-parts
+  "The operands of the code's `and`s and `or`s that no trial saw decide it
+  on their own: false while every other operand of an `and` was true, or
+  true while every other of an `or` was false.  An operand counts only
+  where it once came out that way with the others run cleanly, so a
+  guard and what it guards, (and (some? x) (pos? (:n x))), says nothing."
+  [target found]
+  (let [seen @combos]
+    (vec (for [[id {:keys [op parts] fname :fn}] (sort-by key found)
+               :let [obs (get seen [target id])]
+               :when (seq obs)
+               [i part] (map-indexed vector parts)
+               :let [deciding (if (= :and op) false true)
+                     others (if (= :and op) true false)
+                     clean (filter #(and (= deciding (nth % i)) (not-any? #{:throw} %)) obs)
+                     alone (some #(every? (fn [[j o]] (or (= j i) (= o others))) (map-indexed vector %)) clean)]
+               ;; a nil test of a local the later operands read guards them:
+               ;; where it fails they cannot say anything of their own
+               :let [guarded (let [x (cond (symbol? part) part
+                                           (and (seq? part) (contains? '#{some? seq} (first part))) (second part)
+                                           (and (seq? part) (= 'not (first part)) (seq? (second part))
+                                                (= 'nil? (first (second part)))) (second (second part))
+                                           :else nil)]
+                               (and (symbol? x)
+                                    (some #(some #{x} (tree-seq coll? seq %)) (drop (inc i) parts))))]
+               :when (and (seq clean) (not alone) (not guarded))]
+           (str "`" fname "`: in " (pr-str (cons (symbol (name op)) parts)) ", " (pr-str part) " was never "
+                deciding " while the others were " others
+                "; each time it was " deciding ", another was too")))))
 
 (defn- one-sided-tests
   "The tests of the code the laws took one way only, as notes."
   [target tests]
   (let [seen @coverage]
-    (vec (for [[id {:keys [fn test]}] (sort-by key tests)
+    (vec (for [[id {:keys [test] fname :fn}] (sort-by key tests)
                :let [outs (get seen [target id])]
                :when (= 1 (count outs))]
-           (str "`" fn "`: " (pr-str test) " was never " (if (contains? outs true) "false" "true"))))))
+           (str "`" fname "`: " (pr-str test) " was never " (if (contains? outs true) "false" "true"))))))
 
 (defn- unwritten?
   "Does target have no namespace loaded and no source to load it from?"
@@ -6224,14 +6302,16 @@
          (let [_ (require target)
                probes (when-not (false? (:coverage opts))
                         (swap! coverage #(into {} (remove (fn [[[t] _]] (= t target))) %))
+                        (swap! combos #(into {} (remove (fn [[[t] _]] (= t target))) %))
                         (install-probes! target))]
            (try
              (let [r (check* spec-ns opts)
                    notes (when (and probes (seq (:laws r)) (not (:no-code r)))
-                           (one-sided-tests target (:tests probes)))]
+                           (concat (one-sided-tests target (:tests probes))
+                                   (undecided-parts target (:combos probes))))]
                (cond-> r
                  (seq notes)
-                 (-> (assoc :one-way-tests notes)
+                 (-> (assoc :one-way-tests (vec notes))
                      (update :message str
                              "\n\n  tests of the code no law took both ways; each is a case the laws never"
                              " try. If it can happen, say what the code does then:\n"

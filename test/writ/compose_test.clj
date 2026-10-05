@@ -82,3 +82,11 @@
   (let [r (spec/check 'writ.spec-demo.fee-spec {:seed 1})]
     (is (some #(re-find #"`fee`: \(> n \(\* 40 40\)\) was never true" %) (:one-way-tests r)) (pr-str (:one-way-tests r)))
     (is (re-find #"no law took both ways" (:message r)))))
+
+(deftest an-operand-that-never-decides-alone-is-named
+  (let [r (spec/check 'writ.spec-demo.admit-spec {:seed 1})]
+    (is (some #(re-find #"`admit`: in \(and \(<= 18 age\) member\), \(<= 18 age\) was never false while the others were true" %)
+              (:one-way-tests r))
+        (pr-str (:one-way-tests r)))
+    (is (not-any? #(re-find #", member was never" %) (:one-way-tests r))
+        "a non-member is tried with an adult's age")))
