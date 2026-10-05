@@ -90,3 +90,13 @@
         (pr-str (:one-way-tests r)))
     (is (not-any? #(re-find #", member was never" %) (:one-way-tests r))
         "a non-member is tried with an adult's age")))
+
+(deftest a-step-is-taken-only-where-its-fn-requires-allow
+  (let [r (spec/check 'writ.spec-demo.purse-spec {:seed 1})]
+    (is (:ok r) (:message r))
+    (is (some #(= 'wallet:purse:spend:refused (:law %)) (:laws r)))))
+
+(deftest a-max-whose-other-side-never-wins-is-named
+  (let [r (spec/check 'writ.spec-demo.fee-spec {:seed 1})]
+    (is (some #(re-find #"`floor-fee`: \(>= 10 \(quot n 100\)\) was never false" %) (:one-way-tests r))
+        (pr-str (:one-way-tests r)))))

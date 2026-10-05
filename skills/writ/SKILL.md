@@ -155,7 +155,8 @@ failures: a law over every input may already answer one.
 - An edge argument written `'name` is not a type but the spec's own value
   of that name, passed as is: `[scan (Vec Pattern) 'yes Nat]` hands
   `scan` the spec's `yes` guard, since a fn cannot be generated.
-- `:tested {state "why"}` lets the edges out of a state off proof, as
+- `:tested {state "why"}` lets the edges out of a state off proof, and
+  `:tested {[state f] "why"}` one step of it, as
   `{:require :tested :because "why"}` does for a law. A report says so when
   such an edge gets proved after all, so the marker can go.
 - `:start`, `:final`, `:never`, `:before` are rules of the graph itself.

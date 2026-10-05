@@ -751,7 +751,7 @@
           (base-at st m x)
           (:stores (:amap m))))
 
-(declare apply-fn on-path pruned ev)
+(declare apply-fn on-path pruned ev run-steps)
 
 (defn- keyed-step
   "For a fn value (fn [acc e] (assoc acc K V)), K the entry's key and V
@@ -788,6 +788,12 @@
                  [(into [:or false] (for [[p k _] (:map m)] (conj-f p (same-key st x k))))
                   (map-lookup st m x {:nil true})])
     (:nil m) [false {:nil true}]
+    ;; a map's entries that pass the view's filters
+    (= :entries (:op (:mmap m)))
+    (let [{:keys [a steps]} (:mmap m)
+          [pa va] (mlookup st a x)
+          [c _] (run-steps st steps pa {:vec [x va] :kind :vector})]
+      [(define! st :bool c) va])
     ;; the keys of a map, each holding x
     (= :keys-of (:op (:mmap m)))
     (let [[pa _] (mlookup st (:a (:mmap m)) x)] [pa (:x (:mmap m))])
@@ -1803,13 +1809,20 @@
                                   :else (give-up! "contains? on a value that is not a set or map")))
                        a b)
       into (lift2 st (fn [x y]
-                       (when-not (:set x) (give-up! "into a value that is not a set"))
-                       (let [sy (if (:set y) (:set y) (:set (finite-set st (map (fn [e] [true e]) (seq-of y)) false)))
-                             sx (:set x)]
-                         {:set {:mem (fn [e] [:or ((:mem sx) e) ((:mem sy) e)])
-                                :elems (when (and (:elems sx) (:elems sy)) (into (:elems sx) (:elems sy)))
-                                :distinct true
-                                :elem (or (:elem sx) (:elem sy))}}))
+                       (when-not (or (:set x)
+                                     ;; a map's entries, filtered, into an empty map
+                                     (and (= [] (:map x)) (:view y) (= :entries (:proj (:view y)))
+                                          (:amap (:src (:view y)))
+                                          (every? #(= :filter (first %)) (:steps (:view y)))))
+                         (give-up! "into a value that is not a set"))
+                       (if (:map x)
+                         {:mmap {:op :entries :a (:src (:view y)) :steps (:steps (:view y))}}
+                         (let [sy (if (:set y) (:set y) (:set (finite-set st (map (fn [e] [true e]) (seq-of y)) false)))
+                               sx (:set x)]
+                           {:set {:mem (fn [e] [:or ((:mem sx) e) ((:mem sy) e)])
+                                  :elems (when (and (:elems sx) (:elems sy)) (into (:elems sx) (:elems sy)))
+                                  :distinct true
+                                  :elem (or (:elem sx) (:elem sy))}})))
                   a b)
       filter (lift st (fn [xs]
                         (if (as-view xs)

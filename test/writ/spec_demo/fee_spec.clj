@@ -7,6 +7,10 @@
 
 (ann fee [Nat -> Nat])
 
-(graph fees {:states {:n Nat} :edges {:n {[fee] #{:n}}}})
+(graph fees {:states {:n Nat} :edges {:n {[fee] #{:n} [floor-fee] #{:n}}}})
 
 (law a-small-order-is-free (forall [n Nat] (=> (<= n 100) (= 0 (fee n)))))
+
+(ann floor-fee [Nat -> Nat])
+
+(law a-small-order-pays-the-floor (forall [n Nat] (=> (<= n 100) (= 10 (floor-fee n)))))

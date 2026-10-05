@@ -372,7 +372,7 @@
   (when-not (and (simple-sym? nm) (vector? binder) (= 2 (count binder)) (simple-sym? (first binder)))
     (fail! "`refine` is (refine Name [x BaseType] predicate), had: "
            (pr-str (list 'refine nm binder '...))))
-  (when (and (some? opts) (not (and (map? opts) (= #{:build} (set (keys opts))) (simple-sym? (:build opts)))))
+  (when (and (some? opts) (not (and (map? opts) (= #{:build} (set (keys opts))) (symbol? (:build opts)))))
     (fail! "`refine " nm "` takes one option, {:build f}: f names the spec's fn that makes a base"
            " value one of the refinement, had: " (pr-str opts)))
   (let [[v base] binder
@@ -600,9 +600,9 @@
           (known! ":witnesses" (second k))))
       (when-let [t (:tested m)]
         (when-not (map? t)
-          (fail! where ": :tested is {state \"why it cannot be proved yet\"}, had " (pr-str t)))
+          (fail! where ": :tested is {state \"why it cannot be proved yet\"}, or {[state f] \"why\"}, had " (pr-str t)))
         (doseq [[st why] t]
-          (known! ":tested" st)
+          (known! ":tested" (if (vector? st) (first st) st))
           (when-not (and (string? why) (not (str/blank? why)))
             (fail! where ": :tested " (pr-str st) " needs the reason its edges cannot be proved yet"))))
       (doseq [[from es] (:edges m)]
@@ -2906,7 +2906,8 @@
   :else state.  One more law says some value passes the guard, and, for a
   test that is an `and`, one per clause says it fails while the others
   hold, so each clause rules out something of its own."
-  [[gname m :as g] refs invs]
+  ([g refs invs] (graph-obligations g refs invs nil))
+  ([[gname m :as g] refs invs contracts]
   (vec (for [{:keys [from f args tos pos guard else changes by own-when case cases wrap]}
              ;; a [first] edge out of a tuple state takes nothing a law can
              ;; judge: it is read through the edges into that state instead,
@@ -2964,12 +2965,17 @@
                    entered? (or (vector? start) (and (keyword? start) (not= from start)))
                    held (let [hs (for [[b pred] (invariants-of invs gname from)] (subst-var pred b v))]
                           (when (and entered? (seq hs)) (if (next hs) (cons 'and hs) (first hs))))
+                   ;; a step whose fn requires something is only ever taken
+                   ;; where it holds: each law of the step is under it
+                   rq (when-let [r (get-in contracts [f :requires])] (guard-of r call-args))
+                   held (cond (and held rq) (list 'and held rq) rq rq :else held)
                    pre (cond (and held test) (list 'and held test) held held :else test)
                    under (fn [p] (if pre (list '=> pre p) p))
                    step-name (str gname ":" (name from) ":" f (when wrap (str "." wrap)))
                    edge (str step-name (when case (str "#" case)))
                    sfx (when case (str "#" case))
-                   tested (get-in m [:tested from])
+                   ;; every edge out of a state, or one step of it, [state fn]
+                   tested (or (get-in m [:tested [from f]]) (get-in m [:tested from]))
                    off-proof #(cond-> % tested (assoc :opts {:require :tested :because tested}))]
              law (concat
                    (when landing?
@@ -3090,7 +3096,7 @@
                                           " never fails on its own: whenever the other clauses hold,"
                                           " so does it, and it rules out nothing they do not")
                             :step-of gname :guard-law true})))))]
-         law)))
+         law))))
 
 (defn- ensures-laws
   "A law per ann with :ensures, `f:ensures`: on arguments of f's parameter
@@ -4039,6 +4045,7 @@
                           (at-boundaries
                           (if-let [b (:build r)]
                             ;; built by the spec's own fn, then checked
+                            ;; the spec's own fn, or one of a spec it builds on, by alias
                             (let [build (some-> (ns-resolve (the-ns spec-ns) b) deref)]
                               (when-not (fn? build)
                                 (fail! "refinement `" name "` is built by `" b "`, which is not a fn of the spec"))
@@ -4277,6 +4284,21 @@
                 :total true
                 :guard-law true}))))))
 
+(defn- with-uses
+  "e with the types of the specs it builds on, which may be named in it:
+  their refinements, read in their own namespaces, under its own."
+  [e]
+  (let [deps (keep #(do (require %) (when-let [de (get @registry %)] [% de])) (:uses e))
+        own (set (map :name (:refines e)))]
+    (cond-> e
+      (seq deps) (assoc ::uses-refines (vec (for [[_ de] deps, r (:refines de)
+                                                 :when (not (contains? own (:name r)))]
+                                             r))
+                        ::uses-tenv (reduce (fn [acc [d de]]
+                                              (merge-with #(if (map? %1) (merge %1 %2) %2)
+                                                          acc (type-env-of de d)))
+                                            {} deps)))))
+
 (defn- entry
   ([spec-ns target] (entry spec-ns target nil))
   ([spec-ns target proof]
@@ -4291,20 +4313,9 @@
        ;; the code calls them, and left to that spec's proved laws in the
        ;; proofs here, not unfolded
        (let [cs (components-of e)
-             ;; the types of the specs it builds on may be named here: their
-             ;; refinements, read in their own namespaces, under its own
-             deps (keep #(when-let [de (get @registry %)] [% de]) (:uses e))
-             own (set (map :name (:refines e)))
-             e (cond-> e
+             e (cond-> (with-uses e)
                  (seq cs) (assoc ::components cs
-                                 :assumes (merge (into {} (for [[q c] cs] [q (:sig c)])) (:assumes e)))
-                 (seq deps) (assoc ::uses-refines (vec (for [[_ de] deps, r (:refines de)
-                                                            :when (not (contains? own (:name r)))]
-                                                        r))
-                                   ::uses-tenv (reduce (fn [acc [d de]]
-                                                         (merge-with #(if (map? %1) (merge %1 %2) %2)
-                                                                     acc (type-env-of de d)))
-                                                       {} deps)))]
+                                 :assumes (merge (into {} (for [[q c] cs] [q (:sig c)])) (:assumes e))))]
          (assoc e ::proof (proof-entry spec-ns proof)))))))
 
 (defn- assumed-var
@@ -4991,7 +5002,9 @@
     (reduce (fn [acc dep]
               (let [r (binding [*using* (conj *using* spec-ns)]
                         (check dep (-> (select-keys opts [:cache :cache-dir :seed :fuel])
-                                       (assoc :adequacy false))))
+                                       ;; what this spec's laws reach in the
+                                       ;; component is noted by this check
+                                       (assoc :adequacy false :coverage false))))
                     proved (::proved-props r)
                     de (get @registry dep)
                     ;; a law that holds but is closed, or only witnessed, has
@@ -5512,7 +5525,7 @@
   (let [refs (refines-of e)
         signed (set (keys (:anns e)))
         fns-of (fn [form] (into (sorted-set) (filter signed) (names-in form)))
-        glaws (concat (ensures-laws e) (mapcat #(graph-obligations % refs (:invariants e)) (:graphs e)))
+        glaws (concat (ensures-laws e) (mapcat #(graph-obligations % refs (:invariants e) (:contracts e)) (:graphs e)))
         law-oids (set (keep :oid glaws))]
     (vec (concat
            (for [{:keys [name prop]} (:laws e)]
@@ -5523,7 +5536,7 @@
              {:id oid :kind :ensures :of name :law name :fns (fns-of prop) :text explain})
            (for [[gname m :as g] (:graphs e)
                  o (concat
-                     (for [{:keys [name oid prop explain]} (graph-obligations g refs (:invariants e))]
+                     (for [{:keys [name oid prop explain]} (graph-obligations g refs (:invariants e) (:contracts e))]
                        {:id oid :kind (keyword (first (str/split oid #"\."))) :of gname :law name
                         :fns (fns-of prop) :text explain})
                      ;; an edge into plain types has no law: it is data flow, checked
@@ -5982,7 +5995,7 @@
   contradicts an example fails now, not after the code is written.  A
   report with :ok false, since there is no code, and :no-code true."
   [spec-ns opts]
-  (let [e (assoc (get @registry spec-ns) ::ns spec-ns)
+  (let [e (with-uses (assoc (get @registry spec-ns) ::ns spec-ns))
         target (or (:target opts) (:target e))
         e (assoc e :target target)
         {:keys [anns]} e
@@ -6002,7 +6015,7 @@
             seed (or (:seed opts) 42)
             laws (-> (vec (:laws e))
                      (into (ensures-laws e))
-                     (into (mapcat #(graph-obligations % refs (:invariants e)) (:graphs e))))
+                     (into (mapcat #(graph-obligations % refs (:invariants e) (:contracts e)) (:graphs e))))
             examples (keep :example laws)
             problems (atom [])
             problem! #(swap! problems conj %)
@@ -6156,6 +6169,11 @@
         walk (fn walk [f]
                (cond
                  (and (seq? f) (= 'quote (first f))) f
+                 ;; (max a b) and (min a b) choose: as an if, its test noted
+                 (and (seq? f) (contains? '#{max min} (first f)) (= 3 (count f)))
+                 (let [x (gensym "max__") y (gensym "max__")]
+                   (list 'let [x (walk (nth f 1)) y (walk (nth f 2))]
+                         (list 'if (list (if (= 'max (first f)) '>= '<=) x y) x y)))
                  ;; an operand that recurs is in the tail of the fn around it,
                  ;; and a thunk would take the recur: that one is left as it is
                  (and (seq? f) (contains? '#{and or} (first f)) (< 2 (count f))
@@ -6300,15 +6318,39 @@
          ;; the code's tests noted while its laws run: a test that only ever
          ;; went one way is a case no law tries
          (let [_ (require target)
+               ;; the target, and each component it builds on: what this spec's
+               ;; laws never make a component do is a case of the workflow too
+               comps (keep #(do (require %) (:target (get @registry %))) (:uses (get @registry spec-ns)))
                probes (when-not (false? (:coverage opts))
-                        (swap! coverage #(into {} (remove (fn [[[t] _]] (= t target))) %))
-                        (swap! combos #(into {} (remove (fn [[[t] _]] (= t target))) %))
-                        (install-probes! target))]
+                        (vec (for [t (cons target comps)
+                                   :when (not (unwritten? t))]
+                               (do (require t)
+                                   (swap! coverage #(into {} (remove (fn [[[x] _]] (= x t))) %))
+                                   (swap! combos #(into {} (remove (fn [[[x] _]] (= x t))) %))
+                                   (assoc (install-probes! t) :target t)))))]
            (try
              (let [r (check* spec-ns opts)
-                   notes (when (and probes (seq (:laws r)) (not (:no-code r)))
-                           (concat (one-sided-tests target (:tests probes))
-                                   (undecided-parts target (:combos probes))))]
+                   ;; a component's fns the target's code reaches, through its
+                   ;; own helpers: what the spec's builders call is not the code's
+                   reached (delay (let [g (merge (try (call-graph target) (catch Throwable _ {}))
+                                                 (into {} (for [c comps
+                                                                [f gs] (try (call-graph c) (catch Throwable _ {}))]
+                                                            [(symbol (str c) (str f))
+                                                             (set (map #(if (namespace %) % (symbol (str c) (str %))) gs))])))]
+                                    (loop [todo (keys (try (call-graph target) (catch Throwable _ {}))), seen #{}]
+                                      (if-let [x (first todo)]
+                                        (if (contains? seen x) (recur (rest todo) seen)
+                                            (recur (concat (rest todo) (get g x)) (conj seen x)))
+                                        seen))))
+                   only-reached (fn [t m] (into {} (filter #(contains? @reached (symbol (str t) (str (:fn (val %))))) m)))
+                   notes (when (and (seq probes) (seq (:laws r)) (not (:no-code r)))
+                           (mapcat (fn [{t :target :keys [tests combos]}]
+                                     (if (= t target)
+                                       (concat (one-sided-tests t tests) (undecided-parts t combos))
+                                       (map #(str/replace-first % "`" (str "`" t "/"))
+                                            (concat (one-sided-tests t (only-reached t tests))
+                                                    (undecided-parts t (only-reached t combos))))))
+                                   probes))]
                (cond-> r
                  (seq notes)
                  (-> (assoc :one-way-tests (vec notes))
@@ -6317,7 +6359,7 @@
                              " try. If it can happen, say what the code does then:\n"
                              (str/join "\n" (map #(str "    " %) (take 12 notes)))))))
              (finally
-               (doseq [[v f] (:restore probes)] (alter-var-root v (constantly f)))))))))))
+               (doseq [p probes, [v f] (:restore p)] (alter-var-root v (constantly f)))))))))))
 
 (defn- check*
   [spec-ns opts]
@@ -6353,7 +6395,7 @@
              laws (-> (vec laws)
                       (into (ensures-laws e))
                       (into (component-laws e))
-                      (into (mapcat #(graph-obligations % refs (:invariants e)) (:graphs e))))
+                      (into (mapcat #(graph-obligations % refs (:invariants e) (:contracts e)) (:graphs e))))
              publics (set (keys (ns-publics (the-ns target))))
              interns (set (keys (ns-interns (the-ns spec-ns))))
              proof-own* (proof-own (:ns proof-e))

@@ -1062,6 +1062,13 @@
       (and (= 'merge-with g) (= 3 (count ms)) (every? #(a-map? ctx %) (rest ms)))
       (let [[f a b] ms]
         [:if (has b) [:if (has a) [:ap f [:call 'get a k] [:call 'get b k]] [:call 'get b k]] (at a)])
+      ;; (into {} (filter f m)): m's entries that pass f
+      (and (= 'into g) (= 2 (count ms)) (= [:call 'hash-map] (first ms))
+           (= :call (head (second ms))) (= 'filter (second (second ms))) (= 4 (count (second ms)))
+           (a-map? ctx (nth (second ms) 3)))
+      (let [[_ _ f src] (second ms)
+            d (if (seq dflt) (first dflt) t/tnil)]
+        [:if (has src) [:if [:ap f [:call 'vector k [:call 'get src k]]] [:call 'get src k] d] d])
       ;; every key of c, each holding x
       (and (= 'zipmap g) (= 2 (count ms))
            (= :call (head (first ms))) (= 'keys (second (first ms))) (a-map? ctx (nth (first ms) 2))
@@ -1111,6 +1118,11 @@
                        (every? #(a-map? ctx %) (take-last 2 (drop 2 m))))
                   (let [[a b] (take-last 2 (drop 2 m))]
                     [:if [:call 'contains? a k] [:lit true] [:call 'contains? b k]])
+                  (and (= 2 n) (= :call (head m)) (= 'into (second m)) (= 4 (count m))
+                       (= [:call 'hash-map] (nth m 2)) (= :call (head (nth m 3))) (= 'filter (second (nth m 3)))
+                       (= 4 (count (nth m 3))) (a-map? ctx (nth (nth m 3) 3)))
+                  (let [[_ _ f src] (nth m 3)]
+                    [:if [:call 'contains? src k] [:call 'boolean [:ap f [:call 'vector k [:call 'get src k]]]] [:lit false]])
                   (and (= 2 n) (= :call (head m)) (= 'zipmap (second m)) (= 4 (count m))
                        (= :call (head (nth m 2))) (= 'keys (second (nth m 2))) (a-map? ctx (nth (nth m 2) 2))
                        (= :call (head (nth m 3))) (= 'repeat (second (nth m 3))))
