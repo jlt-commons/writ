@@ -730,3 +730,14 @@
     (is (:proved (prover/prove-law law)) "what it returns does not depend on the binding")
     (is (not (:proved (prover/prove-law (assoc law :total true))))
         "but it throws on a short vector, so it is not proved never to throw")))
+
+(deftest a-vector-mapped-by-place-is-read-symbolically
+  (let [target 'writ.spec-demo.numbered
+        [defs own] (prover/definitions [[target (writ.book/read-forms (#'spec/source-url target))]])
+        prove #(prover/prove-law {:prop (list 'forall '[xs (Vec Nat)] (list 'forall '[i Nat] %))
+                                  :defs defs :own own :target target :tenv {}
+                                  :rets {'writ.spec-demo.numbered/number-items '(Vec {:i Nat :x Nat})}
+                                  :prover {:order [:symbolic]}})]
+    (is (:proved (prove '(=> (< i (count xs)) (= i (:i (nth (writ.spec-demo.numbered/number-items xs) i)))))))
+    (is (:proved (prove '(=> (< i (count xs)) (= (nth xs i) (:x (nth (writ.spec-demo.numbered/number-items xs) i)))))))
+    (is (not (:proved (prove '(=> (< i (count xs)) (= (inc i) (:i (nth (writ.spec-demo.numbered/number-items xs) i))))))))))

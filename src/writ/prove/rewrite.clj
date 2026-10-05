@@ -764,6 +764,31 @@
 
 (defn- nan-lit? [t] (and (= :lit (head t)) (float? (second t)) (Double/isNaN (second t))))
 
+(defn- floatless-type?
+  "Does type ty hold no float anywhere: no Float, Double or Any in it?"
+  [ty]
+  (cond
+    (symbol? ty) (contains? '#{Nat Int Bool String Char Keyword Symbol Unit} ty)
+    (seq? ty) (and (contains? '#{List Vec Set Map Tuple Opt} (first ty)) (every? floatless-type? (rest ty)))
+    (record-type? ty) (every? floatless-type? (vals ty))
+    (and (map? ty) (:writ/elems ty)) (floatless-type? (:writ/elems ty))
+    :else false))
+
+(defn- no-float-source?
+  "Can term t hold no float at all: every variable it names (a fn
+  literal's own parameters aside) of a type with none, no float literal,
+  and no division, which can make a float of integers?"
+  [ctx t]
+  (let [subs (t/subterms t)
+        bound (set (mapcat (fn [x] (when (= :fn (head x)) (second x))) subs))]
+    (and (not-any? #(and (= :lit (head %)) (float? (second %))) subs)
+         (not-any? #(and (= :call (head %)) (= '/ (second %))) subs)
+         ;; a defn's value is made in its body, unread here
+         (not-any? #(= :app (head %)) subs)
+         (every? (fn [v] (or (contains? bound v)
+                             (let [ty (get-in ctx [:types v])] (and ty (floatless-type? ty)))))
+                 (t/vars t)))))
+
 (defn- equality [ctx a b]
   (let [ha (head a) hb (head b)]
     (cond
@@ -793,6 +818,9 @@
       (and (int-term? ctx a) (int-term? ctx b))
       [:ieq (lin-neg-canon (lin+ (lin-of ctx a) (lin* -1 (lin-of ctx b))))]
       (and (= a b) (float-free? ctx a)) [:lit true]
+      ;; no float anywhere it could come from: its variables are of types
+      ;; without one, and it has no float literal and no division
+      (and (= a b) (no-float-source? ctx a)) [:lit true]
       ;; a literal goes second, so a fact and a test of it are one term
       (and (= :lit ha) (not= :lit hb)) [:call '= b a]
       ;; a term known to equal one exact literal is not another
@@ -1014,6 +1042,33 @@
         (when-not (some #{acc e} (t/vars v*))
           [:if [:call 'contains? coll k] v* (into [:call 'get init k] dflt)])))))
 
+(defn- a-map?
+  "Is term m a map or nil, by its form or its type?"
+  [ctx m]
+  (or (= t/tnil m) (non-nil-map? ctx m)
+      (and (= :call (head m)) (contains? '#{merge merge-with zipmap} (second m)))))
+
+(defn- merged-get
+  "(get m k d?) where m is (merge a b), (merge-with f a b) or (zipmap (keys
+  c) (repeat x)), each a map or nil: read through to the parts, each at k.
+  nil for any other m."
+  [ctx m k dflt]
+  (let [[_ g & ms] (when (= :call (head m)) m)
+        at (fn [x] (into [:call 'get x k] dflt))
+        has (fn [x] [:call 'contains? x k])]
+    (cond
+      (and (= 'merge g) (= 2 (count ms)) (every? #(a-map? ctx %) ms))
+      (let [[a b] ms] [:if (has b) [:call 'get b k] (at a)])
+      (and (= 'merge-with g) (= 3 (count ms)) (every? #(a-map? ctx %) (rest ms)))
+      (let [[f a b] ms]
+        [:if (has b) [:if (has a) [:ap f [:call 'get a k] [:call 'get b k]] [:call 'get b k]] (at a)])
+      ;; every key of c, each holding x
+      (and (= 'zipmap g) (= 2 (count ms))
+           (= :call (head (first ms))) (= 'keys (second (first ms))) (a-map? ctx (nth (first ms) 2))
+           (= :call (head (second ms))) (= 'repeat (second (second ms))) (= 3 (count (second ms))))
+      [:if (has (nth (first ms) 2)) (nth (second ms) 2) (if (seq dflt) (first dflt) t/tnil)]
+      :else nil)))
+
 (defn- map-rule
   "get, contains?, assoc and dissoc on literal keys; an assoc or dissoc of
   several keys is one after another."
@@ -1027,6 +1082,9 @@
             ;; a key of a fold that sets each key of a map once
             (and (<= 2 n 3) (keyed-fold-get ctx m k (drop 2 args)))
             (keyed-fold-get ctx m k (drop 2 args))
+            ;; a key of maps merged: the later map's where it holds the key
+            (and (<= 2 n 3) (merged-get ctx m k (drop 2 args)))
+            (merged-get ctx m k (drop 2 args))
             ;; the key an assoc just set, whatever it is: its value
             (and (<= 2 n 3) (= :call (head m)) (= 'assoc (second m)) (= 5 (count m)) (= k (nth m 3)))
             (nth m 4)
@@ -1045,8 +1103,19 @@
                         (if (= 3 n) (nth args 2) t/tnil)
                         (reverse es))))
             :else nil)
-      contains? (when (and (= 2 n) (exact-key? k))
-                  (map-lookup m k (constantly [:lit true]) [:lit false] #(vector :call 'contains? % k)))
+      contains? (cond
+                  (and (= 2 n) (exact-key? k))
+                  (map-lookup m k (constantly [:lit true]) [:lit false] #(vector :call 'contains? % k))
+                  ;; a key of maps merged is a key of either
+                  (and (= 2 n) (= :call (head m)) (contains? '#{merge merge-with} (second m))
+                       (every? #(a-map? ctx %) (take-last 2 (drop 2 m))))
+                  (let [[a b] (take-last 2 (drop 2 m))]
+                    [:if [:call 'contains? a k] [:lit true] [:call 'contains? b k]])
+                  (and (= 2 n) (= :call (head m)) (= 'zipmap (second m)) (= 4 (count m))
+                       (= :call (head (nth m 2))) (= 'keys (second (nth m 2))) (a-map? ctx (nth (nth m 2) 2))
+                       (= :call (head (nth m 3))) (= 'repeat (second (nth m 3))))
+                  [:call 'contains? (nth (nth m 2) 2) k]
+                  :else nil)
       assoc (cond
               (and (< 3 n) (odd? n))
               (reduce (fn [acc [k v]] [:call 'assoc acc k v]) m (partition 2 (rest args)))

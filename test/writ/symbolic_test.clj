@@ -65,11 +65,14 @@
            (for [y [-9 0 1 36 37 38 99] k [[:Up] [:Down] [:Idle]]] {'y y 'k k}))))
 
 (deftest outside-is-said-not-guessed
-  (testing "a product of two unknowns is not linear"
-    (let [defs (defs-of 'writ.spec-demo.shapes "writ/spec_demo/shapes.clj")]
-      (is (= :outside (sym/agrees? {:types '{s Shape} :defs defs :tenv tenv}
-                                   [:call '= [:app 'writ.spec-demo.shapes/area 's] [:lit 9]]
-                                   {'s [:Square 3]})))))
+  (testing "a product of two unknowns is not linear: it is some integer, the same for the
+            same factors, so it is read, but not exactly"
+    (let [defs (defs-of 'writ.spec-demo.shapes "writ/spec_demo/shapes.clj")
+          r (sym/agrees? {:types '{s Shape} :defs defs :tenv tenv}
+                         [:call '= [:app 'writ.spec-demo.shapes/area 's] [:lit 9]]
+                         {'s [:Square 3]})]
+      (is (not= :outside r))
+      (is (not (true? r)) "nothing of multiplication is known of it")))
   (let [defs (defs-of 'writ.spec-demo.sort "writ/spec_demo/sort.clj")]
     (require 'writ.spec-demo.sort)
     (is (= :outside (sym/agrees? {:types '{xs (List Nat)} :defs defs :tenv {}}
