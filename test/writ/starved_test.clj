@@ -245,6 +245,11 @@
   (let [r (spec/check 'writ.spec-demo.bulk-example-full-spec {:seed 42})]
     (is (:ok r) (:message r))))
 
+(deftest an-example-may-name-the-specs-values
+  (let [r (spec/check 'writ.spec-demo.bulk-example-named-spec {:seed 42})]
+    (is (:ok r) (:message r))
+    (is (not (has? r "was never false")) "a comparison the law asserts is not one to turn")))
+
 (deftest an-example-checks-the-code
   (let [r (spec/check 'writ.spec-demo.bulk-example-full-spec {:seed 42 :target 'writ.spec-demo.bulk-off})]
     (is (= :failed (:status (law-result r 'example:price:1))))))

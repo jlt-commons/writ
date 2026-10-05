@@ -1404,6 +1404,35 @@
 (defn- compare-int [op a b]
   [op (int-of a) (int-of b)])
 
+(defn- literal-ite?
+  "Is integer term t a choice among at most 16 literals: an :ite tree
+  whose leaves are all integers?"
+  [t]
+  (letfn [(leaves [t] (cond (integer? t) 1
+                            (and (vector? t) (= :ite (first t)) (= 4 (count t)))
+                            (let [a (leaves (nth t 2)) b (leaves (nth t 3))]
+                              (when (and a b) (+ a b)))
+                            :else nil))]
+    (and (vector? t) (= :ite (first t))
+         (when-let [n (leaves t)] (<= n 16)))))
+
+(defn- through-defs
+  "Integer term t with each variable merging introduced replaced by its
+  definition, through :ite trees up to 24 steps deep."
+  ([st t] (through-defs st t 24))
+  ([st t depth]
+   (cond
+     (zero? depth) t
+     (symbol? t) (if-let [d (get-in @st [:def-of t])] (through-defs st d (dec depth)) t)
+     (and (vector? t) (= :ite (first t)) (= 4 (count t)))
+     [:ite (nth t 1) (through-defs st (nth t 2) (dec depth)) (through-defs st (nth t 3) (dec depth))]
+     :else (fold t))))
+
+(defn- scale-ite
+  "The :ite tree t of literals with each leaf multiplied by term x."
+  [t x]
+  (if (integer? t) [:* t x] [:ite (nth t 1) (scale-ite (nth t 2) x) (scale-ite (nth t 3) x)]))
+
 (defn- fold
   "An integer term with its literal parts computed: [:+ 1 2] is 3."
   [t]
@@ -1580,6 +1609,11 @@
                               (let [s (fold (int-of p)) u (fold (int-of q))]
                                 (cond (integer? s) {:int [:* s u]}
                                       (integer? u) {:int [:* u s]}
+                                      ;; one factor is one of a few literals, as a
+                                      ;; lookup in a table of rates gives: a
+                                      ;; product per literal, each linear
+                                      (literal-ite? (through-defs st u)) {:int (scale-ite (through-defs st u) s)}
+                                      (literal-ite? (through-defs st s)) {:int (scale-ite (through-defs st s) u)}
                                       :else (give-up! "a product of two unknowns"))))
                          acc x))
                 {:int 1} args)
@@ -1629,6 +1663,21 @@
       zero? (lift st (fn [x] {:bool (num-test st 'zero? [x] #(vector := (int-of x) 0))}) a)
       pos? (lift st (fn [x] {:bool (num-test st 'pos? [x] #(vector :> (int-of x) 0))}) a)
       neg? (lift st (fn [x] {:bool (num-test st 'neg? [x] #(vector :< (int-of x) 0))}) a)
+      ;; a remainder by 2, as integer arithmetic has it
+      even? (lift st (fn [x] {:bool [:= [:mod (int-of x) 2] 0]}) a)
+      odd? (lift st (fn [x] {:bool [:= [:mod (int-of x) 2] 1]}) a)
+      ;; the one boolean, whatever the value's shape: a boolean is it or not,
+      ;; nil and any other known shape is neither, and an opaque value
+      ;; answers as some boolean, the same each time it is asked
+      (true? false?)
+      (lift st (fn [x]
+                 (cond
+                   (contains? x :bool) {:bool (if (= 'true? f) (:bool x) [:not (:bool x)])}
+                   (or (:nil x) (contains? x :int) (contains? x :const) (:map x) (:vec x) (:set x)
+                       (:seqv x) (:amap x))
+                   {:bool false}
+                   :else {:bool (unknown! st f x :bool)}))
+            a)
       identity a
       hash-set (finite-set st (map (fn [x] [true x]) args) true)
       set (lift st (fn [x] (cond (:set x) {:set (assoc (:set x) :distinct true)}

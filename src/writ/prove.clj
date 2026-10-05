@@ -205,6 +205,18 @@
     (when (and empty more)
       {:by :list-cases :on v :empty empty :cons more})))
 
+(defn- by-extensionality
+  "Prove normal goal n, two sequences =, by their counts and then their
+  elements at a fresh index below the count."
+  [opts g hyps depth ctx n]
+  (let [taken (into (set (keys (:types opts))) (mapcat t/vars (cons g hyps)))
+        i (first (remove taken (map #(symbol (str "i%" %)) (range))))]
+    (when-let [{:keys [count-goal nth-hyp nth-goal]} (sc/extensional ctx n i)]
+      (let [o (assoc-in opts [:types i] 'Nat)
+            c (prove-goal o count-goal hyps (dec depth))
+            e (when c (prove-goal o nth-goal (conj hyps nth-hyp) (dec depth)))]
+        (when (and c e) {:by :extensional :on i :count c :elements e})))))
+
 (defn- prove-goal
   "Prove boolean term g under hyps.  In order: a data value's tag is split
   into its constructors; integer arithmetic through and through goes to
@@ -255,6 +267,8 @@
                  (when (and yes no) {:by :split :on c :then yes :else no}))
                (or (when-let [e (enum-candidate ctx n (:enum-limit opts (:enum-limit default-config)))]
                      (by-enumeration opts g hyps depth e))
+                   ;; two sequences equal, element by element
+                   (by-extensionality opts g hyps depth ctx n)
                    (when-let [v (elems-var opts n)] (by-list-cases opts g hyps depth v))
                    (solved)))))))))
 
@@ -488,6 +502,7 @@
          (when (or (by? :solver) (by? :symbolic)) ", with the solver")
          (when-let [vs (seq (ons :list-cases))]
            (str ", with cases on " (str/join " and " vs)))
+         (when (by? :extensional) ", element by element")
          (when-let [gs (seq (ons :generalizing))]
            (str ", generalising " (str/join " and " (map pr-str gs))))
          (when-let [as (seq (ons :accumulator))]
@@ -716,14 +731,18 @@
                     (let [t0 (System/currentTimeMillis)
                           b0 @burned
                           seen (atom [])
-                          [r outcome] (binding [*stuck* seen *case* []]
+                          why (atom [])
+                          [r outcome] (binding [*stuck* seen *case* [] sym/*why* why]
                                         (try (let [r (f)] [r (if r :proved :failed)])
                                              (catch clojure.lang.ExceptionInfo e
                                                (if (:writ.prove.rewrite/fuel (ex-data e))
                                                  (do (reset! ran-out true) [nil :fuel])
                                                  (throw e)))))]
-                      (swap! attempts conj {:name nm :outcome outcome :fuel (- @burned b0)
-                                            :ms (- (System/currentTimeMillis) t0)})
+                      (swap! attempts conj (cond-> {:name nm :outcome outcome :fuel (- @burned b0)
+                                                    :ms (- (System/currentTimeMillis) t0)}
+                                             ;; what symbolic evaluation could not read, or
+                                             ;; what the solver answered
+                                             (and (not r) (seq @why)) (assoc :why (vec (take 4 (distinct @why))))))
                       (when-not r (swap! stuck into (map #(assoc % :attempt nm)) @seen))
                       [r @unfolded]))
           symbolic [[:symbolic-cases #(by-symbolic-cases opts g)] [:symbolic #(by-symbolic opts g)]]

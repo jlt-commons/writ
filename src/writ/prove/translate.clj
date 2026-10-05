@@ -24,7 +24,7 @@
      keyword? symbol? string? char? boolean?
      hash-map assoc dissoc merge keys vals get-in assoc-in update update-in
      subvec mapv filterv keep remove not-any? range conj number? fn?
-     complement comp key val})
+     complement comp key val even? odd? map-indexed repeat true? false?})
 
 (def ^:private vector-fns
   "The clojure.core fns whose value is always a vector."
@@ -135,7 +135,15 @@
                        (and (= 'into v) (= 2 (count args)) (vector-term? a))
                        (with-meta [:sq [:eapp [:elems a] [:elems (second args)]]] {:vector true})
                        :else (into [:call v] args)))
-             (outside! (str "`" (:name f) "`"))))
+             (if-let [[x] (when-not (contains? env (:name f)) (constant ctx (:name f)))]
+               ;; a def of a map or a set, called as a fn: a lookup
+               (if (and (or (map? x) (set? x)) (<= 1 (count args) 2))
+                 (into [:call 'get (if (set? x)
+                                     (into [:call 'hash-set] (map t/lit (t/sort-printed x)))
+                                     (t/value->term x))]
+                       args)
+                 (outside! (str "`" (:name f) "`")))
+               (outside! (str "`" (:name f) "`")))))
     :fn (into [:ap (term-of ctx env f)] args)
     ;; (:k m) and (:k m default) are lookups
     :lit (if (and (keyword? (:val f)) (<= 1 (count args) 2))

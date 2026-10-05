@@ -61,6 +61,15 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
    prints states, steps, signatures, laws and wiring from the spec alone,
    and ends with the questions its types raise. When a person asked for the
    feature, show it to them and have them confirm it before writing code.
+   Run the check now, before any code: with the target not written yet,
+   `check` checks the spec alone. Each type it names must make values
+   that fit it, each example must fit its fn's signature and `:requires`,
+   each law must call the target, and each law that calls a fn on its own
+   variables is run at that fn's examples, so ``law `x` contradicts the
+   example (f 2) => 7`` shows a wrong law or a wrong example while both
+   are cheap to fix. Give the examples the problem statement works
+   through; they are what the laws are checked against here. The report
+   says `no implementation yet` and is never `:ok`.
 7. Then the implementation. If a law holds but isn't proved, write a
    lemma or hint in the proof namespace (see
    [The proof namespace](#the-proof-namespace)); never weaken the law.
@@ -111,6 +120,9 @@ failures: a law over every input may already answer one.
   `[insert Nat _]` is `(insert n state)`. `[first]`, `[second]` or
   `[last]` takes a state out of a tuple state, so a fn that returns
   `[next-state reply]` can lead back: `{:result {[first] #{:links}}}`.
+  Such an edge is judged through the steps into the tuple state: an
+  `[add String]` into `:result` gets the law `g:links:add.first`, that
+  `(first (add links s))` lands in `:links`, refinement and all.
 - `(refine Name [x Base] pred)` is a type: values of Base where pred
   holds. Use it in `ann`, `forall`, states, other refinements. It defines
   `Name?`. Refine the parts (a Paddle, a Ball) rather than folding random
@@ -129,6 +141,8 @@ failures: a law over every input may already answer one.
 - Each target of such an edge is also a law, `graph:state:fn->target`:
   some value of the state lands there. A step the code never takes fails,
   so don't list targets "just in case"; list the steps the problem has.
+- A refinement that only names a record, `(refine Member [m {...}] true)`,
+  is a plain state: an edge into it is data flow, with no law of its own.
 - Two states of the same plain type fail the check (`:unsorted` and
   `:sorted` both `(List Nat)` say nothing apart). Make the meaningful one
   a refinement, defined with the helpers the laws use:
@@ -287,6 +301,33 @@ failures: a law over every input may already answer one.
 - `(flow f [param ...] [link link ...] ...)`: the path data takes through
   `f`. See [Flows](#flows).
 
+## Building on another spec
+
+Build a larger workflow on a component that has a spec of its own:
+prove the component once, then use it as a trusted piece.
+
+```clojure
+(spec my.shop {:uses [my.auth-spec]})
+```
+
+- `my.auth-spec` is checked first. If it fails, this spec fails too, with
+  its report: a workflow on a broken component stands on nothing.
+- Each of its proved laws is a lemma here, cited by its full name
+  (`my.auth-spec/a-wrong-password-does-not`); a law of it only tested is
+  not imported, and the report says so.
+- Its signed fns are taken at that spec: calls to them from this target
+  are typed by their signatures, checked against their `:requires` while
+  the laws run (charging a session the workflow never authenticated
+  fails, naming the component's contract), and not unfolded in proofs
+  here, so the workflow's proofs rest on the component's laws and stay
+  true for any implementation that meets its spec.
+- Put a protocol the component imposes in its `:requires`
+  (`(ann charge [Session Nat -> Nat] {:requires (fn [s _] (authed? s))})`):
+  that is what a caller is held to.
+- Imported laws are not laws of this spec and judge no stand-in: the
+  workflow's spec must still say what it means. Specs may not use each
+  other in a cycle.
+
 ## Assumptions
 
 When the code calls something writ does not check (`clojure.string`, a
@@ -399,6 +440,16 @@ When a law holds but isn't proved, add what the prover needs in
   proves even though the code's vector branch walks elements the prover
   cannot see. An unknown answer (`vector?` of an opaque value, its `first`)
   is the same each time it is asked of the same value.
+- Pipelines are read by position: the count of a `map`, `mapv`,
+  `map-indexed`, `range` or `repeat`, and the element at any index of a
+  `map` over sequences or a `range`, without running the steps that do
+  not reach it; a lookup past an `assoc` drops what the other keys hold.
+  Two sequences are equal when their counts are and their elements at
+  every index are, and the prover proves it that way. So a law over a
+  whole output, `(= (mapv :w xs) (mapv :w (tag xs)))`, and a law at an
+  index, `(= (:w (nth (tag xs) i)) (:w (nth xs i)))`, are both likely to
+  be proved. `even?`, `odd?`, a lookup in a constant map and arithmetic
+  on one of a few literals (a rate from a table) are read too.
 - The usual reasons a law isn't proved: recursion that needs a lemma about
   a helper (write the lemma), a law about a recursive fn stated over its
   whole output where a pointwise statement would do, or a form outside
@@ -626,6 +677,7 @@ never to throw.
 (spec/check 'my.sort-spec {:target 'my.sort2})    ; same spec, other impl
 (spec/check! 'my.sort-spec)                       ; throws with the message
 (spec/sample '(List Nat) {} 5)                    ; what a type generates
+(spec/sample 'my.spec/Order 5)                    ; ... one the spec declares, refinements built
 (spec/scan 'my.ns)                                ; which fns a spec could cover
 (spec/call-graph 'my.ns)                          ; {f #{g ...}}, read from source
 (spec/mermaid 'my.spec)                           ; the graph, with the spec's calls
@@ -656,6 +708,14 @@ A report's `:timings` says where the time went, in milliseconds
 tested law carries `:test-ms`.
 
 ## Reading a report
+
+Only `:ok` (the check's exit status) says pass or fail. The first line
+says `ok` or `FAILED`; the indented lines under it are a summary and
+notes, which never fail a check on their own; each failure follows them
+as a block of its own, after a blank line. A note such as "was never
+false" or "not a step of any graph" is about the spec: when you own only
+the implementation, pass it on to the spec's owner rather than change
+code for it.
 
 `:static` fails first. A static failure is a single `Writ:` message, and no
 law runs until it is fixed. After that, each law has a `:status`:
@@ -767,6 +827,13 @@ confirm it, then without one.
   the spelling; the spec names the structure.
 - ``law `x` fails for ...`` - the implementation is wrong for that input;
   see [Reading a report](#reading-a-report).
+- ``law `x` is thinly tested: its hypothesis held in N of M trials`` - the
+  law ran its conclusion on few inputs. A common cause is drawing indices
+  as free `Nat`s behind `(< i (count xs))`: two such indices meet a
+  rare case (a tie between two entries) almost never. Quantify over the
+  positions inside the law instead, `(every? (fn [[i j]] ...) (for [i
+  (range (count xs)) j (range (count xs))] [i j]))`, so every trial checks
+  every pair.
 - ``the hypothesis never held in N trials`` - no generated input satisfied
   the `=>` premise, and the solver found none either, so the law tested
   nothing. Tell the spec's owner: the premise may be unsatisfiable, or
@@ -783,7 +850,9 @@ confirm it, then without one.
 - ``law `x`: (<= a b) was never false in N trials, nor at an input the
   solver found`` - a clause of the law that only ever went one way tests
   one side only. Build inputs that turn it (a refinement, a value in the
-  law), or drop it if it always holds. Tell the spec's owner.
+  law), or drop it if it always holds. A note, not a failure; a
+  comparison the law asserts outright is never named, since it is false
+  only where the law fails. Tell the spec's owner.
 - ``no witness among N generated values`` - the `exists` law found no
   value. Either the implementation is wrong, or the witness is too rare to
   generate.

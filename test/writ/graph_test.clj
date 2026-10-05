@@ -227,3 +227,10 @@
   (let [r (spec/check 'writ.spec-demo.shelf-spec {:seed 42})]
     (is (not (:ok r)))
     (is (str/includes? (:message r) ":done cannot be left and is not final"))))
+
+(deftest a-projection-edge-judges-what-the-step-returns
+  (let [r (spec/check 'writ.spec-demo.links-refined-spec {:seed 42})
+        names (set (map :law (:laws r)))]
+    (is (contains? names 'store:links:add.first) (pr-str names))
+    (is (not (contains? names 'store:added:first)) "the projection's own law would judge only generated tuples")
+    (is (str/includes? (:message r) "law `store:links:add.first` fails") (:message r))))

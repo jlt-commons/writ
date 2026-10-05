@@ -71,8 +71,12 @@
   (let [atoms (atom {:names {} :decls {}})
         facts (vec (for [[c v] (t/sort-printed key (filter (comp boolean? val) (:facts ctx)))]
                      (let [f (truth ctx atoms c)] (if v f [:not f]))))
-        g (truth ctx atoms n)]
-    {:formula [:=> (into [:and true] facts) g]
+        g (truth ctx atoms n)
+        ;; what the terms' types say: a count, a Nat, is at least 0
+        nats (vec (for [[x a] (t/sort-printed key (:names @atoms))
+                        :when (and (= :int (get-in @atoms [:decls a])) (rw/nat-term? ctx x))]
+                    [:<= 0 a]))]
+    {:formula [:=> (into (into [:and true] nats) facts) g]
      :decls (:decls @atoms)}))
 
 (defn pure?

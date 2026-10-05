@@ -825,6 +825,13 @@
               (reverse (partition 2 bs))))
     (or (head? p "and") (head? p "=>"))
     (cons (first p) (map desugar (rest p)))
+    ;; (let [bs] (=> P Q)) is (=> (let [bs] P) (let [bs] Q)): a law may name
+    ;; what its hypothesis and its conclusion both read
+    (and (seq? p) (contains? '#{let clojure.core/let} (first p)) (= 3 (count p))
+         (vector? (second p)) (head? (desugar (nth p 2)) "=>"))
+    (let [[_ bs inner] p
+          [_ h c] (desugar inner)]
+      (list '=> (list 'let bs h) (list 'let bs c)))
     :else p))
 
 ;; --- an integer between bounds ----------------------------------------------------
@@ -1383,10 +1390,21 @@
 
       :else (fail! "cannot generate values of type `" (pr-str t) "`"))))
 
+(declare type-env)
+
 (defn sample
-  "`n` generated values of type `t`, for a look at what laws are run on."
-  ([t tenv] (sample t tenv 10))
-  ([t tenv n] (gen/sample (type->gen t tenv) n)))
+  "`n` generated values of type `t`, for a look at what laws are run on.
+  `tenv` is a type env, or a spec namespace whose types `t` may name:
+  (sample 'Order 'my.spec 5).  A type qualified by its spec needs no env:
+  (sample 'my.spec/Order) or (sample 'my.spec/Order 5)."
+  ([t] (sample t {} 10))
+  ([t tenv-or-n] (if (number? tenv-or-n) (sample t {} tenv-or-n) (sample t tenv-or-n 10)))
+  ([t tenv n]
+   (let [[t tenv] (cond (symbol? tenv) [t (type-env tenv)]
+                        (and (qualified-symbol? t) (empty? tenv))
+                        [(symbol (name t)) (type-env (symbol (namespace t)))]
+                        :else [t tenv])]
+     (gen/sample (type->gen t tenv) n))))
 
 (def ^:dynamic *parallel*
   "Whether par-map may spread its work over threads: false under a check
@@ -1599,23 +1617,39 @@
 
 (def ^:private witness-trials 1000)
 
-(defn- law-atoms
+(defn- law-atom-parts
   "The clauses of a law whose outcome a test should see both ways: each
   comparison in it, and each part of its hypotheses, that mentions one of
   its variables.  Not inside a fn literal, whose locals a test cannot
-  bind.  At most 8."
+  bind, and not a comparison the conclusion asserts, alone or as a part
+  of an `and`: that one is false only where the law fails, so seeing it
+  one way is the law holding.  At most 8."
   [body vars]
   (let [vars (set vars)
         mentions? (fn [f] (some vars (tree-seq coll? seq f)))
+        cmp? (fn [f] (and (seq? f) (contains? '#{< <= > >=} (first f))))
         walk (fn walk [f]
                (cond
                  (and (seq? f) (contains? '#{fn fn* letfn} (first f))) []
-                 (seq? f) (concat (when (contains? '#{< <= > >=} (first f)) [f]) (mapcat walk (rest f)))
+                 (seq? f) (concat (when (cmp? f) [f]) (mapcat walk (rest f)))
                  (coll? f) (mapcat walk f)
                  :else []))
+        asserted (fn asserted [f]
+                   (cond (head? f "and") (mapcat asserted (rest f))
+                         (cmp? f) (mapcat walk (rest f))
+                         ;; each way an `or` can hold is a case of the law: one
+                         ;; never true is a case no test reached, such as a tie
+                         (head? f "or") (concat (rest f) (mapcat walk (rest f)))
+                         :else (walk f)))
         flat (fn flat [f] (if (and (seq? f) (contains? '#{and or not} (first f))) (mapcat flat (rest f)) [f]))
-        hyps (loop [p body, hs []] (if (head? p "=>") (recur (nth p 2) (into hs (flat (nth p 1)))) hs))]
-    (vec (take 8 (distinct (filter #(and (seq? %) (mentions? %)) (concat hyps (walk body))))))))
+        [hyps concl] (loop [p body, hs []]
+                       (if (head? p "=>") (recur (nth p 2) (conj hs (nth p 1))) [hs p]))]
+    (let [keep* #(filter (fn [f] (and (seq? f) (mentions? f))) %)
+          hs (keep* (concat (mapcat flat hyps) (mapcat walk hyps)))
+          all (vec (take 8 (distinct (concat hs (keep* (asserted concl))))))]
+      {:atoms all :hyp-atoms (set hs)})))
+
+(defn- law-atoms [body vars] (:atoms (law-atom-parts body vars)))
 
 (defn- count-atoms!
   "Note how each atom came out at env, in counts: {atom {true n false n}}."
@@ -1671,16 +1705,17 @@
       (let [vars (mapv first bs)
             ctx* (assoc ctx :vars vars)
             discards (atom 0)
-            atoms (law-atoms body vars)
+            {:keys [atoms hyp-atoms]} (law-atom-parts body vars)
             counts (atom {})
             res (qc (prop/for-all* (mapv #(type->gen (second %) (:tenv ctx)) bs)
                                    (fn [& vals]
                                      (case (:result (holds ctx* body (zipmap vars vals)))
                                        :pass (do (count-atoms! ctx* atoms counts (zipmap vars vals)) true)
                                        ;; a trial its hypothesis refused still shows
-                                       ;; how the hypothesis came out
+                                       ;; how the hypothesis came out, and only that:
+                                       ;; the conclusion's clauses were not in play
                                        :discard (do (swap! discards inc)
-                                                    (count-atoms! ctx* atoms counts (zipmap vars vals))
+                                                    (count-atoms! ctx* (filter hyp-atoms atoms) counts (zipmap vars vals))
                                                     true)
                                        false))))]
         (cond
@@ -2008,20 +2043,49 @@
                    judges (fn [imp] (if (= :off-example (:kind imp)) (remove #(::example (meta %)) props) props))
                    survives? (fn [imp]
                                (try
-                                 (binding [*stand-ins* {v ((:make imp) real)}]
-                                   (and (every? #(holds-sampled? ctx % trials seed) (judges imp))
-                                        (not (and (:args imp)
-                                                  (some #(rejects-at? ctx % qnm (:args imp) 10 seed) (judges imp))))))
+                                 (let [s ((:make imp) real)
+                                       ;; a stand-in that answers as the real fn on every
+                                       ;; call the laws make is the real fn, as far as
+                                       ;; they can tell: when the real fn returns its
+                                       ;; argument, so does the pass-through
+                                       differed (atom false)
+                                       called (atom false)
+                                       s* (fn [& a]
+                                            (let [x (apply s a)]
+                                              (reset! called true)
+                                              (when-not @differed
+                                                (when-not (= x (try (apply real a) (catch Throwable _ ::threw)))
+                                                  (reset! differed true)))
+                                              x))]
+                                   (binding [*stand-ins* {v s*}]
+                                     (and (every? #(holds-sampled? ctx % trials seed) (judges imp))
+                                          (not (and (:args imp)
+                                                    (some #(rejects-at? ctx % qnm (:args imp) 10 seed) (judges imp))))
+                                          ;; one off the laws' pins differs where they do not
+                                          ;; look, and that is the gap it shows
+                                          ;; and one no law calls is a gap of the plainest kind
+                                          (or (some? (:args imp)) (contains? #{:off-pin :off-example} (:kind imp))
+                                              @differed (not @called)))))
                                  (catch Throwable _ false)))
                    off-examples (let [ret (plain (:ret sig))
                                       other (other-value ret (:tenv ctx) seed)]
                                   (when other
-                                    (for [{:keys [args out]} (keep #(let [x (::example (meta %))]
-                                                                      (when (= nm (:fn x)) x))
-                                                                   props)
-                                          :let [args (vec args) wrong (other out)]
+                                    (for [[p {forms :args sns :spec-ns}]
+                                          (keep #(let [x (::example (meta %))]
+                                                   (when (= nm (:fn x)) [% x]))
+                                                props)
+                                          ;; an example may name the spec's own values
+                                          ;; or call the target, (example f [(g sample)]
+                                          ;; ...): the stand-in is off at what they are,
+                                          ;; read from the law, whose names are qualified
+                                          :let [[_ call out] p
+                                                vs (try (binding [*ns* (the-ns sns)]
+                                                          (mapv eval (cons out (rest call))))
+                                                        (catch Throwable _ nil))]
+                                          :when vs
+                                          :let [[out & args] vs, args (vec args), wrong (other out)]
                                           :when (not= wrong out)]
-                                      {:desc (str "agrees with the real fn except at " (pr-str (list* nm args))
+                                      {:desc (str "agrees with the real fn except at " (pr-str (list* nm forms))
                                                   ", where it returns " (pr-str wrong) " -- the example says "
                                                   (pr-str out) ", and no other law says what `" nm "` returns there")
                                        :kind :off-example
@@ -2843,9 +2907,26 @@
   test that is an `and`, one per clause says it fails while the others
   hold, so each clause rules out something of its own."
   [[gname m :as g] refs invs]
-  (vec (for [{:keys [from f args tos pos guard else changes by own-when case cases]} (graph-edges g)
+  (vec (for [{:keys [from f args tos pos guard else changes by own-when case cases wrap]}
+             ;; a [first] edge out of a tuple state takes nothing a law can
+             ;; judge: it is read through the edges into that state instead,
+             ;; each landing its projection where the [first] edge leads
+             (let [es (graph-edges g)
+                   outs (group-by :from (filter #(contains? projections (:f %)) es))]
+               (mapcat (fn [e]
+                         (if (contains? projections (:f e))
+                           []
+                           (cons e (for [p (:tos e), pe (get outs p)]
+                                     (-> e
+                                         (assoc :tos (:tos pe) :wrap (:f pe))
+                                         (dissoc :changes :case :cases :else))))))
+                       es))
              :let [ty #(get (:states m) %)
-                   ref-of #(let [t (plain (ty %))] (when (symbol? t) (get refs t)))
+                   ;; a refinement that only names its base, (refine Member [m {...}] true),
+                   ;; says no more than the base does: an edge into it is data flow
+                   says? (fn says? [r] (and r (or (not (true? (:pred r)))
+                                                  (let [b (plain (:base r))] (and (symbol? b) (says? (get refs b)))))))
+                   ref-of #(let [t (plain (ty %))] (when (symbol? t) (let [r (get refs t)] (when (says? r) r))))
                    refined? (every? ref-of tos)
                    ;; a landing in a state with invariants is checked even
                    ;; when the state is a plain type, since edges out of it
@@ -2861,7 +2942,7 @@
                    binders (vec (concat [v (ty from)]
                                         (mapcat (fn [a t] (when-not (fixed-arg? t) [a t])) avs args)))
                    call-args (insert-at avs pos v)
-                   call (apply list f call-args)
+                   call (cond->> (apply list f call-args) wrap (list wrap))
                    ;; each target's predicate, of the call itself: the law
                    ;; reads as the spec would write it, (ascending? (isort xs)),
                    ;; the shape the prover takes apart
@@ -2885,7 +2966,7 @@
                           (when (and entered? (seq hs)) (if (next hs) (cons 'and hs) (first hs))))
                    pre (cond (and held test) (list 'and held test) held held :else test)
                    under (fn [p] (if pre (list '=> pre p) p))
-                   step-name (str gname ":" (name from) ":" f)
+                   step-name (str gname ":" (name from) ":" f (when wrap (str "." wrap)))
                    edge (str step-name (when case (str "#" case)))
                    sfx (when case (str "#" case))
                    tested (get-in m [:tested from])
@@ -2970,7 +3051,9 @@
                                               " left to the code")
                                 ;; about the spec's guards, not the code
                                 :graph gname :guard-law true}))))
-                   (when guard
+                   ;; a projection's edge lands what its edge lands; the guard is
+                   ;; that edge's, and said there
+                   (when (and guard (not wrap))
                      (concat
                        (when (and (nil? case) (or (= :keep else) (ref-of else) (inv? else)))
                          [(off-proof
@@ -3418,7 +3501,11 @@
 (defn- tenv-of [data]
   (into {} (map (fn [f] (let [d (dt/parse f)] [(:name d) (dt/env d)]))) data))
 
-(defn- refines-of [e] (into {} (map (juxt :name identity)) (:refines e)))
+(defn- refines-of
+  "name -> refinement for the spec's own refinements, and those of the
+  specs it builds on, its own first."
+  [e]
+  (into {} (map (juxt :name identity)) (concat (::uses-refines e) (:refines e))))
 
 (defn- erase
   "A type (or a signature, or a data form) with each refinement replaced
@@ -3967,7 +4054,10 @@
                                 (catch Throwable _ false)))))))
             ;; the spec's one-line fns, which a refinement built to fit
             ;; reads its predicate through
-            (cond-> (tenv-of data) (seq refines) (assoc ::helpers (one-line-helpers spec-ns)))
+            ;; the types of the specs it builds on, under its own
+            (merge-with #(if (map? %1) (merge %1 %2) %2)
+                        (or (::uses-tenv e) {})
+                        (cond-> (tenv-of data) (seq refines) (assoc ::helpers (one-line-helpers spec-ns))))
             refines)))
 
 (defn type-env
@@ -4127,6 +4217,33 @@
           (fail! "`" p "` proves `" (:proves pe) "`, not `" spec-ns "`"))
         (assoc pe :ns p)))))
 
+(declare unwritten? erase refines-of)
+
+(defn- components-of
+  "The signed fns of the specs e :uses, each a component the spec builds
+  on: {qualified-fn {:sig :requires :spec}}.  Its signature in base
+  types, since a refinement is the used spec's to check; its :requires
+  read as that spec reads it, against its own target and helpers."
+  [e]
+  (into {}
+        (for [dep (:uses e)
+              :let [_ (require dep)
+                    de (get @registry dep)
+                    dt (:target de)]
+              :when (and de (not (unwritten? dt)))
+              :let [_ (require dt)
+                    refs (refines-of de)]
+              [nm sig] (:anns de)
+              :let [q (symbol (str dt) (str nm))
+                    rq (get-in de [:contracts nm :requires])]]
+          [q {:sig (erase sig refs)
+              :spec dep
+              :requires (when rq
+                          (let [form (qualify rq (set (second rq)) (set (keys (ns-publics (the-ns dt))))
+                                              (set (keys (ns-interns (the-ns dep)))) dt dep)]
+                            {:test (nth rq 2)
+                             :f (let [g (binding [*ns* (the-ns dep)] (eval form))] #(apply g %))}))}])))
+
 (defn- entry
   ([spec-ns target] (entry spec-ns target nil))
   ([spec-ns target proof]
@@ -4136,7 +4253,26 @@
        (fail! "`" spec-ns "` is not a spec namespace: it has no `(spec target-ns)` form"))
      (let [e (assoc (if target (assoc e :target target) e) ::ns spec-ns)]
        (require (:target e))
-       (assoc e ::proof (proof-entry spec-ns proof))))))
+       ;; a component the spec builds on is taken at its own spec: its fns
+       ;; typed by their signatures, checked against their :requires where
+       ;; the code calls them, and left to that spec's proved laws in the
+       ;; proofs here, not unfolded
+       (let [cs (components-of e)
+             ;; the types of the specs it builds on may be named here: their
+             ;; refinements, read in their own namespaces, under its own
+             deps (keep #(when-let [de (get @registry %)] [% de]) (:uses e))
+             own (set (map :name (:refines e)))
+             e (cond-> e
+                 (seq cs) (assoc ::components cs
+                                 :assumes (merge (into {} (for [[q c] cs] [q (:sig c)])) (:assumes e)))
+                 (seq deps) (assoc ::uses-refines (vec (for [[_ de] deps, r (:refines de)
+                                                            :when (not (contains? own (:name r)))]
+                                                        r))
+                                   ::uses-tenv (reduce (fn [acc [d de]]
+                                                         (merge-with #(if (map? %1) (merge %1 %2) %2)
+                                                                     acc (type-env-of de d)))
+                                                       {} deps)))]
+         (assoc e ::proof (proof-entry spec-ns proof)))))))
 
 (defn- assumed-var
   "The var of an assumed fn, its namespace loaded, or nil.  A host member
@@ -4175,7 +4311,8 @@
              (let [f @v]
                (swap! originals assoc v f)
                (alter-var-root v (constantly (checked q f sig tenv (arg-names v (count (:params sig)))
-                                                      {:assumed true})))
+                                                      {:assumed true
+                                                       :requires (get-in e [::components q :requires])})))
                v))))))
 
 (defn- unwrap! [vars]
@@ -4245,7 +4382,7 @@
 
 (def ^:private thin-tests
   "Fewer trials than this meeting a law's hypothesis is a thin test."
-  20)
+  50)
 
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
@@ -4263,8 +4400,8 @@
               (when (= :proved (:require proof)) " (the spec requires proof)")
               (when-let [ts (seq (filter #(= :test (:evidence %)) laws))]
                 (str "; tested, not proved: " (str/join ", " (map :law ts))
-                     (when-let [n (some->> (seq (keep :trials ts)) (apply min))]
-                       (str " (each on at least " n " inputs)"))))))
+                     (when-let [n (some->> (seq (keep #(or (:held %) (some-> (:trials %) (- (or (:discarded %) 0)))) ts)) (apply min))]
+                       (str " (each on at least " n " inputs that met its hypothesis)"))))))
        ;; a law that, on its own, tells no wrong answer from the right one
        (apply str (for [{:keys [law fns]} silent]
                     (str "\n  law `" law "` tells none of " (str/join ", " (map #(str "`" % "`'s") fns))
@@ -4286,12 +4423,17 @@
        (apply str (for [{:keys [id text blocking]} questions :when (not blocking)]
                     (str "\n  open question `" id "`: " text)))
        ;; what every proof here rests on
-       (when (seq assumed)
+       (when-let [as (seq (remove :component assumed))]
          (str "\n  assumes, tested but not proved: "
-              (str/join ", " (for [{f :fn sig :sig a :assumption} assumed]
+              (str/join ", " (for [{f :fn sig :sig a :assumption} as]
                                (if f (str f " " (sig-str sig)) (str a))))))
-       (apply str (for [{d :spec n :imported sk :skipped} uses]
+       (apply str (for [{d :spec n :imported sk :skipped} uses
+                        :let [fs (keep #(when (= d (:component %)) (:fn %)) assumed)]]
                     (str "\n  uses " d ": " n (if (= 1 n) " proved law" " proved laws") " to cite"
+                         (when (seq fs)
+                           (str "; its fns " (str/join ", " (map #(str "`" (name %) "`") fs))
+                                " are taken at that spec: typed, held to their :requires where the code"
+                                " calls them, and not unfolded in proofs here"))
                          (apply str (for [[l why] sk]
                                       (str "\n    law `" l "` of " d " is not imported, being unproved: " why))))))
        (apply str (for [{l :lemma p :proof st :status} lemmas :when (= :proved st)]
@@ -4666,11 +4808,11 @@
   [prop refs spec-ns]
   (let [[bs body] (leading-foralls prop)
         gs (vec (keep (fn [[x t]] (guard t x refs spec-ns)) bs))]
-    (if (empty? gs)
-      prop
-      (reduce (fn [acc [x t]] (list 'forall [x (erase t refs)] acc))
-              (list '=> (if (next gs) (cons 'and gs) (first gs)) body)
-              (reverse bs)))))
+    ;; a refinement with nothing to guard, (refine Account [a {...}] true), is
+    ;; still erased: the prover reads base types, a refinement's name it does not
+    (reduce (fn [acc [x t]] (list 'forall [x (erase t refs)] acc))
+            (if (empty? gs) body (list '=> (if (next gs) (cons 'and gs) (first gs)) body))
+            (reverse bs))))
 
 (defn- thrown? [r]
   (or (:error r) (some (fn [[_ v]] (str/starts-with? (str v) "threw:")) (:detail r))))
@@ -4820,7 +4962,12 @@
                 (-> acc
                     (update :lemmas into proved)
                     (update :tenv merge (type-env-of de dep))
-                    (update :report conj {:spec dep :imported (count proved) :skipped skipped}))))
+                    (update :report conj {:spec dep :imported (count proved) :skipped skipped})
+                    ;; what is built on a component that fails its own spec stands on nothing
+                    (cond-> (not (:ok r))
+                      (update :failed conj
+                              (str "the spec builds on " dep ", which fails its own check; fix it first:\n"
+                                   (str/join "\n" (map #(str "    " %) (str/split-lines (str (:message r)))))))))))
             {:lemmas [] :tenv {} :report []}
             deps)))
 
@@ -5579,7 +5726,8 @@
              {:fn q :sig sig :status :failed
               :why (str "the spec assumes a signature for `" q "`, which does not resolve: require"
                         " its namespace in the spec, and name it through an alias")}
-             :else {:fn q :sig sig :status :held}))
+             :else (cond-> {:fn q :sig sig :status :held}
+                     (get-in e [::components q]) (assoc :component (get-in e [::components q :spec])))))
          (for [{:keys [name prop]} (:assumptions e)]
            (try
              (let [p (desugar prop)
@@ -5759,6 +5907,171 @@
 
 (declare check*)
 
+;; --- the spec alone, before the code ----------------------------------------------
+
+(def ^:private ^:dynamic *stub-miss*
+  "An atom set when a stand-in for unwritten code is asked what no example
+  of its fn says."
+  nil)
+
+(defn- stub-fn
+  "A stand-in for fn nm, which the target does not define yet: it answers
+  at the arguments its examples give, from table (an atom), and nowhere
+  else."
+  [nm table]
+  (fn [& args]
+    (let [k (vec args)]
+      (if (contains? @table k)
+        (get @table k)
+        (do (some-> *stub-miss* (reset! true))
+            (throw (ex-info (str "`" nm "` is not written yet") {::no-code true})))))))
+
+(defn- vet
+  "The spec checked alone, when its target has no source yet: what can be
+  said of it before any code is written.  Each type it names is drawn and
+  conforms; each example fits its fn's signature and :requires; each
+  graph is wired by the signatures; each law calls the target; and each
+  law that calls a fn on its own variables is run at that fn's examples,
+  the target's fns answering there and nowhere else, so a law that
+  contradicts an example fails now, not after the code is written.  A
+  report with :ok false, since there is no code, and :no-code true."
+  [spec-ns opts]
+  (let [e (assoc (get @registry spec-ns) ::ns spec-ns)
+        target (or (:target opts) (:target e))
+        e (assoc e :target target)
+        {:keys [anns]} e
+        made? (not (find-ns target))
+        tns (create-ns target)
+        tables (into {} (for [[nm _] anns] [nm (atom {})]))
+        _ (doseq [[nm table] tables
+                  :when (or made? (not (ns-resolve tns nm)))]
+            (intern tns nm (stub-fn nm table)))]
+    (try
+      (let [refs (refines-of e)
+            tenv (type-env-of e spec-ns)
+            publics (set (keys (ns-publics tns)))
+            interns (set (keys (ns-interns (the-ns spec-ns))))
+            ctx {:ev (evaluator spec-ns) :tenv tenv :draws (atom {})}
+            ev (fn [f] (binding [*ns* (the-ns spec-ns)] (eval f)))
+            seed (or (:seed opts) 42)
+            laws (-> (vec (:laws e))
+                     (into (ensures-laws e))
+                     (into (mapcat #(graph-obligations % refs (:invariants e)) (:graphs e))))
+            examples (keep :example laws)
+            problems (atom [])
+            problem! #(swap! problems conj %)
+            ;; the examples' values, an example whose arguments call the target
+            ;; read once the examples it calls have their answers
+            ex-vals (loop [todo examples, done [], pass 0]
+                      (let [[ok left] (reduce (fn [[ok left] {f :fn :keys [args out] :as x}]
+                                                (let [v (binding [*stub-miss* (atom false)]
+                                                          (try {:args (mapv ev args) :out (ev out)}
+                                                               (catch Throwable ex
+                                                                 (when-not (::no-code (ex-data ex))
+                                                                   {:error (or (ex-message ex) (str ex))}))))]
+                                                  (cond (nil? v) [ok (conj left x)]
+                                                        (:error v) (do (problem! (str "example " (pr-str (list* f args))
+                                                                                      " cannot be read: " (:error v)))
+                                                                       [ok left])
+                                                        :else (do (swap! (get tables f) assoc (:args v) (:out v))
+                                                                  [(conj ok (merge x v)) left]))))
+                                              [[] []] todo)]
+                        (if (and (seq left) (seq ok) (< pass 5))
+                          (recur left (into done ok) (inc pass))
+                          (do (doseq [{f :fn :keys [args]} left]
+                                (problem! (str "example " (pr-str (list* f args))
+                                               " calls the target at arguments no other example gives")))
+                              (into done ok)))))
+            ;; each type the spec names makes values that fit it
+            types (distinct (concat (mapcat (fn [[_ s]] (conj (:params s) (:ret s))) anns)
+                                    (vals (into {} (mapcat (comp :states second) (:graphs e))))
+                                    (for [{:keys [prop]} laws
+                                          [_ t] (first (leading-foralls (desugar prop)))]
+                                      t)))
+            drawn (atom 0)]
+        (doseq [t types]
+          (try
+            (dotimes [i 20]
+              (let [v (draw ctx t i (+ seed i))]
+                (swap! drawn inc)
+                (when-not (conforms? t v tenv)
+                  (throw (ex-info (str "type `" (pr-str t) "` made " (pr-str v) ", which does not fit it") {})))))
+            (catch Throwable ex
+              (problem! (str "cannot make values of `" (pr-str t) "`: " (or (ex-message ex) (str ex)))))))
+        ;; each example fits its fn's signature and :requires
+        (doseq [{f :fn :keys [args out]} ex-vals
+                :let [{:keys [params ret]} (get anns f)
+                      call (pr-str (list* f args))]]
+          (cond
+            (nil? params) (problem! (str "example " call ": the spec gives `" f "` no signature"))
+            (not= (count params) (count args))
+            (problem! (str "example " call " passes " (count args) " argument(s), but `" f "` takes " (count params)))
+            :else
+            (do (doseq [[t a i] (map vector params args (range)) :when (not (conforms? t a tenv))]
+                  (problem! (str "example " call ": argument " (inc i) ", " (pr-str a) ", is not a " (pr-str t))))
+                (when-not (conforms? ret out tenv)
+                  (problem! (str "example " call ": the result " (pr-str out) " is not a " (pr-str ret))))
+                (when-let [rq (get-in e [:contracts f :requires])]
+                  (when-not (try (apply (ev rq) args) (catch Throwable _ false))
+                    (problem! (str "example " call " breaks `" f "`'s :requires " (pr-str (nth rq 2)))))))))
+        ;; each graph is wired by the signatures
+        (doseq [g (:graphs e), err (graph-flow-errors g anns refs)]
+          (problem! err))
+        ;; each law calls the target, and agrees with the examples it can run at
+        (let [checked (atom #{})]
+          (doseq [{:keys [name prop example guard-law]} laws
+                  ;; a guard's own laws are about the spec's test, not the code
+                  :when (not (or example guard-law))]
+            (let [qp (try (qualify (desugar prop) #{} publics interns target spec-ns) (catch Throwable _ nil))
+                  [bs body] (when qp (leading-foralls qp))
+                  vars (mapv first bs)]
+              (cond
+                (nil? qp) nil
+                (not (calls-target? qp target))
+                (problem! (str "law `" name "` is vacuous: it calls no fn of " target))
+                :else
+                (doseq [{f :fn :keys [args]} ex-vals
+                        :let [qnm (symbol (str target) (str f))]
+                        pos (calls-on-vars qp qnm (count args))
+                        :let [pinned (into {} (for [[v i] pos] [v (nth args i)]))]
+                        :when (every? (fn [[v x]] (conforms? (get (into {} bs) v) x tenv)) pinned)
+                        i (range 10)
+                        :let [env (merge (into {} (for [[j [v t]] (map-indexed vector bs)
+                                                        :when (not (contains? pinned v))]
+                                                    [v (draw ctx t (mod i 30) (+ seed i (* 7919 j)))]))
+                                         pinned)
+                              miss (atom false)
+                              r (binding [*stub-miss* miss] (holds (assoc ctx :vars vars) body env))]
+                        :when (not @miss)]
+                  (if (= :fail (:result r))
+                    (when-not (contains? @checked [name f args])
+                      (swap! checked conj [name f args])
+                      (problem! (str "law `" name "` contradicts the example " (pr-str (list* f args)) " => "
+                                     (pr-str (get @(get tables f) (vec args)))
+                                     (apply str (for [[t v] (:detail r)]
+                                                  (str "\n    " (pr-str (unqualify-form t)) " => " v)))
+                                     (str "\n    at " (pr-str (into (sorted-map) env))))))
+                    (swap! checked conj [::ran name]))))))
+          (let [ps @problems
+                ran (count (filter #(and (vector? %) (= ::ran (first %))) @checked))
+                r {:ok false :no-code true :spec-ok (empty? ps) :spec spec-ns :target target
+                   :problems ps :laws [] :examples (count ex-vals) :types (count types)}]
+            (assoc r :message
+                   (str "writ.spec: " spec-ns " against " target ": no implementation yet"
+                        "\n  the spec alone: " (count types) " types make values that fit them, "
+                        (count ex-vals) " examples read, " ran " laws run at the examples' arguments"
+                        (if (empty? ps)
+                          (str "\n  nothing in the spec contradicts itself that this could find; write "
+                               target " next")
+                          (str "\n\n" (str/join "\n\n" ps))))))))
+      (finally
+        (when made? (remove-ns target))))))
+
+(defn- unwritten?
+  "Does target have no namespace loaded and no source to load it from?"
+  [target]
+  (and (symbol? target) (not (find-ns target)) (not (ns-resource target))))
+
 (defn check
   "Check a spec namespace against its target (or opts :target).  Returns a
   report map; :ok says whether everything held and :message explains any
@@ -5777,7 +6090,11 @@
   ([spec-ns] (check spec-ns {}))
   ([spec-ns opts]
    (binding [*parallel* (and *parallel* (not (false? (:parallel opts))))]
-     (check* spec-ns opts))))
+     (require spec-ns)
+     (let [target (or (:target opts) (:target (get @registry spec-ns)))]
+       (if (unwritten? target)
+         (vet spec-ns opts)
+         (check* spec-ns opts))))))
 
 (defn- check*
   [spec-ns opts]
@@ -5929,7 +6246,7 @@
                                                                                        (quant? (second (leading-foralls p)))
                                                                                        (head? p "exists"))
                                                                            (:law %))
-                                                                         ::example (:example %))
+                                                                         ::example (some-> (:example %) (assoc :spec-ns spec-ns)))
                                                         (:hypothesis-witness %)
                                                         (vary-meta assoc ::witness (:hypothesis-witness %))))
                                                    (remove #(or (:lemma %) (:step-of %)) results))
@@ -6023,9 +6340,10 @@
                                                 (seq run-errs) (assoc :runs-failed run-errs)))))
                                  (:graphs e)))
              graphless (and (empty? (:graphs e)) (empty? (:machines e)))
-             problems (vec (for [[g st] (:invariants e)
-                                 :when (not-any? #(= g (first %)) (:graphs e))]
-                             (str "invariant `" g " " st "` names a graph the spec does not have")))
+             problems (into (vec (for [[g st] (:invariants e)
+                                       :when (not-any? #(= g (first %)) (:graphs e))]
+                                   (str "invariant `" g " " st "` names a graph the spec does not have")))
+                            (:failed imports))
              r (assoc base :laws results :gaps gaps :calls call-results :flows flow-results
                            :uses (:report imports)
                            ;; the proved laws, erased and qualified, for a spec that uses this one

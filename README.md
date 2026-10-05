@@ -180,6 +180,29 @@ structurally smaller part of its own parameter (destructure it, or use
 dec/rest/next of it under a test)
 ```
 
+## Before the code
+
+A spec is written first, so it is checked first. When its target has no
+source yet, `check` checks the spec alone and says so: `no
+implementation yet`, never `:ok`. Each type the spec names is drawn and
+must conform (a refinement that starves, or a `{:build f}` that builds
+values outside it, shows here); each example must fit its fn's signature
+and `:requires`; each graph must be wired by the signatures; each law
+must call the target. And each law that calls a fn on its own variables
+is run at that fn's examples, the unwritten fns answering there and
+nowhere else, so a law and an example that disagree are found before
+anyone writes code to satisfy both:
+
+```
+writ.spec: shop.core-spec against shop.core: no implementation yet
+  the spec alone: 2 types make values that fit them, 1 examples read, 1 laws run at the examples' arguments
+
+law `the-price` contradicts the example (price 2) => 7
+    (price q) => 7
+    (* 3 q) => 6
+    at {q 2}
+```
+
 ## What a spec should say
 
 Start from the problem, not the code. Ask what makes an answer right, and
@@ -1271,6 +1294,24 @@ a strong dependency can't make a weak spec look strong. A law of the used
 spec that is only tested is not imported, and the report says so. Specs
 may not use each other in a cycle.
 
+The used spec's target is a component the code here builds on, and it is
+taken at its spec. If the used spec fails its own check, this one fails
+too, with that report. The component's signed fns are typed by their
+signatures where this target calls them, checked against their
+`:requires` while the laws here run, and left folded in the proofs here:
+a workflow's proofs rest on the component's laws, so they hold for any
+implementation of it that meets its spec. A component's protocol goes in
+its `:requires`, and a caller that breaks it fails:
+
+```
+law `a-wrong-password-pays-nothing` fails for
+  ...
+  (checkout accounts user password total) => threw: Writ: `my.auth/charge` requires (authed? s), but is called with [{:user "", :authed false} 0]
+```
+
+`test/writ/spec_demo/shop_spec.clj` builds a checkout on
+`auth_spec.clj` this way.
+
 ### Requiring proof
 
 A tested law has passed some trials; a proved one holds for every input.
@@ -1278,7 +1319,7 @@ By default a spec accepts either, and the report says which each law got:
 
 ```
 writ.spec: my.sort-spec against my.sort: ok
-  6 of 7 laws proved; tested, not proved: smallest-first (each on at least 1000 inputs)
+  6 of 7 laws proved; tested, not proved: smallest-first (each on at least 1000 inputs that met its hypothesis)
 ```
 
 A law that is only tested runs its first 100 trials and then up to 900

@@ -58,6 +58,16 @@
                    (check-goal o g* hs (:then p)))
                  (check-goal opts g (conj hyps c) (:then p)))
                (check-goal opts g (conj hyps [:call 'not c]) (:else p)))
+      :extensional (let [i (:on p)
+                         taken (into (set (keys (:types opts))) (mapcat t/vars (cons g hyps)))
+                         _ (when-not (and (symbol? i) (not (contains? taken i)))
+                             (reject! "the index `" i "` of an element-wise proof is not fresh"))
+                         e (or (sc/extensional (first @cc) @n i)
+                               (reject! "not an equality of two sequences: " (pr-str (t/show @n))))
+                         o (assoc-in opts [:types i] 'Nat)]
+                     (when-not @vacuous
+                       (check-goal o (:count-goal e) hyps (:count p))
+                       (check-goal o (:nth-goal e) (conj hyps (:nth-hyp e)) (:elements p))))
       :list-cases (let [v (:on p)]
                     (when-not (:writ/elems (get-in opts [:types v]))
                       (reject! "`" v "` is not a list of elements"))

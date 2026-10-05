@@ -443,6 +443,20 @@
         [ctx vacuous] (if vacuous [ctx vacuous] (take-all ctx hyps))]
     (under-ih opts ctx vacuous (:ih pctx) n)))
 
+(defn extensional
+  "For a normal goal n that says two sequences are =, the goals that say
+  it element by element at index variable i: {:count-goal :nth-hyp
+  :nth-goal}.  Two values that are never nil and are sequences or vectors
+  are = when they have the same count and, at each i below it, = elements.
+  nil when n is not such an equality."
+  [ctx n i]
+  (when (and (= :call (t/head n)) (= '= (second n)) (= 4 (count n)))
+    (let [[_ _ a b] n]
+      (when (and (rw/seq-value? ctx a) (rw/seq-value? ctx b))
+        {:count-goal [:call '= [:call 'count a] [:call 'count b]]
+         :nth-hyp [:call '< i [:call 'count a]]
+         :nth-goal [:call '= [:call 'nth a i] [:call 'nth b i]]}))))
+
 (defn data-cases
   "One case per constructor of v's data type, as [[value types] ...]; nil
   when v is not of a data type.  A case split, not induction: no case
