@@ -1729,14 +1729,43 @@
               :else []))]
     (vec (walk nil v))))
 
+(defn- records-inside
+  "The maps inside v, at any depth, that hold a scalar under a keyword:
+  the records a law's scalars may be about."
+  [v]
+  (letfn [(walk [v]
+            (cond
+              (map? v) (concat (when (some (fn [[k x]] (and (keyword? k) (or (integer? x) (keyword? x)))) v) [v])
+                               (mapcat walk (vals v)))
+              (coll? v) (mapcat walk v)
+              :else []))]
+    (vec (walk v))))
+
+(defn- focus-points
+  "Each scalar inside v, with the map keys on the way to it and the
+  record it sits in: {:vals [key ... value] :rec map}.  A law's scalars
+  asked about one such point -- a line and a member of it, a lot's sku
+  and a time near its expiry -- meet the case the law is about."
+  [v]
+  (letfn [(walk [v keys rec]
+            (cond
+              (map? v) (let [rec (if (some (fn [[k x]] (and (keyword? k) (or (integer? x) (keyword? x)))) v) v rec)]
+                         (mapcat (fn [[k x]] (walk x (if (or (integer? k) (keyword? k)) (conj keys k) keys) rec)) v))
+              (coll? v) (mapcat #(walk % keys rec) v)
+              (or (integer? v) (keyword? v)) [{:vals (conj keys v) :rec rec}]
+              :else []))]
+    (vec (walk v [] nil))))
+
 (defn- related-gen
-  "Generators for a law's variables, drawn together: now and then a
-  scalar one -- a Nat, Int or Keyword -- is a value found inside the
-  law's other values, one under a key of its own name first.  Drawn apart,
-  `(forall [s Stock, sku Nat] ...)` almost never asks after a sku the
-  stock holds, nor `id` after a lot it has.  The choice is drawn beside
-  the values, so they shrink as they would apart and the choice toward
-  none."
+  "Generators for a law's variables, drawn together: half the trials are
+  about one record inside the law's other values, every scalar -- a Nat,
+  Int or Keyword -- a value of that record, and in the rest a scalar now
+  and then is one. `(forall [s Stock, sku Nat, now Nat] ...)` asks after a lot's
+  sku at a time near its expiry, a field of the scalar's own name first,
+  an integer now and then one either side of it.  Drawn apart, a law
+  almost never asks after a sku the stock holds, nor at a time one of
+  its lots is live.  The choice is drawn beside the values, so they
+  shrink as they would apart and the choice toward none."
   [bs tenv]
   (let [gens (mapv #(type->gen (second %) tenv) bs)
         kinds (mapv (fn [[_ t]] (let [t (plain t)]
@@ -1746,27 +1775,74 @@
         fits? (fn [kind x] (case kind
                              :nat (and (integer? x) (<= 0 x))
                              :int (integer? x)
-                             :kw (keyword? x)))]
+                             :kw (keyword? x)))
+        choice (gen/tuple (gen/frequency [[2 (gen/return false)] [1 (gen/return true)]])
+                          gen/nat
+                          (gen/elements [0 -1 1]))]
     (if (or (not-any? some? kinds) (every? some? kinds))
       gens
       [(gen/fmap
-         (fn [[vs choices]]
-           (let [inside (vec (mapcat (fn [v kind] (when-not kind (scalars-inside v))) vs kinds))]
-             (mapv (fn [[x nm] kind [use? i]]
+         (fn [[vs [focus? ri] choices]]
+           (let [structured (mapcat (fn [v kind] (when-not kind [v])) vs kinds)
+                 inside (vec (mapcat scalars-inside structured))
+                 points (vec (mapcat focus-points structured))
+                 point (when (seq points) (nth points (mod (quot ri 2) (count points))))
+                 recs (vec (mapcat records-inside structured))
+                 ;; a record alike but for one field to another: where a
+                 ;; tie-break decides, a trial is about it half the time
+                 twinned (filterv (fn [r] (some (fn [o] (and (not (identical? r o)) (= (set (keys r)) (set (keys o)))
+                                                            (>= 1 (count (filter #(not= (get r %) (get o %)) (keys r))))))
+                                                recs))
+                                  recs)
+                 ;; the record a trial is about: one with a twin half the
+                 ;; time, else the one its point sits in
+                 rec (if (and (seq twinned) (even? ri))
+                       (nth twinned (mod (quot ri 2) (count twinned)))
+                       (:rec point))]
+             ;; half the time a point's keys and value go to the law's
+             ;; scalars in order, the last to its value: [t m] a line and a
+             ;; member of it
+             (let [scalar-idx (vec (keep-indexed (fn [j k] (when k j)) kinds))
+                   path (:vals point)
+                   by-place (when (and point (odd? ri))
+                              (into {} (map vector (reverse scalar-idx) (reverse path))))]
+             (mapv (fn [[x nm] kind [use? i off] j]
                      (let [own (keyword (clojure.core/name nm))
+                           of-rec (when (and kind rec) (filterv #(fits? kind (second %)) (seq rec)))
+                           named (filterv #(= own (first %)) of-rec)
+                           compared (get-in tenv [::seeds ::compares nm])
+                           near (filterv #(contains? compared (first %)) of-rec)
                            ok (when kind (filterv #(fits? kind (second %)) inside))
-                           named (filterv #(= own (first %)) ok)
-                           ;; its own key first, but not only: a start is
-                           ;; also tried at another booking's end
-                           pool (if (and (seq named) (even? i)) named ok)]
-                       (if (and kind use? (seq pool))
-                         (second (nth pool (mod (quot i 2) (count pool))))
+                           named-anywhere (filterv #(= own (first %)) ok)
+                           ;; the record's own field of that name, or one the code
+                           ;; compares it with; else a field of that name
+                           ;; anywhere, else anything inside
+                           at-rec (cond (seq named) named (seq near) near)
+                           ;; the keys on the way to the point, and the point
+                           on-path (when (and kind point)
+                                     (not-empty (filterv #(fits? kind (second %))
+                                                         (map (fn [x] [nil x]) (:vals point)))))
+                           placed (let [y (get by-place j ::none)]
+                                    (when (and kind (not= ::none y) (fits? kind y)) [[nil y]]))
+                           pool (cond at-rec at-rec
+                                      (and focus? placed) placed
+                                      (and focus? on-path) on-path
+                                      (and (seq named-anywhere) (even? i)) named-anywhere
+                                      :else ok)]
+                       ;; a trial about a point relates every scalar to it; the
+                       ;; others, as any trial, now and then
+                       (if (and kind (or (and focus? (or at-rec on-path)) use?) (seq pool))
+                         (let [y (second (nth pool (mod (quot i 2) (count pool))))]
+                           ;; an integer, or one either side of it: a `now` just
+                           ;; before an `:expires`, at it, or just past it
+                           (if (integer? y)
+                             (let [z (+ y off)] (if (and (= :nat kind) (neg? z)) y z))
+                             y))
                          x)))
-                   (map vector vs (map first bs)) kinds choices)))
+                   (map vector vs (map first bs)) kinds choices (range)))))
          (gen/tuple (apply gen/tuple gens)
-                    (apply gen/tuple (repeat (count bs)
-                                             (gen/tuple (gen/frequency [[2 (gen/return false)] [1 (gen/return true)]])
-                                                        gen/nat)))))])))
+                    (gen/tuple (gen/frequency [[1 (gen/return false)] [1 (gen/return true)]]) gen/nat)
+                    (apply gen/tuple (repeat (count bs) choice))))])))
 
 (defn- test-law
   [ctx {:keys [name prop witness]} {:keys [trials seed max-size]}]
@@ -2127,6 +2203,28 @@
                                                      pinned)))))
                           (range n))))))
             (pin-sites prop qnm (count args))))))
+
+(defn- rejects-at-env
+  "Where law prop fails with fn qnm's arguments set to args, its other
+  variables drawn n times: {:env :detail}, or nil."
+  [ctx prop qnm args n seed]
+  (let [[bs body] (leading-foralls prop)
+        vars (mapv first bs)
+        types (into {} bs)
+        ctx* (assoc ctx :vars vars)]
+    (first
+      (for [site (pin-sites prop qnm (count args))
+            :let [pinned (site args)]
+            :when (and pinned (every? (fn [[v x]] (conforms? (get types v) x (:tenv ctx))) pinned))
+            :let [rest-bs (remove #(contains? pinned (first %)) bs)]
+            i (range n)
+            :let [env (merge (zipmap (map first rest-bs)
+                                     (map-indexed (fn [j [_ t]] (draw ctx t (mod i 30) (+ seed i (* 7919 j))))
+                                                  rest-bs))
+                             pinned)
+                  h (holds ctx* body env)]
+            :when (= :fail (:result h))]
+        {:env env :detail (:detail h)}))))
 
 (def ^:dynamic *stand-ins*
   "var -> the fn a stand-in puts in its place, on this thread: a var
@@ -2735,6 +2833,17 @@
   code is read too; nothing here is checked."
   [ns-sym]
   (graph-of (book/read-forms (source-url ns-sym))))
+
+(defn- reachable-fns
+  "nm and the fns of ns-sym its code reaches, by simple name."
+  [ns-sym nm]
+  (let [g (try (call-graph ns-sym) (catch Throwable _ {}))]
+    (loop [todo [nm] seen #{}]
+      (if-let [x (first todo)]
+        (if (contains? seen x)
+          (recur (rest todo) seen)
+          (recur (concat (rest todo) (filter #(nil? (namespace %)) (get g x))) (conj seen x)))
+        seen))))
 
 (defn- wide-graph
   "The call graph across the project namespaces reachable from ns-sym,
@@ -3926,6 +4035,24 @@
             {}
             (mapcat pairs (tree-seq coll? seq forms)))))
 
+(defn- compared-fields
+  "Per name, the map keys forms compare it against: (< now (:expires l))
+  gives now #{:expires}.  A law's scalar of that name is drawn near
+  that field of a record, the case the comparison decides."
+  [forms]
+  (let [field (fn [x] (cond (and (seq? x) (keyword? (first x)) (= 2 (count x))) (first x)
+                            (and (seq? x) (= 'get (first x)) (= 3 (count x)) (keyword? (nth x 2))) (nth x 2)))
+        pairs (fn [f]
+                (when (and (seq? f) (contains? '#{< <= > >= = not= == compare} (first f)))
+                  (let [xs (rest f)]
+                    (for [a xs b xs
+                          :let [k (field b)]
+                          :when (and (symbol? a) (nil? (namespace a)) k)]
+                      [a k]))))]
+    (reduce (fn [m [a k]] (update m a (fnil conj #{}) k))
+            {}
+            (mapcat pairs (tree-seq coll? seq forms)))))
+
 (defn- code-seeds
   "Per scalar type, the values a target's code mentions -- its own and that
   of the project namespaces it requires, where the prover reads it too: its
@@ -3944,7 +4071,8 @@
        'Int near
        'Nat (set (filter #(>= % 0) near))
        'Any (into kws near)
-       ::fields (field-literals forms)})
+       ::fields (field-literals forms)
+       ::compares (compared-fields forms)})
     (catch Throwable _ {})))
 
 (def ^:private filter-size
@@ -4606,8 +4734,10 @@
          (when error (str "  " error))
          (when (and original (not= original counterexample))
            (str "\n  (shrunk from " (pr-str original) ", failing on test " trial ")"))
-         (if (= :solver found-by)
-           "\n  (found by the solver, when no test did, and confirmed by running the code)"
+         (case found-by
+           :solver "\n  (found by the solver, when no test did, and confirmed by running the code)"
+           :tie (str "\n  (found at an input where the order of tied items decides the result,"
+                     " when no random test made such a tie)")
            (when seed (str "\n  (replay with {:seed " seed "})"))))))
 
 (defn- format-stuck
@@ -6390,6 +6520,56 @@
           (let [v ((nth fs i))]
             (recur (inc i) (conj outs (boolean v)) v (decided v))))))))
 
+(def ^:private ties
+  "[target id] -> what a sort of the code saw while the laws ran: :ran,
+  the times it ran on two items or more, :tied, the times two of them had
+  the same key -- vector keys alike in all but their last part -- and
+  :vector when its keys were vectors."
+  (atom {}))
+
+(defn- note-ties! [target id ks]
+  (when (next ks)
+    (swap! ties update [target id]
+           (fn [m]
+             (let [vec? (every? #(and (vector? %) (< 1 (count %))) ks)
+                   tied (if vec?
+                          (< (count (distinct (map pop ks))) (count ks))
+                          (< (count (distinct ks)) (count ks)))]
+               (cond-> (update m :ran (fnil inc 0))
+                 vec? (assoc :vector true)
+                 tied (update :tied (fnil inc 0))))))))
+
+(def ^:dynamic *flip-ties*
+  "The [target id] of the sorts a stand-in runs with their ties the other
+  way round: what a wrong tie-break, or none, would do."
+  #{})
+
+(defn- tie-group
+  "What two items must share to be tied: a vector key but its last part,
+  any other key whole."
+  [k]
+  (if (and (vector? k) (< 1 (count k))) (pop k) k))
+
+(defn -sort-by
+  "(sort-by kf coll), its items' keys noted for target's sort id; under
+  *flip-ties*, each run of tied items reversed."
+  [target id kf coll]
+  (let [ks (mapv kf coll)]
+    (note-ties! target id ks)
+    (let [sorted (sort-by kf coll)]
+      (if (contains? *flip-ties* [target id])
+        (mapcat reverse (partition-by #(tie-group (kf %)) sorted))
+        sorted))))
+
+(defn -pick-by
+  "(op kf x ...), min-key or max-key, its items' keys noted; under
+  *flip-ties*, the other of tied items picked."
+  [target id op kf xs]
+  (note-ties! target id (mapv kf xs))
+  (if (contains? *flip-ties* [target id])
+    (apply op kf (reverse xs))
+    (apply op kf xs)))
+
 (defn- probe-combos
   "form with each `and` and `or` of two or more operands run by -combo:
   [form' combos], combos id -> {:op :parts}, the operands as written."
@@ -6412,11 +6592,140 @@
                    (swap! found assoc id {:op (keyword (name (first f))) :parts parts})
                    (list `-combo (list 'quote target) id (keyword (name (first f)))
                          (vec (for [p parts] (list 'fn [] (walk p))))))
+                 ;; a sort, and an arg-min or arg-max: whether a trial ever
+                 ;; gave two items the same key, the case a tie-break decides
+                 (and (seq? f) (= 'sort-by (first f)) (= 3 (count f)))
+                 (let [id (swap! ids inc)]
+                   (swap! found assoc id {:op :sort-by :form f})
+                   (list `-sort-by (list 'quote target) id (walk (nth f 1)) (walk (nth f 2))))
+                 (and (seq? f) (contains? '#{min-key max-key} (first f)) (<= 3 (count f)))
+                 (let [id (swap! ids inc)]
+                   (swap! found assoc id {:op :pick-by :form f})
+                   (list `-pick-by (list 'quote target) id (first f) (walk (nth f 1)) (vec (map walk (drop 2 f)))))
+                 (and (seq? f) (= 'apply (first f)) (contains? '#{min-key max-key} (second f)) (= 4 (count f)))
+                 (let [id (swap! ids inc)]
+                   (swap! found assoc id {:op :pick-by :form f})
+                   (list `-pick-by (list 'quote target) id (second f) (walk (nth f 2)) (walk (nth f 3))))
                  (seq? f) (apply list (map walk f))
                  (vector? f) (mapv walk f)
                  (map? f) (into {} (map (fn [[k v]] [(walk k) (walk v)])) f)
                  :else f))]
     [(walk form) @found]))
+
+(def ^:private tie-runs
+  "Fewer runs than this with two items of one key leave a tie-break
+  barely tried: where the tie falls, among which items, decides whether a
+  wrong tie-break shows."
+  20)
+
+(declare related-gen reachable-fns)
+
+(defn- tie-witnesses
+  "Up to k inputs of signed fn nm at which its result changes when the
+  ties of sort key go the other way round: the inputs at which a wrong
+  tie-break, or none, shows.  Such inputs are rare, so they are looked
+  for among many draws, the fn alone run on each.  [[param ...] [args ...]]."
+  [target nm sig ctx seed key k]
+  (let [v (ns-resolve (the-ns target) nm)
+        real (when (var? v) @v)
+        params (vec (take (count (:params sig)) (first (:arglists (meta v)))))
+        bs (mapv (fn [i t] [(or (get params i) (symbol (str "arg" i))) t]) (range) (:params sig))
+        gens (try (related-gen bs (:tenv ctx)) (catch Throwable _ nil))
+        g (when gens (if (= (count gens) (count bs)) (apply gen/tuple gens) (first gens)))
+        run (fn [f args] (try {:ok (apply f args)} (catch Throwable _ ::threw)))
+        flipped (fn [& args] (binding [*flip-ties* #{key}] (apply real args)))]
+    (when (and (fn? real) g)
+      [(mapv first bs)
+       (->> (random/split-n (random/make-random (+ seed (hash key))) 3000)
+            (map-indexed (fn [i r] (vec (rose/root ((:gen g) r (mod i 30))))))
+            (filter #(not= (run real %) (run flipped %)))
+            distinct
+            (take k)
+            vec)])))
+
+(defn- tie-sorts-of
+  "The sorts in sorts that signed fn nm reaches.  The laws' trials need
+  not have tied any: that they seldom do is why their ties are looked for."
+  [target nm sorts]
+  (let [reach (reachable-fns target nm)]
+    (filter #(contains? reach (:fname %)) sorts)))
+
+(defn- tie-flips
+  "Stand-ins for signed fn nm: the real fn with the ties of a sort it
+  reaches the other way round, each kept only with an input at which its
+  result differs from the real fn's, where the laws that call nm are then
+  run."
+  [target nm sig ctx seed sorts]
+  (vec (for [{:keys [key form]} (tie-sorts-of target nm sorts)
+             :let [[ps ds] (tie-witnesses target nm sig ctx seed key 1)
+                   d (first ds)]
+             :when d]
+         {:desc (str "puts tied items of " (pr-str form) " the other way round, as a wrong tie-break"
+                     " would, and differs from the real fn on " (pr-str (zipmap ps d)))
+          :kind :mutant
+          :args d
+          :make (fn [real] (fn [& args] (binding [*flip-ties* #{key}] (apply real args))))})))
+
+(declare rejects-at-env)
+
+(defn- tie-trials
+  "Each law only tested, run as well at the inputs where the order of tied
+  items decides a signed fn's result -- found by turning the ties of the
+  sorts it reaches the other way round -- the law's other variables drawn
+  a few times.  A random trial seldom makes such a tie where it counts, so
+  a wrong tie-break would pass every other trial.  A law that fails there
+  fails, with that input."
+  [results ctx anns target sorts seed]
+  (let [;; a map is the same value in any order, but code that leans on the
+        ;; order it was built in reads it one way: each input in both
+        reorder (fn [d] (walk/postwalk #(if (and (map? %) (not (record? %)) (< 1 (count %)))
+                                          (into (empty %) (reverse (seq %)))
+                                          %)
+                                       d))
+        witnesses (into {} (for [[nm sig] anns
+                                 {:keys [key]} (tie-sorts-of target nm sorts)
+                                 :let [[_ ds] (tie-witnesses target nm sig ctx seed key 6)]
+                                 :when (seq ds)]
+                             ;; not distinct: a map and its reordering are equal
+                             [[nm key] (vec (mapcat (fn [d] [d (reorder d)]) ds))]))
+        by-fn (reduce (fn [m [[nm _] ds]] (update m nm into ds)) {} witnesses)]
+    (if (empty? by-fn)
+      results
+      (mapv (fn [r]
+              (if-not (and (= :tested (:status r)) (:prop r))
+                r
+                (or (first (for [[nm ds] by-fn
+                                 :let [qnm (symbol (name target) (name nm))]
+                                 d ds
+                                 :let [env (rejects-at-env ctx (:prop r) qnm d 5 seed)]
+                                 :when env]
+                             (assoc r :status :failed :counterexample (:env env) :detail (:detail env)
+                                    :found-by :tie)))
+                    r)))
+            results))))
+
+(defn- untied-sorts
+  "The sorts, arg-mins and arg-maxes of the code that ran on two items or
+  more while no trial gave two of them the same key: what decides between
+  equal items -- a tie-break, or the order they came in -- no law tries."
+  [target found]
+  (let [seen @ties]
+    (vec (for [[id {:keys [op form] fname :fn}] (sort-by key found)
+               :when (contains? #{:sort-by :pick-by} op)
+               :let [obs (get seen [target id])]
+               :when (pos? (:ran obs 0))
+               :let [vector-keys? (:vector obs)
+                     tied (:tied obs 0)]
+               :when (< tied tie-runs)]
+           (str "`" fname "`: " (pr-str form)
+                (if vector-keys?
+                  " had two items alike in all but the last part of their keys "
+                  " had two items with the same key ")
+                (if (zero? tied) "in none" (str "in only " tied)) " of the " (:ran obs) " times it ran, so"
+                (if vector-keys?
+                  " its tie-break is barely tried"
+                  (str " which of equal items " (if (= :sort-by op) "comes first" "it picks") " is barely tried"))
+                ": build a law with two such items")))))
 
 (defn- probe-tests
   "form, its macros expanded, with each if's test noted by -cov: [form'
@@ -6586,9 +6895,15 @@
                                (do (require t)
                                    (swap! coverage #(into {} (remove (fn [[[x] _]] (= x t))) %))
                                    (swap! combos #(into {} (remove (fn [[[x] _]] (= x t))) %))
+                                   (swap! ties #(into {} (remove (fn [[[x] _]] (= x t))) %))
                                    (assoc (install-probes! t) :target t)))))]
            (try
-             (let [r (check* spec-ns opts)
+             (let [r (check* spec-ns (assoc opts ::tie-sorts
+                                             (vec (for [{t :target :keys [combos]} probes
+                                                        :when (= t target)
+                                                        [id {:keys [op form] fname :fn}] combos
+                                                        :when (contains? #{:sort-by :pick-by} op)]
+                                                    {:key [t id] :form form :fname fname}))))
                    ;; a component's fns the target's code reaches, through its
                    ;; own helpers: what the spec's builders call is not the code's
                    reached (delay (let [g (merge (try (call-graph target) (catch Throwable _ {}))
@@ -6605,10 +6920,12 @@
                    notes (when (and (seq probes) (seq (:laws r)) (not (:no-code r)))
                            (mapcat (fn [{t :target :keys [tests combos]}]
                                      (if (= t target)
-                                       (concat (one-sided-tests t tests) (undecided-parts t combos))
+                                       (concat (one-sided-tests t tests) (undecided-parts t combos)
+                                               (untied-sorts t combos))
                                        (map #(str/replace-first % "`" (str "`" t "/"))
                                             (concat (one-sided-tests t (only-reached t tests))
-                                                    (undecided-parts t (only-reached t combos))))))
+                                                    (undecided-parts t (only-reached t combos))
+                                                    (untied-sorts t (only-reached t combos))))))
                                    probes))]
                (cond-> r
                  (seq notes)
@@ -6665,10 +6982,10 @@
                                anns)
              ;; the keys the spec's own helpers test, which a law about an
              ;; unwritten target, or one that names a case, is about too
-             seeds (update (code-seeds target) ::fields
-                           #(merge-with into (field-literals (try (book/read-forms (source-url spec-ns))
-                                                                  (catch Throwable _ nil)))
-                                        %))
+             spec-forms (try (book/read-forms (source-url spec-ns)) (catch Throwable _ nil))
+             seeds (-> (code-seeds target)
+                       (update ::fields #(merge-with into (field-literals spec-forms) %))
+                       (update ::compares #(merge-with into (compared-fields spec-forms) %)))
              ctx {:ev (evaluator spec-ns) :tenv (assoc tenv ::seeds seeds)
                   ;; the values drawn with a fixed seed, made once a check
                   :draws (atom {})}
@@ -6750,7 +7067,10 @@
                          ;; tests alone, so it gets more of them
                          ((fn [rs] (timed :more-trials
                                           #(let [wrapped (wrap! e)]
-                                             (try (more-trials ctx rs opts spec-ns target (:ns proof-e) @writ-version)
+                                             (try (cond-> (more-trials ctx rs opts spec-ns target (:ns proof-e) @writ-version)
+                                                    ;; and where the order of tied items decides
+                                                    (seq (::tie-sorts opts))
+                                                    (tie-trials ctx anns target (::tie-sorts opts) (or seed 42)))
                                                   (finally (unwrap! wrapped)))))))
                          (require-evidence
                            ;; a lemma is there to be cited, so it must be proved
@@ -6789,8 +7109,14 @@
                                 trials (or seed 42)
                                 ;; mutants of the fn's source, on request: they cost
                                 ;; a static check each
-                                (when (= :mutants (:adequacy opts))
-                                  (fn [nm sig] (mutants e target nm sig ctx (or seed 42) 12)))))
+                                ;; and a sort's ties the other way round, where
+                                ;; the laws saw ties: a tie-break they may not pin
+                                (let [mut? (= :mutants (:adequacy opts))
+                                      sorts (::tie-sorts opts)]
+                                  (when (or mut? (seq sorts))
+                                    (fn [nm sig]
+                                      (concat (when mut? (mutants e target nm sig ctx (or seed 42) 12))
+                                              (when (seq sorts) (tie-flips target nm sig ctx (or seed 42) sorts))))))))
                       [])
              gaps (vec (for [{f :fn s :survivors} per-fn :when (seq s)]
                          {:fn f :survivors s}))

@@ -44,3 +44,21 @@
     ;; and a for's own tests, (chunked-seq? ...), are no test of the code
     (is (not-any? #(re-find #"__\d+" %) (:one-way-tests r)) (pr-str (:one-way-tests r)))
     (is (not-any? #(re-find #"`holder`" %) (:one-way-tests r)) (pr-str (:one-way-tests r)))))
+
+(deftest a-missing-tie-break-is-caught-where-the-tie-decides
+  ;; five random trials, none extra: the tie that shows the wrong order
+  ;; comes from the inputs found by turning the sort's ties around
+  (doseq [sd [1 2 3]]
+    (let [opts {:seed sd :adequacy false :cache false :trials 5 :more-trials false}
+          bad (spec/check 'writ.spec-demo.lots-spec (assoc opts :target 'writ.spec-demo.lots-untied))
+          good (spec/check 'writ.spec-demo.lots-spec opts)
+          l (law-result bad 'the-earliest-then-the-lowest-id)]
+      (is (= :failed (:status l)) (str "seed " sd ": " (:message bad)))
+      (is (= :tie (:found-by l)) (str "seed " sd))
+      (is (str/includes? (:message bad) "where the order of tied items decides"))
+      (is (:ok good) (str "seed " sd ": " (:message good))))))
+
+(deftest a-tie-break-no-law-pins-is-a-gap
+  ;; with no law about it, the order of tied lots is a stand-in no law rejects
+  (let [r (spec/check 'writ.spec-demo.lots-loose-spec {:seed 7})]
+    (is (some #(str/includes? % "puts tied items of") (mapcat :survivors (:gaps r))) (:message r))))
