@@ -20,3 +20,8 @@
     (is (has? r "law `the-price` contradicts the example (price 2) => 7") (:message r))
     (is (has? r "example (price 0) breaks `price`'s :requires") (:message r))
     (is (has? r "law `arithmetic` is vacuous") (:message r))))
+
+(deftest an-example-of-an-unsigned-fn-is-named
+  (let [r (spec/check 'writ.spec-demo.unwritten-unsigned-spec)]
+    (is (:no-code r) (:message r))
+    (is (has? r "example (bump 1): the spec gives `bump` no signature") (:message r))))

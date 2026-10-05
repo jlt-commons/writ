@@ -45,3 +45,7 @@
   (forall [q Queue, now Nat]
     (=> (some (fn [k] (due? (get (:jobs q) k) now)) (keys (:jobs q)))
         (some? (next-job q now)))))
+
+(law a-due-job-named-is-taken
+  (forall [q Queue, id Nat, now Nat]
+    (=> (due? (get (:jobs q) id) now) (some? (next-job q now)))))

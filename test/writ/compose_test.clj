@@ -105,3 +105,9 @@
   (let [r (spec/check 'writ.spec-demo.hits-user-spec {:seed 3})]
     (is (:ok r) (:message r))
     (is (= :proved (:status (law-result r 'twice:hits:add-twice))) (:message r))))
+
+(deftest a-test-made-of-an-and-is-named-as-the-code-wrote-it
+  (let [r (spec/check 'writ.spec-demo.gate-spec {:seed 7 :adequacy false})]
+    (is (some #(str/includes? % "(and (<= 18 age) member?) was never true") (:one-way-tests r))
+        (pr-str (:one-way-tests r)))
+    (is (not (str/includes? (:message r) "-combo")) (:message r))))

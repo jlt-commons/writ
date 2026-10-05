@@ -23,3 +23,10 @@
   (let [r (spec/check 'writ.spec-demo.jobs-spec {:seed 7 :adequacy false :target 'writ.spec-demo.jobs-by-id})]
     (is (not (:ok r)))
     (is (= :failed (:status (law-result r 'no-due-job-is-better))) (:message r))))
+
+(deftest a-scalar-of-a-law-is-now-and-then-one-its-other-values-hold
+  ;; drawn apart, an `id` is rarely a key of the queue drawn beside it
+  (let [r (spec/check 'writ.spec-demo.jobs-spec {:seed 7 :adequacy false :more-trials false :cache false})
+        l (law-result r 'a-due-job-named-is-taken)]
+    (is (= :tested (:status l)) (:message r))
+    (is (<= 20 (- (:trials l) (:discarded l))) (pr-str l))))

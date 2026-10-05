@@ -1275,6 +1275,29 @@
                       (gen/return [])
                       (gen/fmap #(mapv vector ks %) (apply gen/tuple (repeat (count ks) vg))))))))))
 
+(defn- with-twins
+  "Values of g, a map of records, and now and then with one record a copy
+  of another but for its key, and a field that holds its key: two lots of
+  one sku that expire together, two jobs alike but for their ids.  Drawn
+  apart, records almost never agree in every field an order compares, and
+  where they do the tie-break decides.  The choice is drawn beside the
+  value, so it shrinks as g's own do, and the choice toward no twin."
+  [g]
+  (gen/frequency
+    [[3 g]
+     [1 (gen/fmap (fn [[m i j]]
+                    (let [ks (vec (keys m))]
+                      (if (< (count ks) 2)
+                        m
+                        (let [from (nth ks (mod i (count ks)))
+                              to (nth ks (mod j (count ks)))
+                              a (get m from)
+                              b (get m to)]
+                          (if (and (map? a) (map? b) (not= from to))
+                            (assoc m to (reduce-kv (fn [x f v] (if (= v to) (assoc x f v) x)) a b))
+                            m)))))
+                  (gen/tuple g gen/nat gen/nat))]]))
+
 (defn- index-records
   "Records for an index keyed by k.  When its key type has few values,
   the keys are drawn first and a record made for each, its key set: a
@@ -1363,15 +1386,17 @@
       ;; an index: records, each kept under its key, and one that would
       ;; share a key or a unique field with one before it left out
       (and (kind/index-type? t) (not (data-decl t tenv)))
-      (let [{k :key r :of u :unique} (kind/index-parts t)]
-        (gen/fmap (fn [rs]
-                    (reduce (fn [m x]
-                              (if (or (contains? m (get x k))
-                                      (some (fn [f] (some #(= (get x f) (get % f)) (vals m))) u))
-                                m
-                                (assoc m (get x k) x)))
-                            {} rs))
-                  (index-records r k tenv)))
+      (let [{k :key r :of u :unique} (kind/index-parts t)
+            g (gen/fmap (fn [rs]
+                          (reduce (fn [m x]
+                                    (if (or (contains? m (get x k))
+                                            (some (fn [f] (some #(= (get x f) (get % f)) (vals m))) u))
+                                      m
+                                      (assoc m (get x k) x)))
+                                  {} rs))
+                        (index-records r k tenv))]
+        ;; a unique field a twin would share is left out
+        (if (seq u) g (with-twins g)))
 
       (seq? t)
       (let [[h & as] t
@@ -1676,6 +1701,55 @@
       (when (contains? r :ok)
         (swap! counts update-in [a (boolean (:ok r))] (fnil inc 0))))))
 
+(defn- scalars-inside
+  "The scalars inside v, map keys too, each with the key it sits under
+  (nil for a map key or an element): [[key x] ...]."
+  [v]
+  (letfn [(walk [k v]
+            (cond
+              (map? v) (mapcat (fn [[mk x]] (concat (walk nil mk) (walk mk x))) v)
+              (coll? v) (mapcat #(walk nil %) v)
+              (or (integer? v) (keyword? v)) [[k v]]
+              :else []))]
+    (vec (walk nil v))))
+
+(defn- related-gen
+  "Generators for a law's variables, drawn together: now and then a
+  scalar one -- a Nat, Int or Keyword -- is a value found inside the
+  law's other values, one under a key of its own name first.  Drawn apart,
+  `(forall [s Stock, sku Nat] ...)` almost never asks after a sku the
+  stock holds, nor `id` after a lot it has.  The choice is drawn beside
+  the values, so they shrink as they would apart and the choice toward
+  none."
+  [bs tenv]
+  (let [gens (mapv #(type->gen (second %) tenv) bs)
+        kinds (mapv (fn [[_ t]] (let [t (plain t)]
+                                  (when (and (symbol? t) (not (refinement t tenv)))
+                                    ({'Nat :nat 'Int :int 'Keyword :kw} t))))
+                    bs)
+        fits? (fn [kind x] (case kind
+                             :nat (and (integer? x) (<= 0 x))
+                             :int (integer? x)
+                             :kw (keyword? x)))]
+    (if (or (not-any? some? kinds) (every? some? kinds))
+      gens
+      [(gen/fmap
+         (fn [[vs choices]]
+           (let [inside (vec (mapcat (fn [v kind] (when-not kind (scalars-inside v))) vs kinds))]
+             (mapv (fn [[x nm] kind [use? i]]
+                     (let [own (keyword (clojure.core/name nm))
+                           ok (when kind (filterv #(fits? kind (second %)) inside))
+                           named (filterv #(= own (first %)) ok)
+                           pool (if (seq named) named ok)]
+                       (if (and kind use? (seq pool))
+                         (second (nth pool (mod i (count pool))))
+                         x)))
+                   (map vector vs (map first bs)) kinds choices)))
+         (gen/tuple (apply gen/tuple gens)
+                    (apply gen/tuple (repeat (count bs)
+                                             (gen/tuple (gen/frequency [[2 (gen/return false)] [1 (gen/return true)]])
+                                                        gen/nat)))))])))
+
 (defn- test-law
   [ctx {:keys [name prop witness]} {:keys [trials seed max-size]}]
   (let [[bs body] (leading-foralls prop)
@@ -1724,23 +1798,28 @@
             discards (atom 0)
             {:keys [atoms hyp-atoms]} (law-atom-parts body vars)
             counts (atom {})
-            res (qc (prop/for-all* (mapv #(type->gen (second %) (:tenv ctx)) bs)
+            gens (related-gen bs (:tenv ctx))
+            ;; drawn together, the values come as one vector
+            together? (not= (count gens) (count bs))
+            res (qc (prop/for-all* gens
                                    (fn [& vals]
-                                     (case (:result (holds ctx* body (zipmap vars vals)))
-                                       :pass (do (count-atoms! ctx* atoms counts (zipmap vars vals)) true)
-                                       ;; a trial its hypothesis refused still shows
-                                       ;; how the hypothesis came out, and only that:
-                                       ;; the conclusion's clauses were not in play
-                                       :discard (do (swap! discards inc)
-                                                    (count-atoms! ctx* (filter hyp-atoms atoms) counts (zipmap vars vals))
-                                                    true)
-                                       false))))]
+                                     (let [vals (if together? (first vals) vals)]
+                                       (case (:result (holds ctx* body (zipmap vars vals)))
+                                         :pass (do (count-atoms! ctx* atoms counts (zipmap vars vals)) true)
+                                         ;; a trial its hypothesis refused still shows
+                                         ;; how the hypothesis came out, and only that:
+                                         ;; the conclusion's clauses were not in play
+                                         :discard (do (swap! discards inc)
+                                                      (count-atoms! ctx* (filter hyp-atoms atoms) counts (zipmap vars vals))
+                                                      true)
+                                         false)))))
+            unpack #(if together? (first %) %)]
         (cond
           (not (:pass? res))
-          (let [small (zipmap vars (get-in res [:shrunk :smallest]))]
+          (let [small (zipmap vars (unpack (get-in res [:shrunk :smallest])))]
             {:law name :status :failed
              :counterexample small
-             :original (zipmap vars (:fail res))
+             :original (zipmap vars (unpack (:fail res)))
              :trial (:num-tests res) :seed (:seed res)
              :detail (:detail (holds ctx* body small))})
 
@@ -6128,7 +6207,8 @@
                                                         (:error v) (do (problem! (str "example " (pr-str (list* f args))
                                                                                       " cannot be read: " (:error v)))
                                                                        [ok left])
-                                                        :else (do (swap! (get tables f) assoc (:args v) (:out v))
+                                                        ;; a fn with no signature has no stand-in: said below
+                                                        :else (do (some-> (get tables f) (swap! assoc (:args v) (:out v)))
                                                                   [(conj ok (merge x v)) left]))))
                                               [[] []] todo)]
                         (if (and (seq left) (seq ok) (< pass 5))
@@ -6292,7 +6372,19 @@
   [form target ids]
   (let [tests (atom {})
         ;; a local a macro bound, and:ed or or:ed or cased, shown as what it holds
-        shown (fn [t denv] (walk/postwalk #(if (and (symbol? %) (contains? denv %)) (get denv %) %) t))
+        ;; and an and or or that -combo runs, as the code wrote it
+        thunk-body (fn [th] (when (and (seq? th) (contains? '#{fn fn*} (first th)))
+                              (let [[a b] (rest th)]
+                                (cond (vector? a) b
+                                      (and (seq? a) (vector? (first a))) (second a)))))
+        shown (fn [t denv]
+                (walk/postwalk
+                  #(cond
+                     (and (symbol? %) (contains? denv %)) (get denv %)
+                     (and (seq? %) (= `-combo (first %)) (= 5 (count %)) (vector? (nth % 4)))
+                     (cons (symbol (name (nth % 3))) (map thunk-body (nth % 4)))
+                     :else %)
+                  t))
         constant? #(or (keyword? %) (true? %) (number? %) (string? %))
         walk (fn walk [f denv]
                (cond

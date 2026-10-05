@@ -270,7 +270,15 @@ failures: a law over every input may already answer one.
   from the keywords the code and the spec test or set that field to,
   `(= :ready (:status j))`, `(assoc j :status :dead)`: a `:status
   Keyword` is often `:ready`, so a law about ready jobs is met without
-  building them.
+  building them. A law's scalar variable, a `Nat`, `Int` or `Keyword`
+  quantified beside a structured one, is a third of the time a value
+  found inside it, one under a key of its own name first: in
+  `(forall [s Stock, sku Nat, id Nat] ...)` `sku` is often a lot's `:sku`
+  and `id` a lot the stock holds. An `Index` of records now and then has
+  a record that is a copy of another but for its key: two lots alike but
+  for their ids, where a tie-break decides. Laws still meet such cases
+  more surely when they build them; a tie-break deserves a law that
+  makes the tie.
 - A law is built from:
   - `(= a b)`
   - `(and P ...)`

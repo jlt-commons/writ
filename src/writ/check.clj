@@ -686,10 +686,12 @@
   columns known to be Nat, and those known to be finite collections."
   [params ast shadow tenv]
   (let [tenv (or tenv {})
+        ;; a record's fields are finite too: (vals (:lots stock))
         finite-type? (fn [t]
                        (and (some? t)
                             (or (= 'String t)
-                                (and (seq? t) (contains? '#{List Vec Set Map} (first t)))
+                                (and (seq? t) (contains? '#{List Vec Set Map Tuple Opt} (first t)))
+                                (and (map? t) (seq t))
                                 (and (symbol? t) (contains? tenv t) (not (:tvar (get tenv t))))
                                 (and (seq? t) (contains? tenv (first t))))))
         binds (atom {})
@@ -707,21 +709,31 @@
                   (let [h (when (= :invoke (:op init)) (core-head init {:bound #{}}))
                         args (:args init)
                         coll (case h
-                               (seq vec rest next nnext butlast pop distinct reverse)
+                               (seq vec rest next nnext butlast pop distinct reverse vals keys)
                                (when (= 1 (count args)) (first args))
-                               (drop filter remove keep take-while drop-while sort)
+                               (drop filter remove keep take-while drop-while sort sort-by)
                                (when (<= 1 (count args)) (last args))
+                               ;; a part of a value: every value of a type is
+                               ;; finite, only code makes an endless seq
+                               (get get-in) (first args)
                                map (when (<= 2 (count args)) (some #(when (copy-of % s) %) (rest args)))
                                (nthrest nthnext subvec) (first args)
                                nil)]
                     (cond
                       coll (copy-of coll s)
+                      ;; (:lots stock), a field of a finite value
+                      (and (= :invoke (:op init)) (keyword? (lit-val (:fn init))) (= 1 (count args)))
+                      (copy-of (first args) s)
                       (ref? init) (contains? s (qname-of (:name init)))
                       :else false)))]
     (walk-ast ast
       (fn [n]
         (case (:op n)
-          :let (doseq [[b init] (:bindings n)] (swap! binds assoc b init))
+          :let (doseq [[b init] (:bindings n)]
+                 (swap! binds assoc b init)
+                 ;; (let [lots (sort-by :expires (vals m))] (loop [lots lots] ...))
+                 (when (copy-of init @finite)
+                   (swap! finite conj (qname-of b))))
           :loop (doseq [[b init] (:bindings n)]
                   (swap! loops conj b)
                   (when (gensym? b)
