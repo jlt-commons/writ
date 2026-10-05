@@ -2064,22 +2064,44 @@
              ;; the inputs the solver found to meet a hypothesis no sample meets
              (every? #(not= :fail (:result (holds ctx* body %))) (::witness (meta prop))))))))
 
-(defn- calls-on-vars
-  "The calls of fn qnm in law prop whose arguments are each a variable
-  the law binds or an expression of none: where the law can be run at
-  given arguments of qnm.  Each as {var arg-position}."
+(defn- match-arg
+  "The law variables argument form f pins when the call is made at value
+  v, added to m, or nil when f cannot give v: a variable is v (the same v
+  wherever it appears), a vector literal is a vector of as many, each
+  part matched, a literal is itself, and an expression of none of the
+  law's variables is any value."
+  [f v vars m]
+  (cond
+    (contains? vars f) (if (contains? m f) (when (= v (get m f)) m) (assoc m f v))
+    (vector? f) (when (and (vector? v) (= (count f) (count v)))
+                  (reduce (fn [m [g x]] (or (match-arg g x vars m) (reduced nil))) m (map vector f v)))
+    (or (keyword? f) (number? f) (string? f) (nil? f) (boolean? f) (char? f)) (when (= f v) m)
+    (and (seq? f) (= 'quote (first f))) (when (= (second f) v) m)
+    (not-any? vars (tree-seq coll? seq f)) m
+    :else nil))
+
+(defn- pin-sites
+  "The calls of fn qnm in law prop at which the law can be run at given
+  arguments of qnm: each as a fn of the arguments to the law variables
+  they pin, or nil where that call cannot be made at them.  A call whose
+  arguments are the law's variables, or are built of them,
+  (size [:add a b]), at [:add [:num 1] [:var :x]] pins a and b."
   [prop qnm n]
   (let [[bs body] (leading-foralls prop)
-        vars (set (map first bs))
-        free? (fn [x] (not-any? vars (tree-seq coll? seq x)))]
-    (vec (distinct
-           (for [c (tree-seq coll? seq body)
-                 :when (and (seq? c) (= qnm (first c)) (= n (count (rest c))))
-                 :let [args (vec (rest c))]
-                 :when (every? #(or (contains? vars %) (free? %)) args)
-                 :let [pos (into {} (keep-indexed (fn [i a] (when (contains? vars a) [a i]))) args)]
-                 :when (seq pos)]
-             pos)))))
+        vars (set (map first bs))]
+    (vec (for [forms (distinct
+                       (for [c (tree-seq coll? seq body)
+                             :when (and (seq? c) (= qnm (first c)) (= n (count (rest c))))
+                             :let [forms (vec (rest c))]
+                             :when (some #(some vars (tree-seq coll? seq %)) forms)
+                             :when (every? #(or (contains? vars %) (vector? %)
+                                                (not-any? vars (tree-seq coll? seq %)))
+                                           forms)]
+                         forms))]
+             (fn [args]
+               (let [m (reduce (fn [m [f a]] (or (match-arg f a vars m) (reduced nil)))
+                               {} (map vector forms args))]
+                 (when (seq m) m)))))))
 
 (defn- rejects-at?
   "Does law prop fail when run with fn qnm's arguments set to args, at a
@@ -2092,9 +2114,9 @@
         types (into {} bs)
         ctx* (assoc ctx :vars vars)]
     (boolean
-      (some (fn [pos]
-              (let [pinned (into {} (for [[v i] pos] [v (nth args i)]))]
-                (when (every? (fn [[v x]] (conforms? (get types v) x (:tenv ctx))) pinned)
+      (some (fn [site]
+              (let [pinned (site args)]
+                (when (and pinned (every? (fn [[v x]] (conforms? (get types v) x (:tenv ctx))) pinned))
                   (let [rest-bs (remove #(contains? pinned (first %)) bs)]
                     (some (fn [i]
                             (= :fail (:result
@@ -2104,7 +2126,7 @@
                                                                           rest-bs))
                                                      pinned)))))
                           (range n))))))
-            (calls-on-vars prop qnm (count args))))))
+            (pin-sites prop qnm (count args))))))
 
 (def ^:dynamic *stand-ins*
   "var -> the fn a stand-in puts in its place, on this thread: a var
@@ -2208,7 +2230,7 @@
                    gap-desc (fn [imp]
                               (if (and (:args imp) (not= :off-example (:kind imp)))
                                 (str (:desc imp)
-                                     (if (some #(seq (calls-on-vars % qnm (count (:args imp)))) props)
+                                     (if (some #(seq (pin-sites % qnm (count (:args imp)))) props)
                                        ", and no law tells it apart, even run there"
                                        (str ", and no law calls `" nm "` on its own variables, so none could be run there")))
                                 (:desc imp)))
@@ -2332,7 +2354,9 @@
           refs (refines-of e)
           ;; to the type checker a ! type is its plain type: NaN is a Double
           anns (into {} (map (fn [[k sig]] [k (unbang (erase sig refs))])) anns)
-          data (mapv #(unbang (erase-data % refs)) data)]
+          own-names (set (map second data))
+          data (mapv #(unbang (erase-data % refs))
+                     (concat data (remove #(contains? own-names (second %)) (::uses-data e))))]
       (when (seq missing)
         (fail! "the spec gives `" (first missing) "` a signature, but `" target
                "` defines no fn `" (first missing) "`"))
@@ -4472,6 +4496,9 @@
                                              ;; read in its own spec: its predicate
                                              ;; may name that spec's helpers
                                              (assoc r :spec-ns d)))
+                        ;; their data types, which the target's code takes
+                        ;; apart too, for its static check
+                        ::uses-data (vec (distinct (mapcat (comp :data second) deps)))
                         ::uses-tenv (reduce (fn [acc [d de]]
                                               (merge-with #(if (map? %1) (merge %1 %2) %2)
                                                           acc (type-env-of de d)))
@@ -6285,9 +6312,9 @@
                 :else
                 (doseq [{f :fn :keys [args]} ex-vals
                         :let [qnm (symbol (str target) (str f))]
-                        pos (calls-on-vars qp qnm (count args))
-                        :let [pinned (into {} (for [[v i] pos] [v (nth args i)]))]
-                        :when (every? (fn [[v x]] (conforms? (get (into {} bs) v) x tenv)) pinned)
+                        site (pin-sites qp qnm (count args))
+                        :let [pinned (site args)]
+                        :when (and pinned (every? (fn [[v x]] (conforms? (get (into {} bs) v) x tenv)) pinned))
                         i (range 10)
                         :let [env (merge (into {} (for [[j [v t]] (map-indexed vector bs)
                                                         :when (not (contains? pinned v))]
@@ -6419,6 +6446,11 @@
                  (and (seq? f) (= 'if (first f)) (<= 3 (count f) 4))
                  (let [[_ t a b] f]
                    (if (or (constant? t)
+                           ;; a case's last test, whose else is its no-match
+                           ;; throw: a value of a closed type always matches
+                           (and (seq? b) (= 'throw (first b))
+                                (some #(and (string? %) (str/starts-with? % "No matching clause"))
+                                      (tree-seq coll? seq b)))
                            ;; a test a macro wrote, (chunked-seq? (seq s__25))
                            ;; in a for or (seq? G__31) in a destructuring:
                            ;; the code says nothing there

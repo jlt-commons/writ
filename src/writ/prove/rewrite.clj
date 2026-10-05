@@ -266,6 +266,47 @@
   [ty]
   (and (map? ty) (seq ty) (not (contains? ty :writ/elems)) (every? keyword? (keys ty))))
 
+(declare lemma-rewrite known-literal)
+
+(defn- data-type-of-term
+  "The data type term x is known to be a value of: ty, its own type, when
+  that is one, or the type of a recognizer a fact or a proved contract
+  says holds of it, (Expr? (simplify e)).  nil otherwise."
+  [ctx x ty]
+  (let [data? (fn [ty] (and (symbol? ty) (:ctors (get-in ctx [:tenv ty]))))]
+    (or (when (data? ty) ty)
+        (some (fn [[rty nm]]
+                (when (and (data? rty)
+                           (or (true? (get (:facts ctx) [:app nm x]))
+                               (= [:lit true] (lemma-rewrite ctx [:app nm x]))))
+                  rty))
+              (get-in ctx [:recognizers :names])))))
+
+(defn- known-tag
+  "The constructor tag of x, a value of data type dty: the one the facts
+  say, or the one left when they rule out every other."
+  [ctx x dty]
+  (or (known-literal ctx [:call 'first x])
+      (let [tags (map #(keyword (str (key %))) (:ctors (get-in ctx [:tenv dty])))
+            left (remove #(false? (get (:facts ctx) [:call '= [:call 'first x] [:lit %]])) tags)]
+        (when (= 1 (count left)) (first left)))))
+
+(defn- data-field-type
+  "The type of field k (1 the first) of term x, a value of a data type
+  whose constructor the facts fix: (nth s 1) where s is an Expr -- a
+  variable of that type, a value its recognizer is a fact of, or a call a
+  proved contract says makes one -- and (first s) is :num.  nil
+  otherwise."
+  [ctx x k ty]
+  (when (and (integer? k) (pos? k))
+    (let [dty (data-type-of-term ctx x ty)
+          tag (when dty (known-tag ctx x dty))]
+      (when (keyword? tag)
+        (some (fn [[c info]]
+                (when (= tag (keyword (str c)))
+                  (nth (:fields info) (dec k) nil)))
+              (:ctors (get-in ctx [:tenv dty])))))))
+
 (defn- term-type
   "The type of term t when its form says it: a variable's own, a list of
   a tail's elements, an element nth takes from a vector or a tail (nth
@@ -294,6 +335,7 @@
           (and (= 'get f) (= 4 (count t)) (record-type? ty) (= :lit (head i)) (contains? ty (second i)))
           (get ty (second i))
           (and (= 'nth f) (= 4 (count t)) (list-el ty)) (list-el ty)
+          (and k (not= 'get f)) (data-field-type ctx x k ty)
           :else nil)))))
 
 (defn- tuple-part-type
@@ -325,6 +367,9 @@
       (and (= :call (head t)) (= 'apply (second t)) (= [:cfn '+] (nth t 2 nil))
            (int-elems? ctx (nth t 3 nil)))
       (division? ctx t)
+      ;; a product, and the like, of integers: (* (evaluate a env) (evaluate b env))
+      (and (= :call (head t)) (contains? '#{* max min abs} (second t))
+           (seq (drop 2 t)) (every? #(int-term? ctx %) (drop 2 t)))
       (and (contains? #{:app :call} (head t)) (proved-integer? ctx t))))
 
 (declare proved-nat?)
@@ -612,15 +657,17 @@
   (case (head c)
     :nil false
     :lit (not (false? (second c)))
-    (:sq :fn :cfn :dfn) true
+    ;; a linear form is an integer: truthy
+    (:sq :fn :cfn :dfn :lin) true
     :if (let [a (truthiness ctx (nth c 2)) b (truthiness ctx (nth c 3))]
           (when (and (some? a) (= a b)) a))
     :call (if (or (contains? seq-makers (second c)) (contains? number-makers (second c))
                   (int-term? ctx c))
             true
             (let [d (decide ctx c)] (if (some? d) d (nil-fact ctx c))))
-    ;; a call of a definition that a fact or a law says is an integer
-    :app (if (int-term? ctx c)
+    ;; a call of a definition that a fact or a law says is an integer, or
+    ;; a value of a data type, a vector
+    :app (if (or (int-term? ctx c) (data-type-of-term ctx c nil))
            true
            (let [d (decide ctx c)] (if (some? d) d (nil-fact ctx c))))
     (let [d (decide ctx c)] (if (some? d) d (nil-fact ctx c)))))
@@ -654,7 +701,7 @@
              (:ctors (get-in ctx [:tenv ty])))
      :else false)))
 
-(declare boolean-term? has-type?)
+(declare boolean-term? has-type? normalize truthiness)
 
 (def ^:private selecting-fns
   "clojure.core fns whose value is made of parts of their data arguments
@@ -764,6 +811,21 @@
 
 (defn- nan-lit? [t] (and (= :lit (head t)) (float? (second t)) (Double/isNaN (second t))))
 
+(defn- floatless-data?
+  "Does data type d hold no float in any field of any constructor?  A
+  field of the type itself, or of one being looked through, holds what
+  the type does."
+  ([ctx d] (floatless-data? ctx d #{}))
+  ([ctx d seen]
+   (let [info (get-in ctx [:tenv d])]
+     (and (:ctors info) (empty? (:params info))
+          (every? (fn [[_ c]]
+                    (every? (fn [f] (or (contains? (conj seen d) f)
+                                        (contains? '#{Nat Int Bool String Char Keyword Symbol Unit} f)
+                                        (and (symbol? f) (floatless-data? ctx f (conj seen d)))))
+                            (:fields c)))
+                  (:ctors info))))))
+
 (defn- floatless-type?
   "Does type ty hold no float anywhere: no Float, Double or Any in it?"
   [ty]
@@ -821,6 +883,32 @@
       ;; no float anywhere it could come from: its variables are of types
       ;; without one, and it has no float literal and no division
       (and (= a b) (no-float-source? ctx a)) [:lit true]
+      ;; the tag of a data value is one of its type's constructors': when
+      ;; the facts rule out every other, it is this one
+      (and (= :call ha) (= 'first (second a)) (= 3 (count a)) (= :lit hb) (keyword? (second b))
+           (data-type-of-term ctx (nth a 2) (term-type ctx (nth a 2))))
+      (let [s (nth a 2)
+            tags (map #(keyword (str (key %)))
+                      (:ctors (get-in ctx [:tenv (data-type-of-term ctx s (term-type ctx s))])))]
+        (cond
+          (not (some #{(second b)} tags)) [:lit false]
+          (every? #(or (= % (second b)) (false? (get (:facts ctx) [:call '= a [:lit %]]))) tags) [:lit true]
+          :else nil))
+      ;; a data value against a constructor literal, its tag known to be
+      ;; that one: field by field, (= s [:num (nth s 1)])
+      (and (not= :sq ha) (= :sq hb) (t/elems-list (second b))
+           (let [es (t/elems-list (second b))
+                 dty (data-type-of-term ctx a (term-type ctx a))]
+             (and dty (= :lit (head (first es))) (keyword? (second (first es)))
+                  (= (second (first es)) (known-tag ctx a dty))
+                  (some (fn [[c info]] (and (= (second (first es)) (keyword (str c)))
+                                            (= (count (:fields info)) (dec (count es)))))
+                        (:ctors (get-in ctx [:tenv dty]))))))
+      (reduce (fn [acc [i e]] [:if [:call '= [:call 'nth a [:lit i]] e] acc [:lit false]])
+              [:lit true]
+              (reverse (map-indexed (fn [i e] [(inc i) e]) (rest (t/elems-list (second b))))))
+      ;; a value of a data type with no float in it: (= (simplify x) (simplify x))
+      (and (= a b) (some->> (data-type-of-term ctx a (term-type ctx a)) (floatless-data? ctx))) [:lit true]
       ;; a literal goes second, so a fact and a test of it are one term
       (and (= :lit ha) (not= :lit hb)) [:call '= b a]
       ;; a term known to equal one exact literal is not another
@@ -1318,6 +1406,13 @@
                          (or (= :nil (head a)) (= :sq (head a))
                              (and (t/lit? a) (not (integer? (second a))))) [:lit false]
                          :else nil))
+        ;; a variable typed Keyword is a keyword: a constructor's field
+        ;; in an induction case, (keyword? x-var1)
+        (keyword? string? boolean? char? symbol?)
+        (when (and (= 1 n)
+                   (= ('{keyword? Keyword string? String boolean? Bool char? Char symbol? Symbol} f)
+                      (or (when (symbol? a) (get-in ctx [:types a])) (tuple-part-type ctx a))))
+          [:lit true])
         reduce (when (= 3 n) (reduce-rule ctx a b (nth args 2)))
         sort (when (= 1 n) (sort-model ctx a))
         ;; how many a pipeline gives, without running its steps: a map gives
@@ -1350,6 +1445,13 @@
               (and (= 2 n) (= :call (head a)) (= 'repeat (second a)) (= 4 (count a))
                    (int-term? ctx b))
               (nth a 3)
+              ;; a default nth never reaches: the facts put i inside the
+              ;; value, (nth s 1 nil) where (count s) is 2
+              (and (= 3 n) (t/int-lit? b) (<= 0 (second b)) (not= :sq (head a)) (not= :nil (head a))
+                   (or (true? (truthiness ctx (normalize ctx [:call '< b [:call 'count a]])))
+                       ;; or a data value whose constructor has that field
+                       (some? (data-field-type ctx a (second b) (term-type ctx a)))))
+              [:call 'nth a b]
               (and (<= 2 n 3) (t/int-lit? b))
               (nth-rule a (second b) (if (= 3 n) (nth args 2) ::none))
               ;; an integer index into a known head: the head at 0, else
@@ -1846,16 +1948,17 @@
     false))
 
 (defn- lift-if
-  "A core fn call with an if among its arguments, as an if of two calls:
-  a call runs its arguments first, so the test runs either way.  Only the
-  first such argument is lifted; normalising the branches lifts the rest."
+  "A call, of a core fn or of a definition, with an if among its
+  arguments, as an if of two calls: a call runs its arguments first, so
+  the test runs either way.  Only the first such argument is lifted;
+  normalising the branches lifts the rest."
   [x]
-  (when (= :call (head x))
+  (when (contains? #{:call :app} (head x))
     (let [args (vec (drop 2 x))
           i (first (keep-indexed (fn [i a] (when (= :if (head a)) i)) args))]
       (when i
         (let [[_ c a b] (nth args i)
-              with (fn [v] (into [:call (second x)] (assoc args i v)))]
+              with (fn [v] (into [(head x) (second x)] (assoc args i v)))]
           [:if c (with a) (with b)])))))
 
 (defn- strict

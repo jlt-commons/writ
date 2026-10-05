@@ -867,7 +867,9 @@
                                      :when r]
                                  [{:by :with :lemma (:trace gl) :proof (first r)} (second r)]))
                              [nil #{}]))
-          target-used (filter #(= (str target) (namespace %)) used)
+          ;; a contract of the target's fns was proved from its code too
+          target-used (concat (filter #(= (str target) (namespace %)) used)
+                              (when trace (filter contract? @lemmas-used)))
           ;; every proof is replayed by the checker before it is reported
           checked (when (and trace (or lemma (seq target-used)))
                     (or replayed (check/check-proof (dissoc opts :lemmas-used :unfolded) g trace)))]

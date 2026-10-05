@@ -116,3 +116,15 @@
   (let [r (spec/check 'writ.spec-demo.fold-spec {:seed 7 :adequacy false})]
     (is (:ok r) (:message r))
     (is (= :proved (:status (law-result r 'nothing-runs-nothing))) (:message r))))
+
+(deftest a-workflow-takes-apart-its-components-data
+  (let [r (spec/check 'writ.spec-demo.paint-spec {:seed 7 :adequacy false})]
+    (is (:ok r) (:message r))))
+
+(deftest laws-over-tagged-data-are-proved
+  (let [r (spec/check 'writ.spec-demo.arith-spec {:seed 7 :adequacy false})]
+    (is (:ok r) (:message r))
+    (doseq [l '[evaluate-add evaluate-mul times-zero-is-zero plus-zero-is-itself two-negations-cancel]]
+      (is (= :proved (:status (law-result r l))) (str l)))
+    ;; a case over a closed type always matches: its last test is no note
+    (is (not-any? #(re-find #"identical\?" %) (:one-way-tests r)) (pr-str (:one-way-tests r)))))

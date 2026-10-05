@@ -72,6 +72,16 @@
 
 (defn seq-term [xs] [:sq (elems-of xs)])
 
+(defn elems-list
+  "The elements of e, a chain of :econs ending in :enil, as a vector; nil
+  for any other shape."
+  [e]
+  (loop [e e, out []]
+    (case (head e)
+      :enil out
+      :econs (recur (nth e 2) (conj out (nth e 1)))
+      nil)))
+
 (defn value->term
   "The term for a Clojure value: nil, a literal, or a sequential of them."
   [v]
