@@ -39,6 +39,12 @@
 
 (defn- nan? [x] (and (float? x) (Double/isNaN x)))
 
+(defn strict
+  "b, once a has run: how the prover keeps that a binding or a statement
+  is evaluated whether or not its value is used."
+  [_ b]
+  b)
+
 (defn same
   "Clojure's =, but with NaN the same as NaN, at any depth: so every value
   is the same as itself, which = does not promise.  Sequentials compare
@@ -65,6 +71,16 @@
 (defn elems-of [xs] (reduce (fn [e x] [:econs x e]) enil (reverse xs)))
 
 (defn seq-term [xs] [:sq (elems-of xs)])
+
+(defn elems-list
+  "The elements of e, a chain of :econs ending in :enil, as a vector; nil
+  for any other shape."
+  [e]
+  (loop [e e, out []]
+    (case (head e)
+      :enil out
+      :econs (recur (nth e 2) (conj out (nth e 1)))
+      nil)))
 
 (defn value->term
   "The term for a Clojure value: nil, a literal, or a sequential of them."

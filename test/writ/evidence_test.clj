@@ -28,7 +28,7 @@
       (is (= {:require :tested :proved 10 :general 6 :tested 1 :laws 11} (:proof r)))
       (is (str/includes? (:message r) "(6 for every input, 4 on particular values)"))
       (is (str/includes? (:message r) "10 of 11 laws proved"))
-      (is (str/includes? (:message r) "tested, not proved: smallest-first")))))
+      (is (str/includes? (:message r) "tested (the spec asks for no proof): smallest-first")))))
 
 (deftest a-check-can-demand-proof
   (let [r (spec/check 'writ.spec-demo.sort-spec {:seed 42 :require :proved})]

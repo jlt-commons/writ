@@ -52,12 +52,25 @@
                 (reject! "the goal does not throw: " (pr-str (t/show @n))))
       :rewriting (when-not (or @vacuous (sc/truthy? @n) (true? (rw/truthiness (first @cc) @n)))
                    (reject! "the goal does not rewrite to true: " (pr-str (t/show @n))))
+      ;; the induction hypotheses taken as facts: they hold in the case
+      :cross (do (when (:crossed opts) (reject! "the hypotheses are taken as facts twice"))
+                 (check-goal (assoc opts :crossed true :ih []) (sc/cross-fertilize opts @n) hyps (:then p)))
       :split (let [c (:on p)]
                (if-let [[x v] (and (= :ieq (head c)) (sc/solve-eq (second c)))]
                  (let [[o g* hs] (sc/subst-all opts g hyps {x v})]
                    (check-goal o g* hs (:then p)))
                  (check-goal opts g (conj hyps c) (:then p)))
                (check-goal opts g (conj hyps [:call 'not c]) (:else p)))
+      :extensional (let [i (:on p)
+                         taken (into (set (keys (:types opts))) (mapcat t/vars (cons g hyps)))
+                         _ (when-not (and (symbol? i) (not (contains? taken i)))
+                             (reject! "the index `" i "` of an element-wise proof is not fresh"))
+                         e (or (sc/extensional (first @cc) @n i)
+                               (reject! "not an equality of two sequences: " (pr-str (t/show @n))))
+                         o (assoc-in opts [:types i] 'Nat)]
+                     (when-not @vacuous
+                       (check-goal o (:count-goal e) hyps (:count p))
+                       (check-goal o (:nth-goal e) (conj hyps (:nth-hyp e)) (:elements p))))
       :list-cases (let [v (:on p)]
                     (when-not (:writ/elems (get-in opts [:types v]))
                       (reject! "`" v "` is not a list of elements"))

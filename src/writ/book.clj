@@ -388,8 +388,11 @@
         decls (mapv dt/parse (filter dt/data-form? forms))
         _ (when-let [d (first-dup (mapv :name decls))]
             (fail! "data name `" d "` is declared more than once"))
-        _ (when-let [c (first-dup (mapcat (fn [dl] (map key (:ctors dl))) decls))]
-            (fail! "constructor `" c "` is declared by two types"))
+        ;; two types may share a constructor's name: a literal is typed by
+        ;; the one whose fields it fits
+        _ (when-let [c (first-dup (mapcat (fn [dl] (map (fn [[k v]] [k (count (:fields v))]) (:ctors dl))) decls))]
+            (fail! "constructor `" (first c) "` is declared by two types with " (second c)
+                   " field(s) each; give them different names, or different fields"))
         law-forms (filter lw/law-form? forms)
         law-names (mapv (comp :name lw/parse-law) law-forms)
         _ (when (not= (count law-names) (count (distinct law-names)))
@@ -425,9 +428,14 @@
           (let [dl (dt/parse f)
                 ;; a type and its constructors are book-level names: neither
                 ;; may collide with a name another form already declared
-                names (cons (:name dl) (keys (:ctors dl)))]
+                names (cons (:name dl) (keys (:ctors dl)))
+                ;; but a constructor may share its name with another type's
+                ;; constructor, never with anything else
+                earlier-ctors (set (mapcat (comp keys :ctors dt/parse)
+                                           (filter dt/data-form? (take-while #(not (identical? % f)) forms))))]
             (doseq [n names]
-              (when (contains? seen n)
+              (when (and (contains? seen n)
+                         (not (and (contains? (:ctors dl) n) (contains? earlier-ctors n))))
                 (fail! "`" n "` is declared more than once")))
             ;; a field sees the types declared so far, its own type's
             ;; parameters, and the type itself (recursive fields)

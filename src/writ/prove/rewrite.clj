@@ -108,6 +108,12 @@
     [apply-gt-elems   [:call apply [:cfn >] [:sq [:elems ?v]]]   [:call apply [:cfn >] ?v]]
     ;; not=, max, min and abs, as the comparisons clojure.core makes
     [not=-def      [:call not= ?x ?y]                   [:call not [:call = ?x ?y]]]
+    ;; even? and odd? are a remainder by 2, which integer arithmetic reads
+    [even-def      [:call even? ?x]                     [:call = [:call mod ?x [:lit 2]] [:lit 0]]]
+    [odd-def       [:call odd? ?x]                      [:call = [:call mod ?x [:lit 2]] [:lit 1]]]
+    ;; true? and false? are equality with the one boolean
+    [true?-def     [:call true? ?x]                     [:call = ?x [:lit true]]]
+    [false?-def    [:call false? ?x]                    [:call = ?x [:lit false]]]
     [boolean-def   [:call boolean ?x]                   [:if ?x [:lit true] [:lit false]]]
     [abs-def       [:call abs ?a]                       [:if [:call neg? ?a] [:call - ?a] ?a]]
     ;; a comparison of three is two, the second only if the first holds
@@ -260,6 +266,59 @@
   [ty]
   (and (map? ty) (seq ty) (not (contains? ty :writ/elems)) (every? keyword? (keys ty))))
 
+(declare lemma-rewrite known-literal term-type)
+
+(defn- data-type-of-term
+  "The data type term x is known to be a value of: ty, its own type, when
+  that is one, or the type of a recognizer a fact or a proved contract
+  says holds of it, (Expr? (simplify e)).  nil otherwise."
+  [ctx x ty]
+  (let [data? (fn [ty] (and (symbol? ty) (:ctors (get-in ctx [:tenv ty]))))]
+    (or (when (data? ty) ty)
+        (some (fn [[rty nm]]
+                (when (and (data? rty)
+                           (or (true? (get (:facts ctx) [:app nm x]))
+                               (= [:lit true] (lemma-rewrite ctx [:app nm x]))))
+                  rty))
+              (get-in ctx [:recognizers :names])))))
+
+(defn- tag-equality
+  "(= (first s) kw) for s a data value: false when kw is none of its
+  type's tags, true when the facts rule out every other, nil otherwise."
+  [ctx a kw]
+  (let [s (nth a 2)]
+    (when-let [dty (data-type-of-term ctx s (term-type ctx s))]
+      (let [tags (map #(keyword (str (key %))) (:ctors (get-in ctx [:tenv dty])))]
+        (cond
+          (not (some #{kw} tags)) [:lit false]
+          (every? #(or (= % kw) (false? (get (:facts ctx) [:call '= a [:lit %]]))) tags) [:lit true]
+          :else nil)))))
+
+(defn- known-tag
+  "The constructor tag of x, a value of data type dty: the one the facts
+  say, or the one left when they rule out every other."
+  [ctx x dty]
+  (or (known-literal ctx [:call 'first x])
+      (let [tags (map #(keyword (str (key %))) (:ctors (get-in ctx [:tenv dty])))
+            left (remove #(false? (get (:facts ctx) [:call '= [:call 'first x] [:lit %]])) tags)]
+        (when (= 1 (count left)) (first left)))))
+
+(defn- data-field-type
+  "The type of field k (1 the first) of term x, a value of a data type
+  whose constructor the facts fix: (nth s 1) where s is an Expr -- a
+  variable of that type, a value its recognizer is a fact of, or a call a
+  proved contract says makes one -- and (first s) is :num.  nil
+  otherwise."
+  [ctx x k ty]
+  (when (and (integer? k) (pos? k))
+    (let [dty (data-type-of-term ctx x ty)
+          tag (when dty (known-tag ctx x dty))]
+      (when (keyword? tag)
+        (some (fn [[c info]]
+                (when (= tag (keyword (str c)))
+                  (nth (:fields info) (dec k) nil)))
+              (:ctors (get-in ctx [:tenv dty])))))))
+
 (defn- term-type
   "The type of term t when its form says it: a variable's own, a list of
   a tail's elements, an element nth takes from a vector or a tail (nth
@@ -288,6 +347,7 @@
           (and (= 'get f) (= 4 (count t)) (record-type? ty) (= :lit (head i)) (contains? ty (second i)))
           (get ty (second i))
           (and (= 'nth f) (= 4 (count t)) (list-el ty)) (list-el ty)
+          (and k (not= 'get f)) (data-field-type ctx x k ty)
           :else nil)))))
 
 (defn- tuple-part-type
@@ -308,9 +368,20 @@
       (and (symbol? t) (contains? int-types (get-in ctx [:types t])))
       (contains? int-types (tuple-part-type ctx t))
       (and (= :call (head t)) (= 'count (second t)))
+      ;; a lookup in a map of integers, with an integer default, or at a key
+      ;; the facts say it holds
+      (and (= :call (head t)) (= 'get (second t)) (<= 4 (count t) 5)
+           (let [ty (term-type ctx (nth t 2))]
+             (and (seq? ty) (= 'Map (first ty)) (contains? int-types (nth ty 2 nil))))
+           (if (= 5 (count t))
+             (int-term? ctx (nth t 4))
+             (true? (get (:facts ctx) [:call 'contains? (nth t 2) (nth t 3)]))))
       (and (= :call (head t)) (= 'apply (second t)) (= [:cfn '+] (nth t 2 nil))
            (int-elems? ctx (nth t 3 nil)))
       (division? ctx t)
+      ;; a product, and the like, of integers: (* (evaluate a env) (evaluate b env))
+      (and (= :call (head t)) (contains? '#{* max min abs} (second t))
+           (seq (drop 2 t)) (every? #(int-term? ctx %) (drop 2 t)))
       (and (contains? #{:app :call} (head t)) (proved-integer? ctx t))))
 
 (declare proved-nat?)
@@ -320,6 +391,12 @@
       (= 'Nat (tuple-part-type ctx a))
       (and (= :call (head a)) (= 'count (second a)))
       (and (= :app (head a)) (proved-nat? ctx a))))
+
+(defn nat-term?
+  "Is integer term a known to be at least 0: a count, a variable or a
+  record's field typed Nat, or a call proved to give a Nat?"
+  [ctx a]
+  (boolean (nat-atom? ctx a)))
 
 (defn- lin-of
   "{:c const :m {atom coef}} for an integer term, else nil."
@@ -349,6 +426,19 @@
       x)))
 
 (defn- all-int? [ctx xs] (every? #(int-term? ctx %) xs))
+
+(defn- fixed-int
+  "The integer the facts pin integer atom a to, k*a + c = 0 with k
+  dividing c, or nil."
+  [ctx a]
+  (some (fn [[f v]]
+          (when (and (true? v) (= :ieq (head f)))
+            (when-let [l (lin-of ctx (second f))]
+              (when (= [a] (keys (:m l)))
+                (let [k (get (:m l) a)]
+                  (when (and (not (zero? k)) (zero? (rem (:c l) k)))
+                    (- (quot (:c l) k))))))))
+        (:facts ctx)))
 (defn- all-num-lits? [xs] (every? #(and (t/lit? %) (number? (second %))) xs))
 
 ;; --- deciding conditions ---------------------------------------------------------
@@ -592,15 +682,17 @@
   (case (head c)
     :nil false
     :lit (not (false? (second c)))
-    (:sq :fn :cfn :dfn) true
+    ;; a linear form is an integer: truthy
+    (:sq :fn :cfn :dfn :lin) true
     :if (let [a (truthiness ctx (nth c 2)) b (truthiness ctx (nth c 3))]
           (when (and (some? a) (= a b)) a))
     :call (if (or (contains? seq-makers (second c)) (contains? number-makers (second c))
                   (int-term? ctx c))
             true
             (let [d (decide ctx c)] (if (some? d) d (nil-fact ctx c))))
-    ;; a call of a definition that a fact or a law says is an integer
-    :app (if (int-term? ctx c)
+    ;; a call of a definition that a fact or a law says is an integer, or
+    ;; a value of a data type, a vector
+    :app (if (or (int-term? ctx c) (data-type-of-term ctx c nil))
            true
            (let [d (decide ctx c)] (if (some? d) d (nil-fact ctx c))))
     (let [d (decide ctx c)] (if (some? d) d (nil-fact ctx c)))))
@@ -634,7 +726,7 @@
              (:ctors (get-in ctx [:tenv ty])))
      :else false)))
 
-(declare boolean-term? has-type?)
+(declare boolean-term? has-type? normalize truthiness)
 
 (def ^:private selecting-fns
   "clojure.core fns whose value is made of parts of their data arguments
@@ -643,6 +735,18 @@
   '#{filter remove concat list vector vec cons rest next seq take drop reverse
      sort distinct butlast first second last nth subvec filterv
      get keys vals hash-map assoc dissoc merge})
+
+(defn- int-valued?
+  "Is term t an integer: int-term? knows it, or it is integer arithmetic,
+  linear or not, on such terms?"
+  [ctx t]
+  (or (int-term? ctx t)
+      ;; a lookup in a map of integers is one or nil, and arithmetic on nil throws
+      (and (= :call (head t)) (= 'get (second t))
+           (let [ty (term-type ctx (nth t 2 nil))]
+             (and (seq? ty) (= 'Map (first ty)) (contains? int-types (nth ty 2 nil)))))
+      (and (= :call (head t)) (contains? '#{* + - inc dec quot rem mod max min abs} (second t))
+           (seq (drop 2 t)) (every? #(int-valued? ctx %) (drop 2 t)))))
 
 (defn float-free?
   "Can this term's value hold no NaN?  Then two syntactically equal terms
@@ -676,6 +780,10 @@
                    ;; would throw
                    (contains? '#{nth get subvec} f) (ff? (first args))
                    (contains? '#{take drop} f) (ff? (second args))
+                   ;; arithmetic on integers makes an integer, never a NaN
+                   (and (contains? '#{* + - inc dec quot rem mod max min abs} f) (seq args)
+                        (every? #(int-valued? ctx %) args))
+                   true
                    (contains? selecting-fns f)
                    (every? ff? (remove #(contains? #{:fn :cfn :dfn} (head %)) args))
                    ;; what a fn literal makes of float-free elements
@@ -728,6 +836,46 @@
 
 (defn- nan-lit? [t] (and (= :lit (head t)) (float? (second t)) (Double/isNaN (second t))))
 
+(defn- floatless-data?
+  "Does data type d hold no float in any field of any constructor?  A
+  field of the type itself, or of one being looked through, holds what
+  the type does."
+  ([ctx d] (floatless-data? ctx d #{}))
+  ([ctx d seen]
+   (let [info (get-in ctx [:tenv d])]
+     (and (:ctors info) (empty? (:params info))
+          (every? (fn [[_ c]]
+                    (every? (fn [f] (or (contains? (conj seen d) f)
+                                        (contains? '#{Nat Int Bool String Char Keyword Symbol Unit} f)
+                                        (and (symbol? f) (floatless-data? ctx f (conj seen d)))))
+                            (:fields c)))
+                  (:ctors info))))))
+
+(defn- floatless-type?
+  "Does type ty hold no float anywhere: no Float, Double or Any in it?"
+  [ty]
+  (cond
+    (symbol? ty) (contains? '#{Nat Int Bool String Char Keyword Symbol Unit} ty)
+    (seq? ty) (and (contains? '#{List Vec Set Map Tuple Opt} (first ty)) (every? floatless-type? (rest ty)))
+    (record-type? ty) (every? floatless-type? (vals ty))
+    (and (map? ty) (:writ/elems ty)) (floatless-type? (:writ/elems ty))
+    :else false))
+
+(defn- no-float-source?
+  "Can term t hold no float at all: every variable it names (a fn
+  literal's own parameters aside) of a type with none, no float literal,
+  and no division, which can make a float of integers?"
+  [ctx t]
+  (let [subs (t/subterms t)
+        bound (set (mapcat (fn [x] (when (= :fn (head x)) (second x))) subs))]
+    (and (not-any? #(and (= :lit (head %)) (float? (second %))) subs)
+         (not-any? #(and (= :call (head %)) (= '/ (second %))) subs)
+         ;; a defn's value is made in its body, unread here
+         (not-any? #(= :app (head %)) subs)
+         (every? (fn [v] (or (contains? bound v)
+                             (let [ty (get-in ctx [:types v])] (and ty (floatless-type? ty)))))
+                 (t/vars t)))))
+
 (defn- equality [ctx a b]
   (let [ha (head a) hb (head b)]
     (cond
@@ -757,6 +905,29 @@
       (and (int-term? ctx a) (int-term? ctx b))
       [:ieq (lin-neg-canon (lin+ (lin-of ctx a) (lin* -1 (lin-of ctx b))))]
       (and (= a b) (float-free? ctx a)) [:lit true]
+      ;; no float anywhere it could come from: its variables are of types
+      ;; without one, and it has no float literal and no division
+      (and (= a b) (no-float-source? ctx a)) [:lit true]
+      ;; the tag of a data value is one of its type's constructors': when
+      ;; the facts rule out every other, it is this one
+      (and (= :call ha) (= 'first (second a)) (= 3 (count a)) (= :lit hb) (keyword? (second b))
+           (some? (tag-equality ctx a (second b))))
+      (tag-equality ctx a (second b))
+      ;; a data value against a constructor literal, its tag known to be
+      ;; that one: field by field, (= s [:num (nth s 1)])
+      (and (not= :sq ha) (= :sq hb) (t/elems-list (second b))
+           (let [es (t/elems-list (second b))
+                 dty (data-type-of-term ctx a (term-type ctx a))]
+             (and dty (= :lit (head (first es))) (keyword? (second (first es)))
+                  (= (second (first es)) (known-tag ctx a dty))
+                  (some (fn [[c info]] (and (= (second (first es)) (keyword (str c)))
+                                            (= (count (:fields info)) (dec (count es)))))
+                        (:ctors (get-in ctx [:tenv dty]))))))
+      (reduce (fn [acc [i e]] [:if [:call '= [:call 'nth a [:lit i]] e] acc [:lit false]])
+              [:lit true]
+              (reverse (map-indexed (fn [i e] [(inc i) e]) (rest (t/elems-list (second b))))))
+      ;; a value of a data type with no float in it: (= (simplify x) (simplify x))
+      (and (= a b) (some->> (data-type-of-term ctx a (term-type ctx a)) (floatless-data? ctx))) [:lit true]
       ;; a literal goes second, so a fact and a test of it are one term
       (and (= :lit ha) (not= :lit hb)) [:call '= b a]
       ;; a term known to equal one exact literal is not another
@@ -943,17 +1114,127 @@
       (let [ty (term-type ctx m)]
         (or (record-type? ty) (and (seq? ty) (= 'Map (first ty)))))))
 
+(defn- keyed-fold-get
+  "(get (reduce f init m) k d?), where m is a map and f a fn literal whose
+  step is (assoc acc K V), K the entry's key and V reading acc only at K:
+  each key of m is visited once, and no step touches another key, so the
+  fold at k is its one step there, (contains? m k), or else init at k.
+  nil when the fold is not of that shape."
+  [ctx m-red k dflt]
+  (let [[_ g f init coll] (when (and (= :call (head m-red)) (= 'reduce (second m-red)) (= 5 (count m-red)))
+                            m-red)
+        [_ ps body] (when (= :fn (head f)) f)
+        [acc e] ps
+        key-of? (fn [t] (or (= t [:call 'key e]) (= t [:call 'first e])
+                            (= t [:call 'nth e [:lit 0]]) (= t [:call 'nth e [:lit 0] t/tnil])))
+        val-of? (fn [t] (or (= t [:call 'val e]) (= t [:call 'second e]) (= t [:call 'first [:call 'rest e]])
+                            (= t [:call 'nth e [:lit 1]]) (= t [:call 'nth e [:lit 1] t/tnil])))
+        a-map? (or (= t/tnil coll) (non-nil-map? ctx coll))]
+    (when (and (= 2 (count ps)) a-map? (= :call (head body)) (= 'assoc (second body)) (= 5 (count body))
+               (= acc (nth body 2)) (key-of? (nth body 3)))
+      (let [v (nth body 4)
+            ;; V with acc read at the entry's key as init at k, and the entry
+            ;; read as k and m's value there
+            ;; top down: the read of acc at the entry's key goes whole
+            v* ((fn rd [x]
+                  (cond
+                    (and (= :call (head x)) (= 'get (second x)) (<= 4 (count x) 5)
+                         (= acc (nth x 2)) (key-of? (nth x 3)))
+                    (into [:call 'get init k] (map rd (drop 4 x)))
+                    (key-of? x) k
+                    (val-of? x) [:call 'get coll k]
+                    (and (vector? x) (not= :lit (head x))) (into [(first x)] (map rd) (rest x))
+                    :else x))
+                v)]
+        (when-not (some #{acc e} (t/vars v*))
+          [:if [:call 'contains? coll k] v* (into [:call 'get init k] dflt)])))))
+
+(defn- a-map?
+  "Is term m a map or nil, by its form or its type?"
+  [ctx m]
+  (or (= t/tnil m) (non-nil-map? ctx m)
+      (and (= :call (head m)) (contains? '#{merge merge-with zipmap} (second m)))))
+
+(defn- merged-get
+  "(get m k d?) where m is (merge a b), (merge-with f a b) or (zipmap (keys
+  c) (repeat x)), each a map or nil: read through to the parts, each at k.
+  nil for any other m."
+  [ctx m k dflt]
+  (let [[_ g & ms] (when (= :call (head m)) m)
+        at (fn [x] (into [:call 'get x k] dflt))
+        has (fn [x] [:call 'contains? x k])]
+    (cond
+      (and (= 'merge g) (= 2 (count ms)) (every? #(a-map? ctx %) ms))
+      (let [[a b] ms] [:if (has b) [:call 'get b k] (at a)])
+      (and (= 'merge-with g) (= 3 (count ms)) (every? #(a-map? ctx %) (rest ms)))
+      (let [[f a b] ms]
+        [:if (has b) [:if (has a) [:ap f [:call 'get a k] [:call 'get b k]] [:call 'get b k]] (at a)])
+      ;; (into {} (filter f m)): m's entries that pass f
+      (and (= 'into g) (= 2 (count ms)) (= [:call 'hash-map] (first ms))
+           (= :call (head (second ms))) (= 'filter (second (second ms))) (= 4 (count (second ms)))
+           (a-map? ctx (nth (second ms) 3)))
+      (let [[_ _ f src] (second ms)
+            d (if (seq dflt) (first dflt) t/tnil)]
+        [:if (has src) [:if [:ap f [:call 'vector k [:call 'get src k]]] [:call 'get src k] d] d])
+      ;; every key of c, each holding x
+      (and (= 'zipmap g) (= 2 (count ms))
+           (= :call (head (first ms))) (= 'keys (second (first ms))) (a-map? ctx (nth (first ms) 2))
+           (= :call (head (second ms))) (= 'repeat (second (second ms))) (= 3 (count (second ms))))
+      [:if (has (nth (first ms) 2)) (nth (second ms) 2) (if (seq dflt) (first dflt) t/tnil)]
+      :else nil)))
+
 (defn- map-rule
   "get, contains?, assoc and dissoc on literal keys; an assoc or dissoc of
   several keys is one after another."
   [ctx f args]
   (let [n (count args) [m k] args]
     (case f
-      get (when (and (<= 2 n 3) (exact-key? k))
+      get (cond
+            (and (<= 2 n 3) (exact-key? k))
             (map-lookup m k identity (if (= 3 n) (nth args 2) t/tnil)
-                        #(into [:call 'get % k] (drop 2 args))))
-      contains? (when (and (= 2 n) (exact-key? k))
-                  (map-lookup m k (constantly [:lit true]) [:lit false] #(vector :call 'contains? % k)))
+                        #(into [:call 'get % k] (drop 2 args)))
+            ;; a key of a fold that sets each key of a map once
+            (and (<= 2 n 3) (keyed-fold-get ctx m k (drop 2 args)))
+            (keyed-fold-get ctx m k (drop 2 args))
+            ;; a key of maps merged: the later map's where it holds the key
+            (and (<= 2 n 3) (merged-get ctx m k (drop 2 args)))
+            (merged-get ctx m k (drop 2 args))
+            ;; the key an assoc just set, whatever it is: its value
+            (and (<= 2 n 3) (= :call (head m)) (= 'assoc (second m)) (= 5 (count m)) (= k (nth m 3)))
+            (nth m 4)
+            ;; a key the facts say the map holds: the default is not read
+            (and (= 3 n) (true? (get (:facts ctx) [:call 'contains? m k])))
+            [:call 'get m k]
+            ;; a key the facts say the map does not hold: the default
+            (and (<= 2 n 3) (false? (get (:facts ctx) [:call 'contains? m k])))
+            (if (= 3 n) (nth args 2) t/tnil)
+            ;; a literal map read at a key not known yet: its entries one
+            ;; after another, so a case on the key decides it
+            (and (<= 2 n 3) (not (exact-key? k)))
+            (when-let [es (map-entries m)]
+              (when (<= (count es) 8)
+                (reduce (fn [else [ek v]] [:if [:call '= k ek] v else])
+                        (if (= 3 n) (nth args 2) t/tnil)
+                        (reverse es))))
+            :else nil)
+      contains? (cond
+                  (and (= 2 n) (exact-key? k))
+                  (map-lookup m k (constantly [:lit true]) [:lit false] #(vector :call 'contains? % k))
+                  ;; a key of maps merged is a key of either
+                  (and (= 2 n) (= :call (head m)) (contains? '#{merge merge-with} (second m))
+                       (every? #(a-map? ctx %) (take-last 2 (drop 2 m))))
+                  (let [[a b] (take-last 2 (drop 2 m))]
+                    [:if [:call 'contains? a k] [:lit true] [:call 'contains? b k]])
+                  (and (= 2 n) (= :call (head m)) (= 'into (second m)) (= 4 (count m))
+                       (= [:call 'hash-map] (nth m 2)) (= :call (head (nth m 3))) (= 'filter (second (nth m 3)))
+                       (= 4 (count (nth m 3))) (a-map? ctx (nth (nth m 3) 3)))
+                  (let [[_ _ f src] (nth m 3)]
+                    [:if [:call 'contains? src k] [:call 'boolean [:ap f [:call 'vector k [:call 'get src k]]]] [:lit false]])
+                  (and (= 2 n) (= :call (head m)) (= 'zipmap (second m)) (= 4 (count m))
+                       (= :call (head (nth m 2))) (= 'keys (second (nth m 2))) (a-map? ctx (nth (nth m 2) 2))
+                       (= :call (head (nth m 3))) (= 'repeat (second (nth m 3))))
+                  [:call 'contains? (nth (nth m 2) 2) k]
+                  :else nil)
       assoc (cond
               (and (< 3 n) (odd? n))
               (reduce (fn [acc [k v]] [:call 'assoc acc k v]) m (partition 2 (rest args)))
@@ -988,6 +1269,36 @@
                :else nil)
       nil)))
 
+(defn- sequential-term?
+  "Is term t known to be sequential, never a map, a set or a string,
+  where nth reads something other than its elements in order: a seq
+  term, the value of a fn that always gives one, or a variable or
+  element typed (Vec T) or (List T).  A (List T) may be nil; a pipeline
+  over nil is empty, so nth of it throws, and a rule need only agree
+  where its left side returns."
+  [ctx t]
+  (or (= :sq (head t))
+      (and (= :call (head t))
+           (contains? '#{map mapv filter filterv range vec take drop reverse concat keep mapcat
+                         sort sort-by distinct repeat map-indexed remove butlast subvec}
+                      (second t)))
+      (let [ty (term-type ctx t)]
+        (or (and (seq? ty) (contains? '#{Vec List} (first ty)))
+            (and (map? ty) (contains? ty :writ/elems))))))
+
+(defn seq-value?
+  "Is term t a sequence or a vector, and never nil: a seq term, the value
+  of a fn that always gives one, or a term typed (Vec T)?  Two such
+  values are = exactly when they have the same count and = elements at
+  each index; nil is = to neither, though it has their count when empty."
+  [ctx t]
+  (or (= :sq (head t))
+      (and (= :call (head t))
+           (contains? '#{map mapv filter filterv range vec take drop reverse concat keep mapcat
+                         sort sort-by distinct repeat map-indexed remove subvec}
+                      (second t)))
+      (let [ty (term-type ctx t)] (and (seq? ty) (= 'Vec (first ty))))))
+
 (defn- computed
   "The computed rules: a rewrite of t, or nil."
   [ctx x]
@@ -1020,6 +1331,9 @@
                 (let [k (apply * (map second (filter t/int-lit? args)))
                       v (first (remove t/int-lit? args))]
                   (lin->term (if v (lin* k (lin-of ctx v)) {:c k :m {}})))
+                ;; a factor the facts pin, put in: (* n x) where n is 1
+                (and (all-int? ctx args) (some #(fixed-int ctx %) (remove t/int-lit? args)))
+                (into [:call '*] (map #(if-let [v (and (not (t/int-lit? %)) (fixed-int ctx %))] [:lit v] %) args))
                 :else nil)
         (< <= > >=)
         (when (= 2 n)
@@ -1114,9 +1428,52 @@
                          (or (= :nil (head a)) (= :sq (head a))
                              (and (t/lit? a) (not (integer? (second a))))) [:lit false]
                          :else nil))
+        ;; a variable typed Keyword is a keyword: a constructor's field
+        ;; in an induction case, (keyword? x-var1)
+        (keyword? string? boolean? char? symbol?)
+        (when (and (= 1 n)
+                   (= ('{keyword? Keyword string? String boolean? Bool char? Char symbol? Symbol} f)
+                      (or (when (symbol? a) (get-in ctx [:types a])) (tuple-part-type ctx a))))
+          [:lit true])
         reduce (when (= 3 n) (reduce-rule ctx a b (nth args 2)))
         sort (when (= 1 n) (sort-model ctx a))
+        ;; how many a pipeline gives, without running its steps: a map gives
+        ;; as many as its shortest collection, a range its span, a repeat
+        ;; its count
+        count (when (= 1 n)
+                (let [[_ g & gs] (when (= :call (head a)) a)]
+                  (cond
+                    (and (= 'map g) (<= 2 (count gs) 4))
+                    (reduce (fn [acc c] [:call 'min acc [:call 'count c]])
+                            [:call 'count (second gs)] (drop 2 gs))
+                    (and (= 'range g) (= 2 (count gs)) (every? #(int-term? ctx %) gs))
+                    [:call 'max [:call '- (second gs) (first gs)] [:lit 0]]
+                    (and (= 'repeat g) (= 2 (count gs)) (int-term? ctx (first gs)))
+                    [:call 'max (first gs) [:lit 0]]
+                    :else nil)))
+        map-indexed (when (= 2 n) [:call 'map a [:call 'range [:lit 0] [:call 'count b]] b])
+        mapv (when (<= 3 n 4) (into [:call 'map] args))
         nth (cond
+              ;; an element of a pipeline at any index: the step applied to
+              ;; the elements there.  nth of a map, a set or a string throws
+              ;; or reads chars, so each collection must be a sequence
+              (and (= 2 n) (= :call (head a)) (= 'map (second a)) (<= 4 (count a) 6)
+                   (every? #(sequential-term? ctx %) (drop 3 a)))
+              (into [:ap (nth a 2)] (map (fn [c] [:call 'nth c b]) (drop 3 a)))
+              ;; (range lo hi) at i is lo + i: where nth returns, i is in range
+              (and (= 2 n) (= :call (head a)) (= 'range (second a)) (= 4 (count a))
+                   (int-term? ctx b) (int-term? ctx (nth a 2)) (int-term? ctx (nth a 3)))
+              [:call '+ (nth a 2) b]
+              (and (= 2 n) (= :call (head a)) (= 'repeat (second a)) (= 4 (count a))
+                   (int-term? ctx b))
+              (nth a 3)
+              ;; a default nth never reaches: the facts put i inside the
+              ;; value, (nth s 1 nil) where (count s) is 2
+              (and (= 3 n) (t/int-lit? b) (<= 0 (second b)) (not= :sq (head a)) (not= :nil (head a))
+                   (or (true? (truthiness ctx (normalize ctx [:call '< b [:call 'count a]])))
+                       ;; or a data value whose constructor has that field
+                       (some? (data-field-type ctx a (second b) (term-type ctx a)))))
+              [:call 'nth a b]
               (and (<= 2 n 3) (t/int-lit? b))
               (nth-rule a (second b) (if (= 3 n) (nth args 2) ::none))
               ;; an integer index into a known head: the head at 0, else
@@ -1153,6 +1510,9 @@
             ;; a core fn value applied is a call of it, and a defn's an app
             (= :cfn (head f)) (into [:call (second f)] args)
             (= :dfn (head f)) (into [:app (second f)] args)
+            ;; a keyword applied is a lookup, as (:k m) is
+            (and (= :lit (head f)) (keyword? (second f)) (<= 1 (count args) 2))
+            (into [:call 'get (first args) f] (rest args))
             ;; a set applied is the member equal to its argument, or nil
             (and (= :call (head f)) (= 'hash-set (second f)) (= 1 (count args)))
             (reduce (fn [else e] [:if [:call '= (first args) e] e else]) t/tnil (reverse (drop 2 f)))
@@ -1178,13 +1538,20 @@
   debugging a rewrite that does not terminate."
   nil)
 
+(def ^:dynamic *deadline*
+  "When bound, the clock time (ms) a search must stop by: rewriting past it
+  runs out as it does out of fuel."
+  nil)
+
 (defn- burn!
   ([ctx] (burn! ctx nil))
   ([ctx x]
    (let [left (swap! (:fuel ctx) dec)]
      (some-> (:burned ctx) (swap! inc))
      (when (and *last-terms* x (< left 60)) (swap! *last-terms* conj x))
-     (when (neg? left) (out-of-fuel!)))))
+     (when (neg? left) (out-of-fuel!))
+     (when (and *deadline* (zero? (bit-and left 127)) (> (System/currentTimeMillis) *deadline*))
+       (out-of-fuel!)))))
 
 (declare normalize)
 
@@ -1318,6 +1685,11 @@
   (let [el (fn [t] (when (and (seq? t) (contains? '#{List Vec} (first t))) (second t)))]
     (boolean
       (or (= ty (get-in ctx [:types u]))
+          ;; a part its form types: a constructor's field, (nth s 1) an Expr
+          ;; where s is a :neg
+          (and (vector? u) (not (symbol? u)) (= ty (term-type ctx u)))
+          ;; a call of a fn whose return type is taken at its word
+          (and (= :app (head u)) (= ty (get-in ctx [:trusted-rets (second u)])))
           (and (= :sq (head u)) (symbol? (second u)) (el ty)
                (= {:writ/elems (el ty)} (get-in ctx [:types (second u)])))
           ;; a sublist of a list of its elements: never nil, so a Vec too
@@ -1546,6 +1918,12 @@
                 [m]))]
       (go m (concat plain arith)))))
 
+(declare boolean-term?)
+
+(def ^:private ^:dynamic *bool-check*
+  "True while a rule that holds only of booleans asks whether its term is one."
+  false)
+
 (defn- lemma-rewrite
   "Rewrite x by an earlier proved law: its left side matched against x,
   its hypothesis, instantiated, normalised to true here.  A variable of
@@ -1554,8 +1932,14 @@
   must be shown to be of the variable's type."
   [ctx x]
   (asked! ctx x)
-  (some (fn [{:keys [vars hyp lhs rhs name types]}]
-          (when-let [m0 (match-term lhs x vars)]
+  (some (fn [{:keys [vars hyp lhs rhs name types bool-only]}]
+          (when-let [m0 (and (or (not bool-only)
+                                 (boolean-term? x)
+                                 ;; asking whether x is a boolean rewrites (boolean? x),
+                                 ;; which must not ask again
+                                 (and (not *bool-check*)
+                                      (binding [*bool-check* true] (has-type? ctx 'Bool x))))
+                             (match-term lhs x vars))]
             (some (fn [m]
                     (when (and (every? #(contains? m %) (t/vars rhs)) (typed? ctx types m))
                       (let [y (t/subst rhs m)]
@@ -1588,17 +1972,46 @@
                    (contains? '#{< <= > >= =} (second (nth t 2)))))
     false))
 
+(def ^:private boolean-defs
+  "Definition name -> whether it returns only true or false."
+  (atom {}))
+
+(defn- boolean-app?
+  "Is x a call of a definition that returns only true or false: its body
+  an if-tree whose every leaf is a boolean, or a call of such a
+  definition, itself included?  Then a fact of the call is its value,
+  (simplified? s) given true is true, and it is not unfolded to be read
+  again."
+  [ctx x]
+  (and (= :app (head x))
+       (let [nm (second x)
+             body? (fn body? [b seen]
+                     (case (head b)
+                       :if (and (body? (nth b 2) seen) (body? (nth b 3) seen))
+                       :app (or (contains? seen (second b))
+                                (let [d (get-in ctx [:defs (second b)])]
+                                  (and (:params d) (body? (:body d) (conj seen (second b))))))
+                       (boolean-term? b)))
+             cached (get @boolean-defs nm ::none)]
+         (if (not= ::none cached)
+           cached
+           (let [d (get-in ctx [:defs nm])
+                 v (boolean (and (:params d) (body? (:body d) #{nm})))]
+             (swap! boolean-defs assoc nm v)
+             v)))))
+
 (defn- lift-if
-  "A core fn call with an if among its arguments, as an if of two calls:
-  a call runs its arguments first, so the test runs either way.  Only the
-  first such argument is lifted; normalising the branches lifts the rest."
+  "A call, of a core fn or of a definition, with an if among its
+  arguments, as an if of two calls: a call runs its arguments first, so
+  the test runs either way.  Only the first such argument is lifted;
+  normalising the branches lifts the rest."
   [x]
-  (when (= :call (head x))
+  (when (contains? #{:call :app} (head x))
     (let [args (vec (drop 2 x))
           i (first (keep-indexed (fn [i a] (when (= :if (head a)) i)) args))]
       (when i
         (let [[_ c a b] (nth args i)
-              with (fn [v] (into [:call (second x)] (assoc args i v)))]
+              with (fn [v] (into [(head x) (second x)] (assoc args i v)))]
           [:if c (with a) (with b)])))))
 
 (defn- strict
@@ -1616,7 +2029,7 @@
       (lemma-rewrite ctx x)
       (lift-if x)
       (when (and (contains? (:facts ctx) x) (not (contains? #{:le :ieq} (head x)))
-                 (boolean-term? x) (boolean? (get (:facts ctx) x)))
+                 (or (boolean-term? x) (boolean-app? ctx x)) (boolean? (get (:facts ctx) x)))
         [:lit (get (:facts ctx) x)])
       (apply-patterns (get @indexed (rule-key x)) x)
       (computed ctx x)
@@ -1664,6 +2077,108 @@
   (let [h (inc (fn-height body))]
     (mapv #(symbol (str "%" h "_" %)) (range (count ps)))))
 
+(defn- int-ish?
+  "Is term t, not yet normalised, an integer: one int-term? knows, or
+  inc, dec, +, - or * of such terms?"
+  [ctx t]
+  (or (int-term? ctx t)
+      (and (= :call (head t)) (contains? '#{inc dec + - *} (second t))
+           (seq (drop 2 t)) (every? #(int-ish? ctx %) (drop 2 t)))))
+
+(declare prune-direct)
+
+(defn- prune
+  "A rewrite of call x that drops a part its value cannot depend on, made
+  before x's arguments are normalised, so the part is never worked on: a
+  lookup past an assoc or dissoc of another literal key, the value an
+  assoc of the same key gives, and the count of a map, which is its
+  collections' and not its fn's.  And an element or the count of a map
+  or a range, read before the range is unrolled: under facts that bound
+  an index, an unrolled range meets an nth that splits on the index,
+  whose other case unrolls it again, a walk with no end.  Each holds
+  where its left side returns, as every rule does."
+  [ctx x]
+  (when (= :call (head x))
+    (or
+     ;; what a binding throws matters only to a law that says nothing throws,
+     ;; which symbolic evaluation proves: rewriting reads the body alone
+     (when (= 'writ.prove.term/strict (second x)) (nth x 3))
+     (prune-direct ctx x)
+     ;; count or nth of a call of a definition that is not recursive: of its
+     ;; body, not yet normalised, so a range in it is not unrolled first
+     (let [[_ f m & more] x
+           d (when (= :app (head m)) (get-in ctx [:defs (second m)]))]
+       (when (and (contains? '#{count nth} f) d (not (:recursive? d)) (:params d)
+                  (= (count (:params d)) (count (drop 2 m))))
+         (when-let [y (prune ctx (into [:call f (t/subst (:body d) (zipmap (:params d) (drop 2 m)))] more))]
+           (swap! (:unfolded ctx) conj (second m))
+           (burn! ctx)
+           y))))))
+
+(defn- prune-direct
+  "prune's rules on x as it stands."
+  [ctx x]
+  (when (= :call (head x))
+    (let [[_ f m k2 & more] x
+          mapv->map (fn [m] (if (and (= :call (head m)) (= 'mapv (second m))) (into [:call 'map] (drop 2 m)) m))
+          ;; the seq of a map or a range is the map or the range: neither is nil
+          unseq (fn [m] (let [e (when (= :sq (head m)) (second m))
+                              inner (when (= :elems (head e)) (second e))]
+                          (if (and (= :call (head inner)) (contains? '#{map mapv range} (second inner)))
+                            inner
+                            m)))
+          ;; vec of a sequence is that sequence, element for element
+          unvec (fn [m] (if (and (= :call (head m)) (= 'vec (second m)) (= 3 (count m))
+                                 (sequential-term? ctx (nth m 2)))
+                          (nth m 2)
+                          m))
+          m (mapv->map (unseq (unvec m)))]
+      (case f
+        nth (when (and (nil? more) (= :call (head m)))
+              (cond
+                (and (= 'map (second m)) (<= 4 (count m) 6)
+                     (every? #(sequential-term? ctx (mapv->map %)) (drop 3 m)))
+                (into [:ap (nth m 2)] (map (fn [c] [:call 'nth c k2]) (drop 3 m)))
+                (and (= 'range (second m)) (<= 3 (count m) 4) (int-ish? ctx k2)
+                     (every? #(int-ish? ctx %) (drop 2 m)))
+                (if (= 3 (count m)) k2 [:call '+ (nth m 2) k2])
+                :else nil))
+        get (when (and (<= 0 (count more) 1) (exact-key? k2))
+              (let [;; the map read, its call or fn application opened up to a
+                    ;; few levels without normalising: a lookup in an element
+                    ;; of a pipeline reaches the assoc that builds it
+                    peeled (loop [m m, n 0]
+                             (let [y (cond
+                                       (and (= :ap (head m)) (= :fn (head (second m)))
+                                            (= (count (second (second m))) (count (drop 2 m))))
+                                       (t/subst (nth (second m) 2) (zipmap (second (second m)) (drop 2 m)))
+                                       (= :call (head m)) (prune ctx m)
+                                       :else nil)]
+                               (if (and y (< n 6)) (recur y (inc n)) m)))
+                    [_ g inner & kvs] (when (= :call (head peeled)) peeled)]
+                (cond
+                  ;; an assoc of literal keys: the last value given k2, or past it
+                  (and (= 'assoc g) (seq kvs) (even? (count kvs))
+                       (every? exact-key? (take-nth 2 kvs)))
+                  (if-let [[_ v] (last (filter #(= k2 (first %)) (partition 2 kvs)))]
+                    v
+                    (into [:call 'get inner k2] more))
+                  (and (= 'dissoc g) (= 1 (count kvs)) (exact-key? (first kvs)) (not= (first kvs) k2))
+                  (into [:call 'get inner k2] more)
+                  (not= peeled m) (into [:call 'get peeled k2] more)
+                  :else nil)))
+        count (when (and (nil? k2) (= :call (head m)))
+                (cond
+                  (and (= 'map (second m)) (<= 4 (count m) 6))
+                  (reduce (fn [acc c] [:call 'min acc [:call 'count c]])
+                          [:call 'count (nth m 3)] (drop 4 m))
+                  (and (= 'range (second m)) (= 3 (count m)) (int-ish? ctx (nth m 2)))
+                  [:call 'max (nth m 2) [:lit 0]]
+                  (and (= 'range (second m)) (= 4 (count m)) (int-ish? ctx (nth m 2)) (int-ish? ctx (nth m 3)))
+                  [:call 'max [:call '- (nth m 3) (nth m 2)] [:lit 0]]
+                  :else nil))
+        nil))))
+
 (defn normalize
   "Rewrite t to normal form under ctx.  An if whose test is open gets its
   branches normalised under the test assumed true, and false."
@@ -1708,7 +2223,9 @@
                                                  :memo (atom {}) :stuck (atom #{}) :int-memo (atom {}))
                                           ctx)]
                                [:fn ps* (normalize ctx* (t/subst body (zipmap ps ps*)))])
-                         (into [(head x)] (map #(normalize ctx %)) (rest x)))]
+                         (if-let [y (prune ctx x)]
+                           (normalize ctx y)
+                           (into [(head x)] (map #(normalize ctx %)) (rest x))))]
                 (if (= :if (head x))
                   ;; a boolean law's left side is often an if: an induction
                   ;; hypothesis or a lemma may still rewrite the whole of one
@@ -1726,8 +2243,9 @@
 (defn context
   "A fresh normalising context.  defs: name -> {:params :body :recursive?};
   types: variable -> type; tenv: data declarations."
-  [{:keys [defs types tenv facts ih fuel lemmas lemmas-used recognizers burned unfolded asked]}]
+  [{:keys [defs types tenv facts ih fuel lemmas lemmas-used recognizers burned unfolded asked trusted-rets]}]
   {:defs (or defs {}) :types (or types {}) :tenv (or tenv {})
+   :trusted-rets (or trusted-rets {})
    :recognizers (or recognizers {})
    :facts (or facts {}) :ih (or ih []) :lemmas (or lemmas [])
    :lemma-index (delay (index-rules (or lemmas [])))

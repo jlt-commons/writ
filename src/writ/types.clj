@@ -354,10 +354,11 @@
                               :else x))]
     (mapv sub (:fields (get (:ctors d) c)))))
 
-(defn- ctor-owner
-  "The declared type that has constructor `c`, or nil."
+(defn- ctor-owners
+  "The declared types that have constructor `c`: two types may share a
+  constructor's name, an expression's :add and an instruction's."
   [tenv c]
-  (first (keep (fn [[tn d]] (when (and (map? d) (contains? (:ctors d) c)) tn)) tenv)))
+  (vec (sort-by str (keep (fn [[tn d]] (when (and (map? d) (contains? (:ctors d) c)) tn)) tenv))))
 
 (defn- ctor-list [tenv tname]
   (sort-by str (keys (:ctors (get tenv tname)))))
@@ -500,8 +501,10 @@
                                     c))
                                 ks)]
                    (swap! seen into cs)
-                   (walk ctx (if (= 1 (count cs))
-                               (assoc-in env [::ctor x] {:type t :ctor (first cs)})
+                   ;; a clause of several constructors, (:add :mul), reads
+                   ;; a field where all of them agree on its type
+                   (walk ctx (if (seq cs)
+                               (assoc-in env [::ctor x] {:type t :ctors (vec cs)})
                                env)
                          body)))
         ts (doall bodies)
@@ -538,17 +541,22 @@
         refined (get-in env [::ctor x])
         f (symbol (name s))
         idx (let [i (second (:args ats))] i)]
-    (if (and refined (= 'nth f))
-      (let [i (:val idx)
+    (if (and refined (contains? '#{nth first second} f))
+      (let [i (case f first 0 second 1 (:val idx))
             [tname args] (data-type-of (:type refined) tenv)
-            fs (ctor-fields tenv tname args (:ctor refined))]
+            fss (map #(ctor-fields tenv tname args %) (:ctors refined))
+            at (fn [fs] (when (<= 1 i (count fs)) (nth fs (dec i))))]
         (cond
           (not (integer? i)) nil
           (zero? i) 'Keyword
-          (<= i (count fs)) (nth fs (dec i))
-          :else (fail! "`" nm "`: " (:ctor refined) " has " (count fs) " field(s), but `"
-                       src "` is read at position " i "; destructure at most "
-                       (inc (count fs)) " element(s), the tag first")))
+          (and (every? at fss) (apply = (map at fss))) (at (first fss))
+          (every? at fss)
+          (fail! "`" nm "`: " (clojure.string/join ", " (:ctors refined)) " differ in the type of field "
+                 i " of `" src "`; give each constructor a clause of its own")
+          :else (let [[c fs] (first (remove (comp at second) (map vector (:ctors refined) fss)))]
+                  (fail! "`" nm "`: " c " has " (count fs) " field(s), but `"
+                         src "` is read at position " i "; destructure at most "
+                         (inc (count fs)) " element(s), the tag first"))))
       (fail! "`" src "` in `" nm "` has data type " (show (:type refined (get env x)))
              "; take it apart with `(case (first " src ") ...)`, not `" f "`"))))
 
@@ -566,10 +574,21 @@
                  ts (mapv #(w env %) items)
                  k (when (and *tagged* (= :lit (:op (first items))) (keyword? (:val (first items))))
                      (symbol (name (:val (first items)))))
-                 owner (when k (ctor-owner tenv k))]
-             (if owner
-               (built-type ctx owner k (rest ts))
-               (when (every? #(data? % tenv) ts) data)))
+                 owners (when k (ctor-owners tenv k))
+                 ;; of types that share the name, the one the literal fits:
+                 ;; its field count, then its fields' types
+                 fits (if (next owners)
+                        (filterv #(try (built-type ctx % k (rest ts)) true
+                                       (catch clojure.lang.ExceptionInfo _ false))
+                                 owners)
+                        owners)]
+             (cond
+               (= 1 (count fits)) (built-type ctx (first fits) k (rest ts))
+               (seq fits) (fail! "`" (:nm ctx) "`: " (pr-str (vec (cons (:val (first items)) (map (constantly '_) (rest items)))))
+                                 " could be a value of " (clojure.string/join " or " fits)
+                                 "; give their constructors different fields, or different names")
+               (seq owners) (built-type ctx (first owners) k (rest ts))
+               :else (when (every? #(data? % tenv) ts) data)))
       :set (let [ts (mapv #(w env %) (:items ast))]
              (when (every? #(data? % tenv) ts) data))
       :map (let [ts (mapv #(w env %) (concat (:keys ast) (:vals ast)))

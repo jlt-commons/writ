@@ -61,6 +61,15 @@ names what is wrong. writ runs on jolt; writ.spec uses test.check.
    prints states, steps, signatures, laws and wiring from the spec alone,
    and ends with the questions its types raise. When a person asked for the
    feature, show it to them and have them confirm it before writing code.
+   Run the check now, before any code: with the target not written yet,
+   `check` checks the spec alone. Each type it names must make values
+   that fit it, each example must fit its fn's signature and `:requires`,
+   each law must call the target, and each law that calls a fn on its own
+   variables is run at that fn's examples, so ``law `x` contradicts the
+   example (f 2) => 7`` shows a wrong law or a wrong example while both
+   are cheap to fix. Give the examples the problem statement works
+   through; they are what the laws are checked against here. The report
+   says `no implementation yet` and is never `:ok`.
 7. Then the implementation. If a law holds but isn't proved, write a
    lemma or hint in the proof namespace (see
    [The proof namespace](#the-proof-namespace)); never weaken the law.
@@ -111,6 +120,9 @@ failures: a law over every input may already answer one.
   `[insert Nat _]` is `(insert n state)`. `[first]`, `[second]` or
   `[last]` takes a state out of a tuple state, so a fn that returns
   `[next-state reply]` can lead back: `{:result {[first] #{:links}}}`.
+  Such an edge is judged through the steps into the tuple state: an
+  `[add String]` into `:result` gets the law `g:links:add.first`, that
+  `(first (add links s))` lands in `:links`, refinement and all.
 - `(refine Name [x Base] pred)` is a type: values of Base where pred
   holds. Use it in `ann`, `forall`, states, other refinements. It defines
   `Name?`. Refine the parts (a Paddle, a Ball) rather than folding random
@@ -129,6 +141,8 @@ failures: a law over every input may already answer one.
 - Each target of such an edge is also a law, `graph:state:fn->target`:
   some value of the state lands there. A step the code never takes fails,
   so don't list targets "just in case"; list the steps the problem has.
+- A refinement that only names a record, `(refine Member [m {...}] true)`,
+  is a plain state: an edge into it is data flow, with no law of its own.
 - Two states of the same plain type fail the check (`:unsorted` and
   `:sorted` both `(List Nat)` say nothing apart). Make the meaningful one
   a refinement, defined with the helpers the laws use:
@@ -141,7 +155,8 @@ failures: a law over every input may already answer one.
 - An edge argument written `'name` is not a type but the spec's own value
   of that name, passed as is: `[scan (Vec Pattern) 'yes Nat]` hands
   `scan` the spec's `yes` guard, since a fn cannot be generated.
-- `:tested {state "why"}` lets the edges out of a state off proof, as
+- `:tested {state "why"}` lets the edges out of a state off proof, and
+  `:tested {[state f] "why"}` one step of it, as
   `{:require :tested :because "why"}` does for a law. A report says so when
   such an edge gets proved after all, so the marker can go.
 - `:start`, `:final`, `:never`, `:before` are rules of the graph itself.
@@ -251,10 +266,25 @@ failures: a law over every input may already answer one.
   target's code mentions (with each integer's neighbours), and an `Any` is
   sometimes a vector tagged with one of its keywords, so a branch on
   `(= :normal reason)` or `(case (first ret) :reply ...)` is reached.
+  A record's `Keyword` field, inside a refinement too, is drawn mostly
+  from the keywords the code and the spec test or set that field to,
+  `(= :ready (:status j))`, `(assoc j :status :dead)`: a `:status
+  Keyword` is often `:ready`, so a law about ready jobs is met without
+  building them. A law's scalar variable, a `Nat`, `Int` or `Keyword`
+  quantified beside a structured one, is a third of the time a value
+  found inside it, one under a key of its own name first: in
+  `(forall [s Stock, sku Nat, id Nat] ...)` `sku` is often a lot's `:sku`
+  and `id` a lot the stock holds. An `Index` of records now and then has
+  a record that is a copy of another but for its key: two lots alike but
+  for their ids, where a tie-break decides. Laws still meet such cases
+  more surely when they build them; a tie-break deserves a law that
+  makes the tie.
 - A law is built from:
   - `(= a b)`
   - `(and P ...)`
-  - `(=> P Q)`; a case where `P` does not hold is skipped. When no
+  - `(=> P Q)`; a case where `P` does not hold is skipped. Inside an
+    expression, `(every? (fn [k] (=> P Q)) ks)`, it is a value: true
+    where `P` does not hold. When no
     generated input meets `P`, the solver looks for inputs that do: the
     law is refuted there, or its proof stands on them
   - `(forall [x T, y U] P)`
@@ -287,10 +317,50 @@ failures: a law over every input may already answer one.
 - `(flow f [param ...] [link link ...] ...)`: the path data takes through
   `f`. See [Flows](#flows).
 
+## Building on another spec
+
+Build a larger workflow on a component that has a spec of its own:
+prove the component once, then use it as a trusted piece.
+
+```clojure
+(spec my.shop {:uses [my.auth-spec]})
+```
+
+- `my.auth-spec` is checked first. If it fails, this spec fails too, with
+  its report: a workflow on a broken component stands on nothing.
+- Each of its proved laws is a lemma here, cited by its full name
+  (`my.auth-spec/a-wrong-password-does-not`); a law of it only tested is
+  not imported, and the report says so.
+- Its signed fns are taken at that spec: calls to them from this target
+  are typed by their signatures, checked against their `:requires` while
+  the laws run (charging a session the workflow never authenticated
+  fails, naming the component's contract), and not unfolded in proofs
+  here, so the workflow's proofs rest on the component's laws and stay
+  true for any implementation that meets its spec.
+- Put a protocol the component imposes in its `:requires`
+  (`(ann charge [Session Nat -> Nat] {:requires (fn [s _] (authed? s))})`):
+  that is what a caller is held to. Each signed fn of this target that
+  calls such a fn, itself or through its own helpers, gets the law
+  `f:keeps-requires`: it never throws, a broken `:requires` among the
+  throws. Tested, a call that breaks it fails; proved, every call meets
+  it, from what the component's proved laws say.
+- Imported laws are not laws of this spec and judge no stand-in: the
+  workflow's spec must still say what it means. Specs may not use each
+  other in a cycle.
+- A helper of this spec states what the component means in its own
+  words (a `clashes?` of its own, say); it does not call the
+  component's fns. The component's code may not exist yet when the spec
+  is first checked, and a model that calls it would judge the workflow
+  by the very code it builds on. Laws, and the target, call the
+  component; `(calls f {:through [comp.core/g]})` says the target must.
+
 ## Assumptions
 
-When the code calls something writ does not check (`clojure.string`, a
-library, another namespace), say what the spec takes as given:
+The code may call what writ does not check (`clojure.string`, a
+library, another namespace) without any of this: such a call runs in the
+laws' tests as it is, and its result is taken as Any. To have its types
+checked, or to let the prover reason about it, say what the spec takes
+as given:
 
 ```clojure
 (assume str/trim [String -> String])                 ; a signature, via the spec's alias
@@ -399,6 +469,16 @@ When a law holds but isn't proved, add what the prover needs in
   proves even though the code's vector branch walks elements the prover
   cannot see. An unknown answer (`vector?` of an opaque value, its `first`)
   is the same each time it is asked of the same value.
+- Pipelines are read by position: the count of a `map`, `mapv`,
+  `map-indexed`, `range` or `repeat`, and the element at any index of a
+  `map` over sequences or a `range`, without running the steps that do
+  not reach it; a lookup past an `assoc` drops what the other keys hold.
+  Two sequences are equal when their counts are and their elements at
+  every index are, and the prover proves it that way. So a law over a
+  whole output, `(= (mapv :w xs) (mapv :w (tag xs)))`, and a law at an
+  index, `(= (:w (nth (tag xs) i)) (:w (nth xs i)))`, are both likely to
+  be proved. `even?`, `odd?`, a lookup in a constant map and arithmetic
+  on one of a few literals (a rate from a table) are read too.
 - The usual reasons a law isn't proved: recursion that needs a lemma about
   a helper (write the lemma), a law about a recursive fn stated over its
   whole output where a pointwise statement would do, or a form outside
@@ -484,7 +564,11 @@ of the algorithm (that is the code).
   circular.
 - **Give an example or two.** `(example price [6000] 12000)` is checked as
   a law, and the other laws must pin `price` down at 6000 as well: a
-  stand-in that agrees everywhere but there must break one of them.
+  stand-in that agrees everywhere but there must break one of them. A
+  law is run there when it calls the fn on its variables, or on a value
+  built of them that the example's arguments fit: `(size [:add a b])`
+  is run at `(example size [[:add [:num 1] [:var :x]]] 3)` with `a` and
+  `b` taken from it. Keep the examples; add the law that reaches them.
 - **Reach for the strong kinds of law.** Hughes ("How to Specify It!",
   2019) planted eight bugs in a search tree: laws that only said the
   result was valid caught three; every bug was caught by each of these:
@@ -589,10 +673,25 @@ as a literal and take it apart with `case` on the tag:
 ```
 
 The `case` must list every constructor, or carry a default, and name no
-others. A clause destructures only its constructor's fields. A literal
-`[:Node ...]` carries exactly the declared fields, of fitting types. Read
-the tag with `case (first t)` only: `first`, `second` or `nth` of a data
-value anywhere else is rejected.
+others. A clause destructures only its constructor's fields, or reads
+them by position, `(second t)` or `(nth t 2)`; a clause of several
+constructors, `(:add :mul) ...`, reads a field where they agree on its
+type. A literal `[:Node ...]` carries exactly the declared fields, of
+fitting types. Two types may share a constructor's name when they give
+it different fields -- an expression's `(add Expr Expr)` and an
+instruction's `(add)`: a literal is of the type whose fields it has. Read the tag with `case (first t)` only: `first`,
+`second` or `nth` of a data value outside a clause that fixed its
+constructor is rejected. A case with no default never reaches its
+no-match throw on a value of the type, so its last test is no coverage
+note.
+
+The prover reads a value of a data type -- a variable of it, or a call
+whose signature's return type it proved from the code -- by its
+constructor: under a test of the tag, its fields have their declared
+types, and when the tests rule out every constructor but one, it is
+that one. Laws like `(= (simplify [:mul [:num 0] x]) [:num 0])` or
+`(= (evaluate [:add a b] env) (+ (evaluate a env) (evaluate b env)))`
+are proved, not only tested.
 
 ### Records
 
@@ -626,6 +725,7 @@ never to throw.
 (spec/check 'my.sort-spec {:target 'my.sort2})    ; same spec, other impl
 (spec/check! 'my.sort-spec)                       ; throws with the message
 (spec/sample '(List Nat) {} 5)                    ; what a type generates
+(spec/sample 'my.spec/Order 5)                    ; ... one the spec declares, refinements built
 (spec/scan 'my.ns)                                ; which fns a spec could cover
 (spec/call-graph 'my.ns)                          ; {f #{g ...}}, read from source
 (spec/mermaid 'my.spec)                           ; the graph, with the spec's calls
@@ -656,6 +756,28 @@ A report's `:timings` says where the time went, in milliseconds
 tested law carries `:test-ms`.
 
 ## Reading a report
+
+Only `:ok` (the check's exit status) says pass or fail. The first line
+says `ok` or `FAILED`; the indented lines under it are a summary and
+notes, which never fail a check on their own; each failure follows them
+as a block of its own, after a blank line. A note such as "was never
+false" or "not a step of any graph" is about the spec: when you own only
+the implementation, pass it on to the spec's owner rather than change
+code for it.
+
+While the laws run, each test in the code (an `if`, and the `and`, `or`,
+`cond`, `when` and `case` that expand to one) notes which way it went. A
+test no law took both ways is listed: `` `place-order`: (priced? items
+prices) was never false``. Each is a case the laws never try: if it can
+happen, add a law that says what the code does then (often an input the
+law built to meet a hypothesis leaves it out); if it cannot, the branch is
+dead. Each operand of an `and` or `or` is run in every trial too, the
+value the code sees unchanged, so a case one operand alone decides is
+seen: `` `orderable?`: in (and (priced? ...) (stocked? ...)), (priced?
+...) was never false while the others were true`` means no law tried an
+unpriced item that was in stock, so nothing says what happens then. A
+nil test that guards the operands after it is not named.
+`{:coverage false}` skips it.
 
 `:static` fails first. A static failure is a single `Writ:` message, and no
 law runs until it is fixed. After that, each law has a `:status`:
@@ -767,6 +889,13 @@ confirm it, then without one.
   the spelling; the spec names the structure.
 - ``law `x` fails for ...`` - the implementation is wrong for that input;
   see [Reading a report](#reading-a-report).
+- ``law `x` is thinly tested: its hypothesis held in N of M trials`` - the
+  law ran its conclusion on few inputs. A common cause is drawing indices
+  as free `Nat`s behind `(< i (count xs))`: two such indices meet a
+  rare case (a tie between two entries) almost never. Quantify over the
+  positions inside the law instead, `(every? (fn [[i j]] ...) (for [i
+  (range (count xs)) j (range (count xs))] [i j]))`, so every trial checks
+  every pair.
 - ``the hypothesis never held in N trials`` - no generated input satisfied
   the `=>` premise, and the solver found none either, so the law tested
   nothing. Tell the spec's owner: the premise may be unsatisfiable, or
@@ -783,7 +912,9 @@ confirm it, then without one.
 - ``law `x`: (<= a b) was never false in N trials, nor at an input the
   solver found`` - a clause of the law that only ever went one way tests
   one side only. Build inputs that turn it (a refinement, a value in the
-  law), or drop it if it always holds. Tell the spec's owner.
+  law), or drop it if it always holds. A note, not a failure; a
+  comparison the law asserts outright is never named, since it is false
+  only where the law fails. Tell the spec's owner.
 - ``no witness among N generated values`` - the `exists` law found no
   value. Either the implementation is wrong, or the witness is too rare to
   generate.

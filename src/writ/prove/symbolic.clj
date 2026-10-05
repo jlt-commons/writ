@@ -188,8 +188,10 @@
         (:set v) :set
         (:map v) [:map (mapv second (:map v))]
         (:amap v) [:amap (:base (:amap v))]
-        ;; a view merges only with itself
+        ;; a view merges only with itself, and so does a map read by lookup
         (:view v) [:view v]
+        (:mmap v) [:mmap v]
+        (contains? v :repeat) [:repeat v]
         (:seqv v) (let [{:keys [base off len sfx]} (:seqv v)] [:seqv base off len (count sfx)])
         (:fn v) :fn
         (contains? v :opaque) :opaque
@@ -749,6 +751,72 @@
           (base-at st m x)
           (:stores (:amap m))))
 
+(declare apply-fn on-path pruned ev run-steps)
+
+(defn- keyed-step
+  "For a fn value (fn [acc e] (assoc acc K V)), K the entry's key and V
+  reading acc only at K: a fn of the fold's init giving the step at a key
+  and its value, V run with acc the init and e that entry.  nil for any
+  other fn."
+  [st fv]
+  (let [[_ ps body] (:term fv)
+        [acc e] ps
+        key-of? (fn [t] (or (= t [:call 'key e]) (= t [:call 'first e])
+                            (= t [:call 'nth e [:lit 0]]) (= t [:call 'nth e [:lit 0] [:nil]])))
+        reads-acc-elsewhere? (fn rd [t]
+                               (cond (= t acc) true
+                                     (and (vector? t) (= :call (first t)) (= 'get (second t)) (= acc (nth t 2 nil))
+                                          (key-of? (nth t 3 nil)))
+                                     (some rd (drop 4 t))
+                                     (and (vector? t) (not= :lit (first t))) (some rd (rest t))
+                                     :else false))]
+    (when (and (= :fn (first (:term fv))) (= 2 (count ps))
+               (vector? body) (= [:call 'assoc] (subvec body 0 2)) (= 5 (count body))
+               (= acc (nth body 2)) (key-of? (nth body 3))
+               (not (reads-acc-elsewhere? (nth body 4))))
+      (fn [init]
+        (fn [x vb]
+          (ev st (merge (:env fv) {acc init e {:vec [x vb] :kind :vector}}) (nth body 4)))))))
+
+(defn- mlookup
+  "[present value] of key x in a map value: a map of unknown size, one of
+  known entries, nil, or maps merged or folded over (:mmap)."
+  [st m x]
+  (cond
+    (:amap m) (amap-lookup st m x)
+    (:map m) (do (named! m x)
+                 [(into [:or false] (for [[p k _] (:map m)] (conj-f p (same-key st x k))))
+                  (map-lookup st m x {:nil true})])
+    (:nil m) [false {:nil true}]
+    ;; a map's entries that pass the view's filters
+    (= :entries (:op (:mmap m)))
+    (let [{:keys [a steps]} (:mmap m)
+          [pa va] (mlookup st a x)
+          [c _] (run-steps st steps pa {:vec [x va] :kind :vector})]
+      [(define! st :bool c) va])
+    ;; the keys of a map, each holding x
+    (= :keys-of (:op (:mmap m)))
+    (let [[pa _] (mlookup st (:a (:mmap m)) x)] [pa (:x (:mmap m))])
+    (:mmap m)
+    (let [{:keys [op a b f step]} (:mmap m)
+          [pa va] (mlookup st a x)
+          [pb vb] (mlookup st b x)
+          pa (define! st :bool pa)
+          pb (define! st :bool pb)]
+      [(define! st :bool [:or pa pb])
+       (case op
+         ;; the later map's value where it holds x
+         :merge (merge-values st pb vb va)
+         ;; both: f of the two, on the path where both hold x
+         :merge-with (merge-values st pb
+                                   (merge-values st pa
+                                                 (on-path st [:and pa pb] #(pruned st (fn [] (apply-fn st f [va vb]))))
+                                                 vb)
+                                   va)
+         ;; a fold that sets each key of b once: its step there, or a's
+         :fold (merge-values st pb (on-path st pb #(pruned st (fn [] (step x vb)))) va))])
+    :else (give-up! "a lookup in a value that is not a map")))
+
 (defn- amap-get [st m x dflt]
   (let [[pr v] (amap-lookup st m x)]
     (merge-values st pr v dflt)))
@@ -969,13 +1037,18 @@
 (declare seq-elem seq-slice-has)
 
 (defn- run-steps
-  "[c e] after the view's filters and maps, from element e present when c."
-  [st steps c e]
-  (reduce (fn [[c e] [kind f]]
-            (case kind
-              :filter [(conj-f c (truth (apply-fn st f [e]))) e]
-              :map [c (apply-fn st f [e])]))
-          [c e] steps))
+  "[c e] after the view's filters and maps, from element e present when c,
+  at index idx of the view (a map-indexed step reads it)."
+  ([st steps c e] (run-steps st steps c e nil))
+  ([st steps c e idx]
+   (reduce (fn [[c e] [kind f]]
+             (case kind
+               :filter [(conj-f c (truth (apply-fn st f [e]))) e]
+               :map [c (apply-fn st f [e])]
+               :map-indexed (if idx
+                              [c (apply-fn st f [idx e])]
+                              (give-up! "map-indexed where the index is not known"))))
+           [c e] steps)))
 
 (defn- view-at
   "[c e]: whether the view has an element at key x -- a map's key, an index
@@ -986,7 +1059,9 @@
       (let [[pres val] (amap-lookup st src x)
             e0 (case proj :vals val :keys x :entries {:vec [x val] :kind :vector})]
         (run-steps st steps pres e0))
-      (run-steps st steps (seq-slice-has src x) (seq-elem st src (:int x))))))
+      (run-steps st steps (seq-slice-has src x) (seq-elem st src (:int x))
+                 ;; its place in the view: from the slice's start
+                 (when (contains? x :int) {:int [:- (:int x) (:off (:seqv src))]})))))
 
 (defn- view-extra
   "[[c e] ...]: the elements a view has that no key of its base holds -- the
@@ -994,7 +1069,8 @@
   [st v]
   (let [{:keys [src steps]} (:view v)]
     (if (:seqv src)
-      (mapv #(run-steps st steps true %) (:sfx (:seqv src)))
+      (vec (map-indexed (fn [i e] (run-steps st steps true e {:int [:+ (:len (:seqv src)) i]}))
+                        (:sfx (:seqv src))))
       [])))
 
 (defn- view-base
@@ -1404,6 +1480,35 @@
 (defn- compare-int [op a b]
   [op (int-of a) (int-of b)])
 
+(defn- literal-ite?
+  "Is integer term t a choice among at most 16 literals: an :ite tree
+  whose leaves are all integers?"
+  [t]
+  (letfn [(leaves [t] (cond (integer? t) 1
+                            (and (vector? t) (= :ite (first t)) (= 4 (count t)))
+                            (let [a (leaves (nth t 2)) b (leaves (nth t 3))]
+                              (when (and a b) (+ a b)))
+                            :else nil))]
+    (and (vector? t) (= :ite (first t))
+         (when-let [n (leaves t)] (<= n 16)))))
+
+(defn- through-defs
+  "Integer term t with each variable merging introduced replaced by its
+  definition, through :ite trees up to 24 steps deep."
+  ([st t] (through-defs st t 24))
+  ([st t depth]
+   (cond
+     (zero? depth) t
+     (symbol? t) (if-let [d (get-in @st [:def-of t])] (through-defs st d (dec depth)) t)
+     (and (vector? t) (= :ite (first t)) (= 4 (count t)))
+     [:ite (nth t 1) (through-defs st (nth t 2) (dec depth)) (through-defs st (nth t 3) (dec depth))]
+     :else (fold t))))
+
+(defn- scale-ite
+  "The :ite tree t of literals with each leaf multiplied by term x."
+  [t x]
+  (if (integer? t) [:* t x] [:ite (nth t 1) (scale-ite (nth t 2) x) (scale-ite (nth t 3) x)]))
+
 (defn- fold
   "An integer term with its literal parts computed: [:+ 1 2] is 3."
   [t]
@@ -1580,7 +1685,15 @@
                               (let [s (fold (int-of p)) u (fold (int-of q))]
                                 (cond (integer? s) {:int [:* s u]}
                                       (integer? u) {:int [:* u s]}
-                                      :else (give-up! "a product of two unknowns"))))
+                                      ;; one factor is one of a few literals, as a
+                                      ;; lookup in a table of rates gives: a
+                                      ;; product per literal, each linear
+                                      (literal-ite? (through-defs st u)) {:int (scale-ite (through-defs st u) s)}
+                                      (literal-ite? (through-defs st s)) {:int (scale-ite (through-defs st s) u)}
+                                      ;; two unknowns: some integer, the same for the same
+                                      ;; factors -- what follows from the product being
+                                      ;; one value, and nothing of multiplication
+                                      :else {:int (unknown! st '* (sort-by pr-str [s u]) :int)})))
                          acc x))
                 {:int 1} args)
       inc (num (fn [x] [:+ x 1]))
@@ -1629,6 +1742,21 @@
       zero? (lift st (fn [x] {:bool (num-test st 'zero? [x] #(vector := (int-of x) 0))}) a)
       pos? (lift st (fn [x] {:bool (num-test st 'pos? [x] #(vector :> (int-of x) 0))}) a)
       neg? (lift st (fn [x] {:bool (num-test st 'neg? [x] #(vector :< (int-of x) 0))}) a)
+      ;; a remainder by 2, as integer arithmetic has it
+      even? (lift st (fn [x] {:bool [:= [:mod (int-of x) 2] 0]}) a)
+      odd? (lift st (fn [x] {:bool [:= [:mod (int-of x) 2] 1]}) a)
+      ;; the one boolean, whatever the value's shape: a boolean is it or not,
+      ;; nil and any other known shape is neither, and an opaque value
+      ;; answers as some boolean, the same each time it is asked
+      (true? false?)
+      (lift st (fn [x]
+                 (cond
+                   (contains? x :bool) {:bool (if (= 'true? f) (:bool x) [:not (:bool x)])}
+                   (or (:nil x) (contains? x :int) (contains? x :const) (:map x) (:vec x) (:set x)
+                       (:seqv x) (:amap x))
+                   {:bool false}
+                   :else {:bool (unknown! st f x :bool)}))
+            a)
       identity a
       hash-set (finite-set st (map (fn [x] [true x]) args) true)
       set (lift st (fn [x] (cond (:set x) {:set (assoc (:set x) :distinct true)}
@@ -1674,19 +1802,27 @@
       contains? (lift2 st (fn [sv x]
                             (cond (:set sv) {:bool ((:mem (:set sv)) x)}
                                   (:amap sv) {:bool (first (amap-lookup st sv x))}
+                                  (:mmap sv) {:bool (first (mlookup st sv x))}
                                   (:map sv) (do (named! sv x)
                                                 {:bool (into [:or false] (for [[p k _] (:map sv)] (conj-f p (same-key st x k))))})
                                   (:nil sv) {:bool false}
                                   :else (give-up! "contains? on a value that is not a set or map")))
                        a b)
       into (lift2 st (fn [x y]
-                       (when-not (:set x) (give-up! "into a value that is not a set"))
-                       (let [sy (if (:set y) (:set y) (:set (finite-set st (map (fn [e] [true e]) (seq-of y)) false)))
-                             sx (:set x)]
-                         {:set {:mem (fn [e] [:or ((:mem sx) e) ((:mem sy) e)])
-                                :elems (when (and (:elems sx) (:elems sy)) (into (:elems sx) (:elems sy)))
-                                :distinct true
-                                :elem (or (:elem sx) (:elem sy))}}))
+                       (when-not (or (:set x)
+                                     ;; a map's entries, filtered, into an empty map
+                                     (and (= [] (:map x)) (:view y) (= :entries (:proj (:view y)))
+                                          (:amap (:src (:view y)))
+                                          (every? #(= :filter (first %)) (:steps (:view y)))))
+                         (give-up! "into a value that is not a set"))
+                       (if (:map x)
+                         {:mmap {:op :entries :a (:src (:view y)) :steps (:steps (:view y))}}
+                         (let [sy (if (:set y) (:set y) (:set (finite-set st (map (fn [e] [true e]) (seq-of y)) false)))
+                               sx (:set x)]
+                           {:set {:mem (fn [e] [:or ((:mem sx) e) ((:mem sy) e)])
+                                  :elems (when (and (:elems sx) (:elems sy)) (into (:elems sx) (:elems sy)))
+                                  :distinct true
+                                  :elem (or (:elem sx) (:elem sy))}})))
                   a b)
       filter (lift st (fn [xs]
                         (if (as-view xs)
@@ -1735,6 +1871,20 @@
                                 (:set xs) (image st f a (:set xs))
                                 :else (seq-of xs)))
                          b)
+      ;; a fn of each element's index and the element: the index is its
+      ;; place, from the slice's start, so only while no filter has
+      ;; renumbered the elements, and not over a map, whose order is unknown
+      map-indexed (lift st (fn [xs]
+                             (cond
+                               (:nil xs) {:vec [] :kind :seq}
+                               (:vec xs) {:vec (vec (map-indexed (fn [i e] (apply-fn st a [{:int i} e])) (:vec xs)))
+                                          :kind :seq}
+                               (and (:seqv xs) (as-view xs)) (view-step (as-view xs) [:map-indexed a])
+                               (and (:view xs) (:seqv (:src (:view xs)))
+                                    (not-any? #(= :filter (first %)) (:steps (:view xs))))
+                               (view-step xs [:map-indexed a])
+                               :else (give-up! "map-indexed over a collection of unknown order")))
+                       b)
       list {:vec (vec args) :kind :seq}
       vector {:vec (vec args) :kind :vector}
       vec (lift st (fn [x] (cond (:seqv x) (assoc-in x [:seqv :kind] :vector)
@@ -1796,13 +1946,34 @@
               {:nil true}
               (reduce (fn [m n]
                         (lift2 st (fn [mm nn]
-                                    (if (:nil nn)
-                                      mm
+                                    (cond
+                                      (:nil nn) mm
+                                      ;; a map of unknown size in it: merged by lookup
+                                      (some #(or (:amap %) (:mmap %)) [mm nn])
+                                      {:mmap {:op :merge :a mm :b nn}}
+                                      :else
                                       (do (open! nn "merging in the entries")
                                           (reduce (fn [acc [p k v]] (map-assoc st acc k v p))
                                                   (as-map mm) (:map (as-map nn))))))
                                m n))
                       args))
+      ;; one value over and over: only as zipmap's values
+      repeat (if (= 1 n) {:repeat a} (give-up! "repeat of a count"))
+      ;; (zipmap (keys m) (repeat x)): m's keys, each holding x
+      zipmap (lift2 st (fn [ks vs]
+                         (let [{:keys [src proj steps]} (:view ks)]
+                           (if (and (:view ks) (= :keys proj) (empty? steps) (:amap src) (contains? vs :repeat))
+                             {:mmap {:op :keys-of :a src :x (:repeat vs)}}
+                             (give-up! "zipmap of other than a map's keys and one value"))))
+                    a b)
+      ;; two maps merged with f where both hold a key, read by lookup
+      merge-with (if (= 3 n)
+                   (lift2 st (fn [mm nn]
+                               (cond (:nil nn) mm
+                                     (:nil mm) nn
+                                     :else {:mmap {:op :merge-with :f a :a mm :b nn}}))
+                          b c)
+                   (give-up! "merge-with of other than two maps"))
       keys (lift st (fn [x] (if (:amap x) (view-of x :keys) (let [m (as-map x)]
                               (open! m "the keys")
                               (if (empty? (:map m)) {:nil true}
@@ -1882,6 +2053,11 @@
                                 (and (plus? a) (as-view xs) (not (:vec xs)))
                                 {:int [:+ (int-of b) (view-agg st (as-view xs) :sum)]}
                                 (:vec xs) (reduce (fn [acc x] (apply-fn st a [acc x])) b (:vec xs))
+                                ;; a step that sets the entry's own key from what
+                                ;; acc holds there: a map of unknown size folded
+                                ;; key by key, in any order the same
+                                (and (or (:amap xs) (:mmap xs)) (keyed-step st a))
+                                (lift st (fn [init] {:mmap {:op :fold :a init :b xs :step ((keyed-step st a) init)}}) b)
                                 :else (give-up! "reduce over a collection of unknown order")))
                      c)
                ;; with no initial value: the first element starts it, and
@@ -1908,6 +2084,8 @@
             (lift2 st (fn [x i]
                         (cond
                           (:map x) (map-lookup st x i (if (= 3 n) c {:nil true}))
+                          (:mmap x) (let [[p v] (mlookup st x i)]
+                                      (merge-values st p v (if (= 3 n) c {:nil true})))
                           (:amap x) (amap-get st x i (if (= 3 n) c {:nil true}))
                           ;; a vector at an index: its element there; a seq has none
                           (:seqv x) (cond
@@ -1989,7 +2167,8 @@
                          (:amap x) {:int (view-count st (view-of x :entries))}
                          (and (:view x) (:amap (:src (:view x)))) {:int (view-count st x)}
                          ;; a vector's elements, mapped: as many as it has
-                         (and (:view x) (:seqv (:src (:view x))) (every? #(= :map (first %)) (:steps (:view x))))
+                         (and (:view x) (:seqv (:src (:view x)))
+                              (every? #(contains? #{:map :map-indexed} (first %)) (:steps (:view x))))
                          {:int (seq-count (:src (:view x)))}
                          (and (:view x) (:seqv (:src (:view x)))) {:int (view-agg st x :count)}
                          (:map x) (do (open! x "the count")
@@ -2012,11 +2191,22 @@
       cons (lift2 st (fn [x ys] {:vec (into [x] (seq-of ys)) :kind :seq}) a b)
       concat {:vec (vec (mapcat (fn [x] (let [v (lift st identity x)] (seq-of v))) args)) :kind :seq}
       nth (lift2 st (fn [x i]
-                      (if (:seqv x)
+                      (cond
+                        (:seqv x)
                         (let [[in v] (seq-nth st x (int-of i))]
                           (if (= 3 n)
                             (merge-values st in v c)
                             (do (record-throw! st [:not in]) (merge-values st in v :bottom))))
+                        ;; a vector's elements mapped, by place or not: the step
+                        ;; run on the element at that place
+                        (and (:view x) (:seqv (:src (:view x)))
+                             (every? #(contains? #{:map :map-indexed} (first %)) (:steps (:view x))))
+                        (let [[in v0] (seq-nth st (:src (:view x)) (int-of i))
+                              [_ v] (run-steps st (:steps (:view x)) true v0 {:int (int-of i)})]
+                          (if (= 3 n)
+                            (merge-values st in v c)
+                            (do (record-throw! st [:not in]) (merge-values st in v :bottom))))
+                        :else
                       (let [k (int-of i)
                             xs (seq-of x)
                             past (if (= 3 n) c :bottom)]
@@ -2075,7 +2265,26 @@
 
 (defn- opaque-in? [g] (boolean (some #{:opaque} (tree-seq coll? seq g))))
 
-(declare app-body)
+(declare app-body ev)
+
+(defn- component-call
+  "A call of a fn taken at its spec, a component's: some value of its
+  return type, the same for the same arguments; it throws only where the
+  arguments break its :requires, which is noted as a throw there."
+  [st f vs]
+  (when-let [{:keys [params term]} (get-in @st [:requires f])]
+    (when-not (and term (= (count params) (count vs)))
+      (give-up! (str "the :requires of `" f "`, which the prover cannot read")))
+    (record-throw! st [:not (truth (ev st (zipmap params vs) term))]))
+  (let [ret (get-in @st [:trusted-rets f])
+        ts (map flat vs)
+        base (if (every? some? ts)
+               {:id [:call f] :args (vec (apply concat ts))}
+               (or (get-in @st [:call-bases [f vs]])
+                   (let [b {:id [:call f (:n (swap! st update :n inc))] :args []}]
+                     (swap! st assoc-in [:call-bases [f vs]] b)
+                     b)))]
+    (template st base [:ret] ret (:args base))))
 
 (defn- uninterpreted-call
   "The value of a call of recursive f the evaluation will not unfold: some
@@ -2108,6 +2317,9 @@
   walked down to its end); past that, the call's value is uninterpreted."
   [st f vs]
   (let [d (get-in @st [:defs-of f])]
+    (if (and (or (nil? d) (:outside d)) (get-in @st [:trusted-rets f]))
+      (component-call st f vs)
+    (do
     (when (or (nil? d) (:outside d))
       (give-up! (str "the call of `" f "`")))
     (if-let [why (when (:recursive? d)
@@ -2123,7 +2335,7 @@
                        :else (do (swap! st assoc :unfolds (inc unfolds)) nil))))]
       (do (swap! st update :used (fnil conj #{}) f)
           (uninterpreted-call st f vs why))
-      (app-body st f vs d))))
+      (app-body st f vs d))))))
 
 (defn- app-body
   [st f vs d]
@@ -2290,7 +2502,12 @@
               :else (merge-values st c
                                   (on-path st c #(pruned st (fn [] (ev st env (nth x 2)))))
                                   (on-path st [:not c] #(pruned st (fn [] (ev st env (nth x 3))))))))
-      :call (folded (core st (second x) (mapv #(ev st env %) (drop 2 x))))
+      :call (if (= 'writ.prove.term/strict (second x))
+              ;; a binding runs before the body; where nothing may throw, its
+              ;; throws count whether or not the body reads it
+              (do (when (:total @st) (ev st env (nth x 2)))
+                  (ev st env (nth x 3)))
+              (folded (core st (second x) (mapv #(ev st env %) (drop 2 x)))))
       :app (let [[_ f & args] x] (app st f (mapv #(ev st env %) args)))
       :fn (let [[_ ps body] x]
             {:fn (fn [vs] (ev st (merge env (zipmap ps vs)) body))
@@ -2313,11 +2530,12 @@
   "{:formula :decls} saying that under hyps, goal g is truthy, for every
   value of the typed variables -- and, when opts has :total, that its
   evaluation never throws; nil when some part is outside."
-  [{:keys [types defs tenv total lenient rets]} hyps g]
+  [{:keys [types defs tenv total lenient rets trusted-rets requires]} hyps g]
   (try
     (let [st (state)
           facts (atom [])
-          _ (swap! st assoc :defs-of defs :tenv tenv :total total :rets (or rets {}))
+          _ (swap! st assoc :defs-of defs :tenv tenv :total total :rets (or rets {})
+                   :trusted-rets (or trusted-rets {}) :requires (or requires {}))
           occurs (reduce into (t/vars g) (map t/vars hyps))
           env (into {} (for [v (sort-by str (keys types)) :when (contains? occurs v)]
                          [v (var-value st facts (get types v) tenv v)]))

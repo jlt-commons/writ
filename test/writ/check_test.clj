@@ -191,3 +191,24 @@
     (is (re-find #"does not descend"
                  (check-err '(defn from-x {:writ/descend true} [^:many i ^:many ^Nat n]
                                (if (< i n) (from-x (inc i) n) i)))))))
+
+(deftest a-loop-over-a-sorted-view-of-a-records-map-descends
+  ;; (vals (:lots s)) of a typed record is finite, and so is what sort-by
+  ;; and filter make of it, bound by a let before the loop rebinds it
+  (binding [ck/*affine* false ck/*descend-all* true]
+    (is (ck/check-defn
+          '(defn plan [^{:writ/type {:lots (Map Nat {:id Nat :qty Nat :expires Nat}) :next-id Nat}} s
+                       ^Nat n]
+             (let [lots (sort-by :expires (filter #(pos? (:qty %)) (vals (:lots s))))]
+               (loop [lots lots need n out []]
+                 (cond
+                   (zero? need) out
+                   (empty? lots) nil
+                   :else (let [l (first lots) k (min need (:qty l))]
+                           (recur (rest lots) (- need k) (conj out [(:id l) k]))))))))))
+  (testing "an untyped one may be a lazy seq that never runs out"
+    (binding [ck/*affine* false ck/*descend-all* true]
+      (is (re-find #"must be a finite collection"
+                   (check-err '(defn walk-on [xs]
+                                 (let [ys (filter odd? xs)]
+                                   (loop [ys ys] (if (empty? ys) nil (recur (rest ys))))))))))))

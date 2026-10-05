@@ -29,6 +29,7 @@
             [writ.prove.check :as check]
             [writ.prove.smt :as smt]
             [writ.prove.symbolic :as sym]
+            [writ.solve.cdcl :as cdcl]
             [writ.prove.scheme :as sc :refer [split-foralls goal plain cases truthy? falsy?
                                                solve-eq assume-hyp subst-all instance ih-for
                                                useful-ih replace-term lemma-rules]]))
@@ -110,6 +111,9 @@
   strategies are tried in -- :order in general, :loop-order when a
   recursion of the code climbs on a law's integer."
   {:fuel 20000
+   ;; the time one law's search may take, over all its strategies: past it
+   ;; the rest are not tried, and the law is left to its tests
+   :law-ms 30000
    :depth 8
    :enum-limit 16
    :plausible-samples 30
@@ -205,6 +209,49 @@
     (when (and empty more)
       {:by :list-cases :on v :empty empty :cons more})))
 
+(defn- by-extensionality
+  "Prove normal goal n, two sequences =, by their counts and then their
+  elements at a fresh index below the count."
+  [opts g hyps depth ctx n]
+  (let [taken (into (set (keys (:types opts))) (mapcat t/vars (cons g hyps)))
+        i (first (remove taken (map #(symbol (str "i%" %)) (range))))]
+    (when-let [{:keys [count-goal nth-hyp nth-goal]} (sc/extensional ctx n i)]
+      (let [o (assoc-in opts [:types i] 'Nat)
+            c (prove-goal o count-goal hyps (dec depth))
+            e (when c (prove-goal o nth-goal (conj hyps nth-hyp) (dec depth)))]
+        (when (and c e) {:by :extensional :on i :count c :elements e})))))
+
+(defn- unrolls?
+  "Does normal term n hold a range a new fact may unroll?  Then it
+  normalises under the case's facts to something other than the parent's
+  form normalised again, and the checker reads the case from the start:
+  the case is read from the start here too."
+  [n]
+  (boolean (some #(and (= :call (head %)) (= 'range (second %))) (t/subterms n))))
+
+(declare prove-goal)
+
+(defn- by-cross-fertilizing
+  "Prove g with its induction hypotheses used right to left, once a case
+  has left a goal their rewriting does not reach: the goal's (evaluate a
+  env) is put back as (evaluate (simplify a) env), the hypothesis's left
+  side, and the case's splits then unfold it as they unfold the other
+  side.  Cross-fertilisation, as Boyer and Moore's waterfall has it."
+  [opts g hyps depth]
+  (when (and (not (:crossed opts))
+             ;; an equation among the hypotheses to put back, before the
+             ;; case is normalised again to find where
+             (some (fn [{:keys [lhs rhs vars hyp]}]
+                     (and (empty? vars) (nil? hyp) lhs (not= [:lit true] rhs) (not (symbol? rhs))))
+                   (:ih opts)))
+  (let [[_ vacuous n] (sc/case-context opts g hyps)
+        g* (when-not vacuous (sc/cross-fertilize opts n))]
+    (when (and g* (not= n g*))
+      ;; the hypotheses used up: the goal now reads their left sides,
+      ;; which they would rewrite back
+      (when-let [p (prove-goal (assoc opts :crossed true :ih []) g* hyps depth)]
+        {:by :cross :then p})))))
+
 (defn- prove-goal
   "Prove boolean term g under hyps.  In order: a data value's tag is split
   into its constructors; integer arithmetic through and through goes to
@@ -216,7 +263,7 @@
   builds on."
   ([opts g hyps depth] (prove-goal opts g hyps depth nil))
   ([opts g hyps depth parent]
-   (let [[ctx vacuous n :as here] (if parent
+   (let [[ctx vacuous n :as here] (if (and parent (not (unrolls? (nth parent 2))))
                                     (sc/case-context-after opts parent hyps)
                                     (sc/case-context opts g hyps))
          split (delay (split-candidate n ctx))
@@ -255,8 +302,11 @@
                  (when (and yes no) {:by :split :on c :then yes :else no}))
                (or (when-let [e (enum-candidate ctx n (:enum-limit opts (:enum-limit default-config)))]
                      (by-enumeration opts g hyps depth e))
+                   ;; two sequences equal, element by element
+                   (by-extensionality opts g hyps depth ctx n)
                    (when-let [v (elems-var opts n)] (by-list-cases opts g hyps depth v))
-                   (solved)))))))))
+                   (solved)
+                   (by-cross-fertilizing opts g hyps depth)))))))))
 
 (defn- prove-all
   "Prove every goal (under the hyps) in one context of opts."
@@ -488,6 +538,7 @@
          (when (or (by? :solver) (by? :symbolic)) ", with the solver")
          (when-let [vs (seq (ons :list-cases))]
            (str ", with cases on " (str/join " and " vs)))
+         (when (by? :extensional) ", element by element")
          (when-let [gs (seq (ons :generalizing))]
            (str ", generalising " (str/join " and " (map pr-str gs))))
          (when-let [as (seq (ons :accumulator))]
@@ -676,7 +727,7 @@
   Returns {:proved true :trace :summary :lemmas} or {:proved false :reason
   :stuck}, and :attempts, what each strategy tried did: {:name :outcome
   :fuel :ms}, the outcome :proved, :failed, :fuel or :rejected."
-  [{:keys [prop defs tenv target own fuel lemmas rets total hint lemma sigs contracts replay prover guards sym-budget refutes? counterexample-only] :as args}]
+  [{:keys [prop defs tenv target own fuel lemmas rets trusted-rets component-requires total hint lemma sigs contracts replay prover guards sym-budget refutes? counterexample-only] :as args}]
   (try
     (let [cfg (merge default-config prover)
           {:keys [bs0 bs g recs defs]} (law-setup args)
@@ -699,7 +750,14 @@
                 :sym-budget sym-budget
                 :unfolded unfolded :fuel (or fuel (:fuel cfg)) :lemmas-used lemmas-used :asked asked
                 :depth (:depth cfg) :enum-limit (:enum-limit cfg) :plausible-samples (:plausible-samples cfg)
-                :rets (or rets {}) :burned burned
+                :rets (or rets {}) :trusted-rets (or trusted-rets {}) :burned burned
+                ;; each component fn's :requires, as a term of its parameters
+                ;; one the prover cannot read stays, with no term: a call of
+                ;; that fn is then outside, never taken to meet it
+                :requires (into {} (for [[q {:keys [params body]}] component-requires
+                                         :let [t (try (tr/lower-term (tr/context own) params body)
+                                                      (catch clojure.lang.ExceptionInfo _ nil))]]
+                                     [q {:params params :term t}]))
                 :lemmas (into (vec (mapcat #(lemma-rules % defs tenv own)
                                            (if-let [use (:use hint)]
                                              (filter #(contains? (set use) (:name %)) lemmas)
@@ -708,6 +766,8 @@
           ;; an attempt that runs out of fuel fails on its own; the others
           ;; still get their turn
           ran-out (atom false)
+          ;; when this law's search began: its budget runs from here
+          law-start (delay (System/currentTimeMillis))
           ;; what each attempt did, and the goals the failed ones got stuck on
           attempts (atom [])
           stuck (atom [])
@@ -716,14 +776,20 @@
                     (let [t0 (System/currentTimeMillis)
                           b0 @burned
                           seen (atom [])
-                          [r outcome] (binding [*stuck* seen *case* []]
+                          why (atom [])
+                          [r outcome] (binding [*stuck* seen *case* [] sym/*why* why
+                                                rw/*deadline* (when-let [b (:law-ms cfg)] (+ @law-start b))
+                                                cdcl/*deadline* (when-let [b (:law-ms cfg)] (+ @law-start b))]
                                         (try (let [r (f)] [r (if r :proved :failed)])
                                              (catch clojure.lang.ExceptionInfo e
                                                (if (:writ.prove.rewrite/fuel (ex-data e))
                                                  (do (reset! ran-out true) [nil :fuel])
                                                  (throw e)))))]
-                      (swap! attempts conj {:name nm :outcome outcome :fuel (- @burned b0)
-                                            :ms (- (System/currentTimeMillis) t0)})
+                      (swap! attempts conj (cond-> {:name nm :outcome outcome :fuel (- @burned b0)
+                                                    :ms (- (System/currentTimeMillis) t0)}
+                                             ;; what symbolic evaluation could not read, or
+                                             ;; what the solver answered
+                                             (and (not r) (seq @why)) (assoc :why (vec (take 4 (distinct @why))))))
                       (when-not r (swap! stuck into (map #(assoc % :attempt nm)) @seen))
                       [r @unfolded]))
           symbolic [[:symbolic-cases #(by-symbolic-cases opts g)] [:symbolic #(by-symbolic opts g)]]
@@ -782,8 +848,11 @@
           ;; fails, the counterexample, confirmed by running the code there,
           ;; ends the search
           refuted (delay (boolean (and refutes? @cex (refutes? @cex))))
+          budget (:law-ms cfg)
+          out-of-time (atom false)
+          spent? #(and budget (> (- (System/currentTimeMillis) @law-start) budget) (reset! out-of-time true))
           first-proof (fn [ts] (loop [[t & more] ts]
-                                 (when t
+                                 (when (and t (not (spent?)))
                                    (let [r (attempt t)]
                                      (cond (first r) r
                                            @refuted nil
@@ -822,12 +891,16 @@
                                      :when r]
                                  [{:by :with :lemma (:trace gl) :proof (first r)} (second r)]))
                              [nil #{}]))
-          target-used (filter #(= (str target) (namespace %)) used)
+          ;; a contract of the target's fns was proved from its code too
+          target-used (concat (filter #(= (str target) (namespace %)) used)
+                              (when trace (filter contract? @lemmas-used)))
           ;; every proof is replayed by the checker before it is reported
           checked (when (and trace (or lemma (seq target-used)))
                     (or replayed (check/check-proof (dissoc opts :lemmas-used :unfolded) g trace)))]
       (-> (cond
-            (nil? trace) (cond-> {:proved false :reason (if @ran-out "the search ran out of fuel" "no proof found")
+            (nil? trace) (cond-> {:proved false :reason (cond @out-of-time "the search ran out of time"
+                                                              @ran-out "the search ran out of fuel"
+                                                              :else "no proof found")
                                   :stuck (stuck-report @stuck @attempts)
                                   ;; the terms themselves, for proposing lemmas; not cached
                                   :stuck-raw (vec (take 6 (stuck-ranked @stuck @attempts)))}

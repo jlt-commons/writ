@@ -179,8 +179,14 @@
     (aset ^objects @(:trail s) n l)
     (vreset! (:tsize s) (inc n))))
 
+(def ^:dynamic *deadline*
+  "When bound, the clock time (ms) a search must stop by: past it, the
+  budget is spent."
+  nil)
+
 (defn- budget! [s]
-  (when (> (+ @(:conflicts s) @(:decisions s)) (:budget s))
+  (when (or (> (+ @(:conflicts s) @(:decisions s)) (:budget s))
+            (and *deadline* (> (System/currentTimeMillis) *deadline*)))
     (throw (ex-info (str "the budget of " (:budget s) " decisions is exhausted")
                     {:writ.solve.search/budget true}))))
 

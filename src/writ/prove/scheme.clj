@@ -364,8 +364,15 @@
                                    ;; (= (+ a b) (total ...)) rewrites the call
                                    (if (< (calls a) (calls b)) [b a] [a b]))
                                  [(n gl) [:lit true]])]
-                   :when (not (or (symbol? l) (= :lin (head l))))]
-               {:name name :vars (set (vals ren)) :types types :hyp hyp :lhs l :rhs r}))))
+                   :when (not (or (symbol? l) (= :lin (head l))))
+                   rule (cons {:name name :vars (set (vals ren)) :types types :hyp hyp :lhs l :rhs r}
+                              ;; (not P) says P is false where P is a boolean: a test
+                              ;; on P meets P, not its negation
+                              (when (and (= [:lit true] r) (= :call (head l)) (= 'not (second l))
+                                         (= 3 (count l)) (not (symbol? (nth l 2))))
+                                [{:name name :vars (set (vals ren)) :types types :hyp hyp
+                                  :lhs (nth l 2) :rhs [:lit false] :bool-only true}]))]
+               rule))))
     (catch clojure.lang.ExceptionInfo _ nil)))
 
 
@@ -443,6 +450,20 @@
         [ctx vacuous] (if vacuous [ctx vacuous] (take-all ctx hyps))]
     (under-ih opts ctx vacuous (:ih pctx) n)))
 
+(defn extensional
+  "For a normal goal n that says two sequences are =, the goals that say
+  it element by element at index variable i: {:count-goal :nth-hyp
+  :nth-goal}.  Two values that are never nil and are sequences or vectors
+  are = when they have the same count and, at each i below it, = elements.
+  nil when n is not such an equality."
+  [ctx n i]
+  (when (and (= :call (t/head n)) (= '= (second n)) (= 4 (count n)))
+    (let [[_ _ a b] n]
+      (when (and (rw/seq-value? ctx a) (rw/seq-value? ctx b))
+        {:count-goal [:call '= [:call 'count a] [:call 'count b]]
+         :nth-hyp [:call '< i [:call 'count a]]
+         :nth-goal [:call '= [:call 'nth a i] [:call 'nth b i]]}))))
+
 (defn data-cases
   "One case per constructor of v's data type, as [[value types] ...]; nil
   when v is not of a data type.  A case split, not induction: no case
@@ -515,3 +536,17 @@
     (if (= 'integer? (second g))
       {:name nm :vars (set (vals ren)) :types types :hyp hyp :lhs (n g) :rhs [:lit true]}
       {:name nm :vars (set (vals ren)) :types types :hyp hyp :lhs (n (nth g 2)) :rhs (n (nth g 3))})))
+
+(defn cross-fertilize
+  "Goal g with each induction hypothesis of opts that is an equation, and
+  has no free variables, used right to left: its right side, wherever g
+  holds it, put back as its left.  (evaluate a env) becomes (evaluate
+  (simplify a) env), so both sides of the goal read (simplify a), and a
+  split on its tag unfolds both alike.  Cross-fertilisation, as Boyer and
+  Moore's waterfall has it: equals for equals."
+  [opts g]
+  (reduce (fn [g {:keys [lhs rhs vars hyp]}]
+            (if (and (empty? vars) (nil? hyp) lhs (not= [:lit true] rhs) (not (symbol? rhs)))
+              (replace-term g rhs lhs)
+              g))
+          g (:ih opts)))
