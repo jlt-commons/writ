@@ -266,10 +266,17 @@ failures: a law over every input may already answer one.
   target's code mentions (with each integer's neighbours), and an `Any` is
   sometimes a vector tagged with one of its keywords, so a branch on
   `(= :normal reason)` or `(case (first ret) :reply ...)` is reached.
+  A record's `Keyword` field, inside a refinement too, is drawn mostly
+  from the keywords the code and the spec test or set that field to,
+  `(= :ready (:status j))`, `(assoc j :status :dead)`: a `:status
+  Keyword` is often `:ready`, so a law about ready jobs is met without
+  building them.
 - A law is built from:
   - `(= a b)`
   - `(and P ...)`
-  - `(=> P Q)`; a case where `P` does not hold is skipped. When no
+  - `(=> P Q)`; a case where `P` does not hold is skipped. Inside an
+    expression, `(every? (fn [k] (=> P Q)) ks)`, it is a value: true
+    where `P` does not hold. When no
     generated input meets `P`, the solver looks for inputs that do: the
     law is refuted there, or its proof stands on them
   - `(forall [x T, y U] P)`

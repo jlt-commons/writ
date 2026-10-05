@@ -812,7 +812,8 @@
 
 (defn desugar
   "Multi-binder quantifiers, (forall [x A, y B] P), into nested ones, the
-  single-binder shape writ.law reads."
+  single-binder shape writ.law reads; an implication inside an expression
+  into the if it means there."
   [p]
   (cond
     (quant? p)
@@ -832,7 +833,12 @@
     (let [[_ bs inner] p
           [_ h c] (desugar inner)]
       (list '=> (list 'let bs h) (list 'let bs c)))
-    :else p))
+    ;; an implication inside an expression, (every? (fn [k] (=> P Q)) ks),
+    ;; is no hypothesis of the law: there it is a value, true where P is not
+    :else (walk/prewalk (fn [f] (if (and (head? f "=>") (= 3 (count f)))
+                                  (list 'if (nth f 1) (nth f 2) true)
+                                  f))
+                        p)))
 
 ;; --- an integer between bounds ----------------------------------------------------
 
@@ -1286,7 +1292,14 @@
   [t tenv]
   (let [t (plain t)]
     (cond
-      (refinement t tenv) (:gen (refinement t tenv))
+      (refinement t tenv)
+      (let [r (refinement t tenv)]
+        ;; the keywords only: a number inside a refined value is set to
+        ;; the code's own at its boundaries, and a filter fed the code's
+        ;; small numbers would pass on all-zero values rather than starve
+        (if-let [seeds (and (:gen-for r) (not-empty (into {} (filter (comp seq val)) (select-keys (::seeds tenv) ['Keyword ::fields]))))]
+          ((:gen-for r) seeds)
+          (:gen r)))
 
       (and (symbol? t) (seq (get-in tenv [::bias t])))
       (gen/frequency [[1 (type->gen t (update tenv ::bias dissoc t))]
@@ -1339,7 +1352,11 @@
                           (gen/frequency [[1 (gen/return ::absent)]
                                           [1 (gen/return nil)]
                                           [3 (type->gen (second kt) tenv)]])
-                          (type->gen kt tenv))))]
+                          (let [g (type->gen kt tenv)
+                                fs (get-in tenv [::seeds ::fields k])]
+                            (if (and (seq fs) (= 'Keyword (plain kt)))
+                              (gen/frequency [[1 g] [3 (gen/elements (vec (sort fs)))]])
+                              g)))))]
         (gen/fmap (fn [vs] (into {} (remove #(= ::absent (second %))) (map vector ks vs)))
                   (apply gen/tuple (map key-gen ks))))
 
@@ -3758,6 +3775,36 @@
 
 (declare lib-pairs)
 
+(defn- field-literals
+  "Per map key, the keywords forms set or test that key's value against:
+  (= :ready (:status j)), (case (:status j) :done ...), (assoc j :status
+  :dead), {:status :ready}.  A record's Keyword field is drawn mostly from
+  these, so a job is now and then :ready rather than one of every keyword
+  the code names."
+  [forms]
+  (let [kw? #(and (keyword? %) (nil? (namespace %)))
+        field (fn [x] (cond (and (seq? x) (kw? (first x)) (= 2 (count x))) (first x)
+                            (and (seq? x) (= 'get (first x)) (= 3 (count x)) (kw? (nth x 2))) (nth x 2)))
+        pairs (fn [f]
+                (cond
+                  (map? f) (for [[k v] f :when (and (kw? k) (kw? v))] [k v])
+                  (not (seq? f)) nil
+                  (contains? '#{= not= identical?} (first f))
+                  (let [xs (rest f)]
+                    (for [a xs b xs :let [k (field a)] :when (and k (kw? b))] [k b]))
+                  (and (= 'case (first f)) (field (second f)))
+                  (let [k (field (second f))]
+                    (for [c (take-nth 2 (drop 2 f)) v (if (seq? c) c [c]) :when (kw? v)] [k v]))
+                  (and (contains? '#{contains? get} (first f)) (set? (second f)) (field (nth f 2 nil)))
+                  (for [v (second f) :when (kw? v)] [(field (nth f 2)) v])
+                  (and (set? (first f)) (field (second f)))
+                  (for [v (first f) :when (kw? v)] [(field (second f)) v])
+                  (= 'assoc (first f))
+                  (for [[k v] (partition 2 (drop 2 f)) :when (and (kw? k) (kw? v))] [k v])))]
+    (reduce (fn [m [k v]] (update m k (fnil conj #{}) v))
+            {}
+            (mapcat pairs (tree-seq coll? seq forms)))))
+
 (defn- code-seeds
   "Per scalar type, the values a target's code mentions -- its own and that
   of the project namespaces it requires, where the prover reads it too: its
@@ -3775,7 +3822,8 @@
       {'Keyword kws
        'Int near
        'Nat (set (filter #(>= % 0) near))
-       'Any (into kws near)})
+       'Any (into kws near)
+       ::fields (field-literals forms)})
     (catch Throwable _ {})))
 
 (def ^:private filter-size
@@ -4004,6 +4052,22 @@
                             (gen/fmap (fn [[p n]] (let [v2 (if (seq p) (assoc-in v p n) n)] (if (ok? v2) v2 v)))
                                       (gen/tuple (gen/elements paths) (gen/elements nums)))))))]])))
 
+(defn- holds-keywords?
+  "Whether a Keyword or an Any sits anywhere inside type t, through the
+  refinements it names: the values a law's keyword seeds can change."
+  [t tenv]
+  (letfn [(walk [t seen]
+            (let [t (plain t)
+                  r (refinement t tenv)]
+              (cond
+                (contains? seen t) false
+                r (walk (:base r) (conj seen t))
+                (contains? '#{Keyword Any} t) true
+                (map? t) (some #(walk % (conj seen t)) (concat (keys t) (vals t)))
+                (coll? t) (some #(walk % (conj seen t)) t)
+                :else false)))]
+    (boolean (walk t #{}))))
+
 (defn- remembering-starved
   "Generator g, which once it starves -- its filter finds no value -- fails
   every draw after with the same error at once, rather than looking as
@@ -4043,27 +4107,38 @@
                     tenv (assoc-in tenv [::refines name] (cond-> (assoc r :pred pred :pred-form (:pred r)
                                                                         :spec-ns spec-ns)
                                                            window (assoc :window (finite-window window))))
-                    bias (bias-of (literals (:pred r) spec-ns @bodies))]
-                (assoc-in tenv [::refines name :gen]
-                          (remembering-starved
-                          (at-boundaries
-                          (if-let [b (:build r)]
-                            ;; built by the spec's own fn, then checked
-                            ;; the spec's own fn, or one of a spec it builds on, by alias
-                            (let [build (some-> (ns-resolve (the-ns spec-ns) b) deref)]
-                              (when-not (fn? build)
-                                (fail! "refinement `" name "` is built by `" b "`, which is not a fn of the spec"))
-                              (filtered #(try (boolean (pred %)) (catch Throwable _ false))
-                                             (gen/fmap build (type->gen (:base r) tenv))
-                                             {:max-tries 100
-                                              :ex-fn (fn [_] (ex-info (str "the :build of refinement `" name "`, `" b
-                                                                           "`, makes values its predicate rejects")
-                                                                      {:writ/error true}))}))
-                            (refine-gen (cond-> r window (assoc ::window window))
-                                        pred (assoc tenv ::bias-of-refine bias ::spec-ints @spec-ints)))
-                          @boundary-nums
-                          #(try (and (conforms? (:base r) % tenv) (boolean (pred %)))
-                                (catch Throwable _ false)))))))
+                    bias (bias-of (literals (:pred r) spec-ns @bodies))
+                    ;; a law's draws favour the literals of the code it
+                    ;; runs, inside a refined value too: a job's :status
+                    ;; is now and then the :ready the code tests for
+                    gen-for (fn [seeds]
+                              (let [tenv (cond-> tenv (seq seeds) (assoc ::seeds seeds))
+                                    ok? #(try (and (conforms? (:base r) % tenv) (boolean (pred %)))
+                                              (catch Throwable _ false))
+                                    g (if-let [b (:build r)]
+                                        ;; built by the spec's own fn, then checked
+                                        ;; the spec's own fn, or one of a spec it builds on, by alias
+                                        (let [build (some-> (ns-resolve (the-ns spec-ns) b) deref)]
+                                          (when-not (fn? build)
+                                            (fail! "refinement `" name "` is built by `" b "`, which is not a fn of the spec"))
+                                          (filtered #(try (boolean (pred %)) (catch Throwable _ false))
+                                                    (gen/fmap build (type->gen (:base r) tenv))
+                                                    {:max-tries 100
+                                                     :ex-fn (fn [_] (ex-info (str "the :build of refinement `" name "`, `" b
+                                                                                  "`, makes values its predicate rejects")
+                                                                             {:writ/error true}))}))
+                                        (refine-gen (cond-> r window (assoc ::window window))
+                                                    pred (assoc tenv ::bias-of-refine bias ::spec-ints @spec-ints)))]
+                                (remembering-starved (at-boundaries g @boundary-nums ok?))))]
+                (let [g (gen-for nil)]
+                  (update-in tenv [::refines name] assoc
+                             :gen g
+                             ;; one generator where seeds change nothing:
+                             ;; its count of refused candidates, which
+                             ;; tells a starved refinement, is kept whole
+                             :gen-for (if (holds-keywords? (:base r) tenv)
+                                        (memoize gen-for)
+                                        (constantly g))))))
             ;; the spec's one-line fns, which a refinement built to fit
             ;; reads its predicate through
             ;; the types of the specs it builds on, under its own
@@ -6425,7 +6500,13 @@
                                                                       (plain (:ret s)))
                                                        k)))
                                anns)
-             ctx {:ev (evaluator spec-ns) :tenv (assoc tenv ::seeds (code-seeds target))
+             ;; the keys the spec's own helpers test, which a law about an
+             ;; unwritten target, or one that names a case, is about too
+             seeds (update (code-seeds target) ::fields
+                           #(merge-with into (field-literals (try (book/read-forms (source-url spec-ns))
+                                                                  (catch Throwable _ nil)))
+                                        %))
+             ctx {:ev (evaluator spec-ns) :tenv (assoc tenv ::seeds seeds)
                   ;; the values drawn with a fixed seed, made once a check
                   :draws (atom {})}
              ;; the spec's own one-expression fns, which an exists over

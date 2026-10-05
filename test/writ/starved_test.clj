@@ -193,7 +193,7 @@
   (let [r (spec/check 'writ.spec-demo.shelf-q-spec {:seed 1 :target 'writ.spec-demo.shelf-q-uncounted})]
     (is (not (:ok r)))
     (is (has? r "it breaks (= (:loans m) (lent-to l (:id m)))") (:message r))
-    (is (has? r "at (:members l) key 0, m = {:id 0, :loans 0}") (:message r))))
+    (is (re-find #"at \(:members l\) key (\d+), m = \{:id \1, :loans 0\}" (:message r)) (:message r))))
 
 (deftest the-step-that-broke-a-value-is-reported-first-and-once
   (let [r (spec/check 'writ.spec-demo.shelf-q-spec {:seed 1 :target 'writ.spec-demo.shelf-q-uncounted})

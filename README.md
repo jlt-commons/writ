@@ -519,7 +519,9 @@ A proposition is built from:
 
 - `(= a b)`
 - `(and P ...)`
-- `(=> P Q)`, where cases in which `P` does not hold are skipped
+- `(=> P Q)`, where cases in which `P` does not hold are skipped; inside an
+  expression, `(every? (fn [k] (=> P Q)) ks)`, it is a value, true where `P`
+  does not hold
 - `(forall [x T, y U] P)`
 - `(exists [x T] P)`
 - `(throws? e)`, true when evaluating `e` throws (lazy seqs in what it
