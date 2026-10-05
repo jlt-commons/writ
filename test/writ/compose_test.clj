@@ -100,3 +100,8 @@
   (let [r (spec/check 'writ.spec-demo.fee-spec {:seed 1})]
     (is (some #(re-find #"`floor-fee`: \(>= 10 \(quot n 100\)\) was never false" %) (:one-way-tests r))
         (pr-str (:one-way-tests r)))))
+
+(deftest a-workflow-lands-in-its-components-refinement
+  (let [r (spec/check 'writ.spec-demo.hits-user-spec {:seed 3})]
+    (is (:ok r) (:message r))
+    (is (= :proved (:status (law-result r 'twice:hits:add-twice))) (:message r))))

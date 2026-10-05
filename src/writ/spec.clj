@@ -2947,7 +2947,11 @@
                    ;; each target's predicate, of the call itself: the law
                    ;; reads as the spec would write it, (ascending? (isort xs)),
                    ;; the shape the prover takes apart
-                   in (fn [t] (if-let [r (ref-of t)] (subst-var (:pred r) (:var r) call) true))
+                   in (fn [t] (if-let [r (ref-of t)]
+                                (if-let [d (:spec-ns r)]
+                                  (list (symbol (str d) (str (:pred-name r))) call)
+                                  (subst-var (:pred r) (:var r) call))
+                                true))
                    ;; a landing in t holds t's invariants: (and (Hot? ..) (even? ..))
                    in-held (fn [t]
                              (let [ps (for [[b pred] (invariants-of invs gname t)] (subst-var pred b call))]
@@ -3707,7 +3711,7 @@
       (let [r (get refs t)
             g (guard (:base r) x refs spec-ns)
             ;; a refinement that only names its base guards nothing of its own
-            p (when-not (true? (:pred r)) (list (symbol (str spec-ns) (str (:pred-name r))) x))]
+            p (when-not (true? (:pred r)) (list (symbol (str (or (:spec-ns r) spec-ns)) (str (:pred-name r))) x))]
         (cond (and g p) (list 'and g p) g g :else p))
       (and (seq? t) (= 'Tuple (first t)))
       (let [gs (vec (keep-indexed (fn [i ct] (guard ct (list 'nth x i) refs spec-ns)) (rest t)))]
@@ -4291,9 +4295,11 @@
   (let [deps (keep #(do (require %) (when-let [de (get @registry %)] [% de])) (:uses e))
         own (set (map :name (:refines e)))]
     (cond-> e
-      (seq deps) (assoc ::uses-refines (vec (for [[_ de] deps, r (:refines de)
+      (seq deps) (assoc ::uses-refines (vec (for [[d de] deps, r (:refines de)
                                                  :when (not (contains? own (:name r)))]
-                                             r))
+                                             ;; read in its own spec: its predicate
+                                             ;; may name that spec's helpers
+                                             (assoc r :spec-ns d)))
                         ::uses-tenv (reduce (fn [acc [d de]]
                                               (merge-with #(if (map? %1) (merge %1 %2) %2)
                                                           acc (type-env-of de d)))
@@ -4642,15 +4648,21 @@
                          "\n  the prover: " (or why "no proof found")
                          "\n  A lemma must be proved before a law may cite it: give it a hint,"
                          "\n  or a lemma of its own.")))
-       (apply str (for [{l :law why :unproved st :status need :require stuck :stuck} laws :when (= :unproved st)]
+       (apply str (for [{l :law why :unproved st :status need :require stuck :stuck g :graph} laws :when (= :unproved st)
+                        ;; a graph's law is let off proof in the graph, by its state and step
+                        :let [[_ state step] (when g (str/split (str l) #":"))
+                              step (some-> step (str/replace #"[.#].*$" ""))]]
                     (str "\n\nlaw `" l "` is tested, not proved, and the "
                          (if need "law" "spec") " requires proof"
                          "\n  the prover: " (or why "no proof found")
                          (format-stuck stuck)
                          "\n  Prove it: state it in terms the prover models, or state the lemma"
                          "\n  it needs as a law of its own.  If it cannot be proved yet, say why"
-                         "\n  on the law, and every report will show it:"
-                         "\n  (law " l " {:require :tested :because \"...\"} ...)")))
+                         (if (and g state step)
+                           (str " in the graph, and every report will show it:"
+                                "\n  (graph " g " {... :tested {[:" state " " step "] \"...\"}})")
+                           (str "\n  on the law, and every report will show it:"
+                                "\n  (law " l " {:require :tested :because \"...\"} ...)")))))
        (apply str (for [{sg :suggestion :as x} (concat lemmas laws) :when sg]
                     (str "\n\n" (if (:lemma x) (str "lemma `" (:lemma x)) (str "law `" (:law x))) "` "
                          (cond
@@ -5001,7 +5013,7 @@
              ", which uses it back: specs may not use each other in a cycle"))
     (reduce (fn [acc dep]
               (let [r (binding [*using* (conj *using* spec-ns)]
-                        (check dep (-> (select-keys opts [:cache :cache-dir :seed :fuel])
+                        (check dep (-> (select-keys opts [:cache :cache-dir :seed :fuel :require])
                                        ;; what this spec's laws reach in the
                                        ;; component is noted by this check
                                        (assoc :adequacy false :coverage false))))
@@ -5037,7 +5049,16 @@
           libs+refers (delay
                         (let [libs (lib-pairs target (set (keys (:sigs assumed))))
                               spec-forms (book/read-forms (source-url spec-ns))
-                              {:keys [aliases] :as names} (ns-names (first (filter #(head? % "ns") spec-forms)))]
+                              {:keys [aliases] :as names} (ns-names (first (filter #(head? % "ns") spec-forms)))
+                              ;; a spec built on: its refinements and helpers, its
+                              ;; target's fns named as the assumptions here name them
+                              used (vec (for [d (::uses opts)
+                                              :let [fs (try (book/read-forms (source-url d)) (catch Throwable _ nil))]
+                                              :when fs]
+                                          [d (mapv refine->defn fs)
+                                           (assumed-names (ns-names (first (filter #(head? % "ns") fs)))
+                                                          (set (keys (:sigs assumed))))]))
+                              libs (into libs used)]
                           [libs spec-forms
                            (merge
                              (into {} (for [[a lib] aliases
@@ -6471,6 +6492,7 @@
              imports (imports-of spec-ns e opts)
              results (-> (timed :prover #(prove-laws results (assoc opts ::hints (:hints proof-e) ::proof-ns (:ns proof-e)
                                                    ::components (::components e)
+                                                   ::uses (:uses e)
                                                    ::imports (:lemmas imports)
                                                    ;; what held is given to the prover
                                                    ::assumed {:sigs (into {} (for [{f :fn sig :sig st :status} assumed
