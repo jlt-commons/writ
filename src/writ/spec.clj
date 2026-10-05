@@ -4648,9 +4648,14 @@
                      (- (:proved proof) (:general proof)) " on particular values)"))
               (when (= :proved (:require proof)) " (the spec requires proof)")
               (when-let [ts (seq (filter #(= :test (:evidence %)) laws))]
-                (str "; tested, not proved: " (str/join ", " (map :law ts))
+                (str (if (= :proved (:require proof))
+                       (str "; tested, not proved: " (str/join ", " (map :law ts)))
+                       ;; proof not asked: tested is what the spec wants
+                       (str "; tested (the spec asks for no proof): " (str/join ", " (map :law ts))))
                      (when-let [n (some->> (seq (keep #(or (:held %) (some-> (:trials %) (- (or (:discarded %) 0)))) ts)) (apply min))]
                        (str " (each on at least " n " inputs that met its hypothesis)"))))))
+       ;; what the spec's own laws leave untried: for whoever owns the spec
+       (let [notes (str
        ;; a law that, on its own, tells no wrong answer from the right one
        (apply str (for [{:keys [law fns]} silent]
                     (str "\n  law `" law "` tells none of " (str/join ", " (map #(str "`" % "`'s") fns))
@@ -4668,7 +4673,10 @@
                         :when (and (= :test evidence) held trials (< held thin-tests))]
                     (str "\n  law `" law "` is thinly tested: its hypothesis held in " held " of "
                          trials " trials. Build inputs that meet it: a refinement, or values"
-                         " picked from the ones the law is about")))
+                         " picked from the ones the law is about"))))]
+         (when (seq notes)
+           (str "\n  notes on the spec's laws, for whoever owns the spec (not failures of the code):"
+                notes)))
        (apply str (for [{:keys [id text blocking]} questions :when (not blocking)]
                     (str "\n  open question `" id "`: " text)))
        ;; what every proof here rests on

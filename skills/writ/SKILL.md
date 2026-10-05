@@ -356,8 +356,11 @@ prove the component once, then use it as a trusted piece.
 
 ## Assumptions
 
-When the code calls something writ does not check (`clojure.string`, a
-library, another namespace), say what the spec takes as given:
+The code may call what writ does not check (`clojure.string`, a
+library, another namespace) without any of this: such a call runs in the
+laws' tests as it is, and its result is taken as Any. To have its types
+checked, or to let the prover reason about it, say what the spec takes
+as given:
 
 ```clojure
 (assume str/trim [String -> String])                 ; a signature, via the spec's alias
