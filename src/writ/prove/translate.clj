@@ -228,6 +228,22 @@
                (core-call? (:test (:else th)) 'seq x))
       x)))
 
+(defn- arg-term
+  "An argument of a call.  A fn literal the prover cannot read -- it
+  conjes onto an accumulator not known to be a vector -- is an unknown fn
+  of the locals it closes over, so the call is still read: (reduce f init
+  []) is init whatever f is, and a law proved for any such fn holds for
+  this one.  The same literal at the same locals is the same fn."
+  [ctx env a]
+  (if (= :fn (:op a))
+    (try (term-of ctx env a)
+         (catch clojure.lang.ExceptionInfo ex
+           (if (outside-reason ex)
+             (let [captured (sort-by str (filter #(contains? env %) (distinct (tree-seq coll? seq (:form a)))))]
+               (into [:ap (fresh ctx "u")] (map #(get env %) captured)))
+             (throw ex))))
+    (term-of ctx env a)))
+
 (defn term-of
   "The term for a lowered AST node.  env maps local names to terms."
   [ctx env ast]
@@ -317,7 +333,7 @@
                 (let [x (term-of ctx env (second (:args ast)))]
                   (reduce (fn [else m] [:if [:call '= x (t/lit m)] [:lit true] else])
                           [:lit false] (reverse (t/sort-printed members))))
-                (invoke-term ctx env f (mapv #(term-of ctx env %) (:args ast)))))
+                (invoke-term ctx env f (mapv #(arg-term ctx env %) (:args ast)))))
 
     ;; a vector literal says it is a vector, for vector?; the rest of the
     ;; prover reads it as any sequence

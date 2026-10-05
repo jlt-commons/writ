@@ -30,3 +30,17 @@
         l (law-result r 'a-due-job-named-is-taken)]
     (is (= :tested (:status l)) (:message r))
     (is (<= 20 (- (:trials l) (:discarded l))) (pr-str l))))
+
+(deftest a-comparison-under-a-let-is-taken-with-it
+  ;; run with the law's variables alone, `start` would be unbound
+  (let [{:keys [atoms]} (#'spec/law-atom-parts
+                          '(=> (some? (f x)) (let [[room start] (f x)] (or (<= x start) (= room 0))))
+                          '[x])]
+    (is (some #{'(let [[room start] (f x)] (<= x start))} atoms) (pr-str atoms))
+    (is (not-any? #{'(<= x start)} atoms) (pr-str atoms))))
+
+(deftest a-contains-test-guards-the-read-it-makes-safe
+  (let [r (spec/check 'writ.spec-demo.gate-spec {:seed 7 :adequacy false})]
+    ;; and a for's own tests, (chunked-seq? ...), are no test of the code
+    (is (not-any? #(re-find #"__\d+" %) (:one-way-tests r)) (pr-str (:one-way-tests r)))
+    (is (not-any? #(re-find #"`holder`" %) (:one-way-tests r)) (pr-str (:one-way-tests r)))))

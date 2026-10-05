@@ -111,3 +111,8 @@
     (is (some #(str/includes? % "(and (<= 18 age) member?) was never true") (:one-way-tests r))
         (pr-str (:one-way-tests r)))
     (is (not (str/includes? (:message r) "-combo")) (:message r))))
+
+(deftest a-fold-over-nothing-is-proved-whatever-its-step
+  (let [r (spec/check 'writ.spec-demo.fold-spec {:seed 7 :adequacy false})]
+    (is (:ok r) (:message r))
+    (is (= :proved (:status (law-result r 'nothing-runs-nothing))) (:message r))))

@@ -1670,25 +1670,41 @@
   (let [vars (set vars)
         mentions? (fn [f] (some vars (tree-seq coll? seq f)))
         cmp? (fn [f] (and (seq? f) (contains? '#{< <= > >=} (first f))))
-        walk (fn walk [f]
+        let? (fn [f] (and (seq? f) (contains? '#{let clojure.core/let} (first f)) (vector? (second f))))
+        ;; a comparison that reads a name a let around it binds is taken
+        ;; with that let, so a test runs it where the name has its value
+        names (fn [lhs] (set (filter #(and (symbol? %) (not= '& %)) (tree-seq coll? seq lhs))))
+        under (fn [lets f]
+                (reduce (fn [f bv]
+                          (if (some (names (take-nth 2 bv)) (tree-seq coll? seq f))
+                            (list 'let bv f)
+                            f))
+                        f (reverse lets)))
+        walk (fn walk [f lets]
                (cond
                  (and (seq? f) (contains? '#{fn fn* letfn} (first f))) []
-                 (seq? f) (concat (when (cmp? f) [f]) (mapcat walk (rest f)))
-                 (coll? f) (mapcat walk f)
+                 (let? f) (let [bv (second f)]
+                            (concat (mapcat #(walk % lets) (take-nth 2 (rest bv)))
+                                    (mapcat #(walk % (conj lets bv)) (drop 2 f))))
+                 (seq? f) (concat (when (cmp? f) [(under lets f)]) (mapcat #(walk % lets) (rest f)))
+                 (coll? f) (mapcat #(walk % lets) f)
                  :else []))
-        asserted (fn asserted [f]
-                   (cond (head? f "and") (mapcat asserted (rest f))
-                         (cmp? f) (mapcat walk (rest f))
+        asserted (fn asserted [f lets]
+                   (cond (head? f "and") (mapcat #(asserted % lets) (rest f))
+                         (let? f) (let [bv (second f)]
+                                    (concat (mapcat #(walk % lets) (take-nth 2 (rest bv)))
+                                            (mapcat #(asserted % (conj lets bv)) (drop 2 f))))
+                         (cmp? f) (mapcat #(walk % lets) (rest f))
                          ;; each way an `or` can hold is a case of the law: one
                          ;; never true is a case no test reached, such as a tie
-                         (head? f "or") (concat (rest f) (mapcat walk (rest f)))
-                         :else (walk f)))
+                         (head? f "or") (concat (map #(under lets %) (rest f)) (mapcat #(walk % lets) (rest f)))
+                         :else (walk f lets)))
         flat (fn flat [f] (if (and (seq? f) (contains? '#{and or not} (first f))) (mapcat flat (rest f)) [f]))
         [hyps concl] (loop [p body, hs []]
                        (if (head? p "=>") (recur (nth p 2) (conj hs (nth p 1))) [hs p]))]
     (let [keep* #(filter (fn [f] (and (seq? f) (mentions? f))) %)
-          hs (keep* (concat (mapcat flat hyps) (mapcat walk hyps)))
-          all (vec (take 8 (distinct (concat hs (keep* (asserted concl))))))]
+          hs (keep* (concat (mapcat flat hyps) (mapcat #(walk % []) hyps)))
+          all (vec (take 8 (distinct (concat hs (keep* (asserted concl []))))))]
       {:atoms all :hyp-atoms (set hs)})))
 
 (defn- law-atoms [body vars] (:atoms (law-atom-parts body vars)))
@@ -1740,9 +1756,11 @@
                      (let [own (keyword (clojure.core/name nm))
                            ok (when kind (filterv #(fits? kind (second %)) inside))
                            named (filterv #(= own (first %)) ok)
-                           pool (if (seq named) named ok)]
+                           ;; its own key first, but not only: a start is
+                           ;; also tried at another booking's end
+                           pool (if (and (seq named) (even? i)) named ok)]
                        (if (and kind use? (seq pool))
-                         (second (nth pool (mod i (count pool))))
+                         (second (nth pool (mod (quot i 2) (count pool))))
                          x)))
                    (map vector vs (map first bs)) kinds choices)))
          (gen/tuple (apply gen/tuple gens)
@@ -6400,7 +6418,12 @@
                    (apply list op bs' (map #(walk % denv') body)))
                  (and (seq? f) (= 'if (first f)) (<= 3 (count f) 4))
                  (let [[_ t a b] f]
-                   (if (constant? t)
+                   (if (or (constant? t)
+                           ;; a test a macro wrote, (chunked-seq? (seq s__25))
+                           ;; in a for or (seq? G__31) in a destructuring:
+                           ;; the code says nothing there
+                           (some #(and (symbol? %) (re-find #"__\d+(__auto__)?$" (name %)))
+                                 (tree-seq coll? seq (shown t denv))))
                      (apply list 'if t (map #(walk % denv) (drop 2 f)))
                      (let [id (swap! ids inc)]
                        (swap! tests assoc id (shown t denv))
@@ -6460,8 +6483,16 @@
                                            (and (seq? part) (= 'not (first part)) (seq? (second part))
                                                 (= 'nil? (first (second part)))) (second (second part))
                                            :else nil)]
-                               (and (symbol? x)
-                                    (some #(some #{x} (tree-seq coll? seq %)) (drop (inc i) parts))))]
+                               (or (and (symbol? x)
+                                        (some #(some #{x} (tree-seq coll? seq %)) (drop (inc i) parts)))
+                                   ;; (contains? m k) guards a later read of k in m:
+                                   ;; where k is absent the read is nil, and says
+                                   ;; nothing of its own
+                                   (and (seq? part) (= 'contains? (first part)) (= 3 (count part))
+                                        (some (fn [later]
+                                                (let [xs (set (tree-seq coll? seq later))]
+                                                  (and (contains? xs (nth part 1)) (contains? xs (nth part 2)))))
+                                              (drop (inc i) parts)))))]
                :when (and (seq clean) (not alone) (not guarded))]
            (str "`" fname "`: in " (pr-str (cons (symbol (name op)) parts)) ", " (pr-str part) " was never "
                 deciding " while the others were " others

@@ -347,6 +347,12 @@ prove the component once, then use it as a trusted piece.
 - Imported laws are not laws of this spec and judge no stand-in: the
   workflow's spec must still say what it means. Specs may not use each
   other in a cycle.
+- A helper of this spec states what the component means in its own
+  words (a `clashes?` of its own, say); it does not call the
+  component's fns. The component's code may not exist yet when the spec
+  is first checked, and a model that calls it would judge the workflow
+  by the very code it builds on. Laws, and the target, call the
+  component; `(calls f {:through [comp.core/g]})` says the target must.
 
 ## Assumptions
 
