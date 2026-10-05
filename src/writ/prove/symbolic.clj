@@ -2124,7 +2124,26 @@
 
 (defn- opaque-in? [g] (boolean (some #{:opaque} (tree-seq coll? seq g))))
 
-(declare app-body)
+(declare app-body ev)
+
+(defn- component-call
+  "A call of a fn taken at its spec, a component's: some value of its
+  return type, the same for the same arguments; it throws only where the
+  arguments break its :requires, which is noted as a throw there."
+  [st f vs]
+  (when-let [{:keys [params term]} (get-in @st [:requires f])]
+    (when-not (and term (= (count params) (count vs)))
+      (give-up! (str "the :requires of `" f "`, which the prover cannot read")))
+    (record-throw! st [:not (truth (ev st (zipmap params vs) term))]))
+  (let [ret (get-in @st [:trusted-rets f])
+        ts (map flat vs)
+        base (if (every? some? ts)
+               {:id [:call f] :args (vec (apply concat ts))}
+               (or (get-in @st [:call-bases [f vs]])
+                   (let [b {:id [:call f (:n (swap! st update :n inc))] :args []}]
+                     (swap! st assoc-in [:call-bases [f vs]] b)
+                     b)))]
+    (template st base [:ret] ret (:args base))))
 
 (defn- uninterpreted-call
   "The value of a call of recursive f the evaluation will not unfold: some
@@ -2157,6 +2176,9 @@
   walked down to its end); past that, the call's value is uninterpreted."
   [st f vs]
   (let [d (get-in @st [:defs-of f])]
+    (if (and (or (nil? d) (:outside d)) (get-in @st [:trusted-rets f]))
+      (component-call st f vs)
+    (do
     (when (or (nil? d) (:outside d))
       (give-up! (str "the call of `" f "`")))
     (if-let [why (when (:recursive? d)
@@ -2172,7 +2194,7 @@
                        :else (do (swap! st assoc :unfolds (inc unfolds)) nil))))]
       (do (swap! st update :used (fnil conj #{}) f)
           (uninterpreted-call st f vs why))
-      (app-body st f vs d))))
+      (app-body st f vs d))))))
 
 (defn- app-body
   [st f vs d]
@@ -2339,7 +2361,12 @@
               :else (merge-values st c
                                   (on-path st c #(pruned st (fn [] (ev st env (nth x 2)))))
                                   (on-path st [:not c] #(pruned st (fn [] (ev st env (nth x 3))))))))
-      :call (folded (core st (second x) (mapv #(ev st env %) (drop 2 x))))
+      :call (if (= 'writ.prove.term/strict (second x))
+              ;; a binding runs before the body; where nothing may throw, its
+              ;; throws count whether or not the body reads it
+              (do (when (:total @st) (ev st env (nth x 2)))
+                  (ev st env (nth x 3)))
+              (folded (core st (second x) (mapv #(ev st env %) (drop 2 x)))))
       :app (let [[_ f & args] x] (app st f (mapv #(ev st env %) args)))
       :fn (let [[_ ps body] x]
             {:fn (fn [vs] (ev st (merge env (zipmap ps vs)) body))
@@ -2362,11 +2389,12 @@
   "{:formula :decls} saying that under hyps, goal g is truthy, for every
   value of the typed variables -- and, when opts has :total, that its
   evaluation never throws; nil when some part is outside."
-  [{:keys [types defs tenv total lenient rets]} hyps g]
+  [{:keys [types defs tenv total lenient rets trusted-rets requires]} hyps g]
   (try
     (let [st (state)
           facts (atom [])
-          _ (swap! st assoc :defs-of defs :tenv tenv :total total :rets (or rets {}))
+          _ (swap! st assoc :defs-of defs :tenv tenv :total total :rets (or rets {})
+                   :trusted-rets (or trusted-rets {}) :requires (or requires {}))
           occurs (reduce into (t/vars g) (map t/vars hyps))
           env (into {} (for [v (sort-by str (keys types)) :when (contains? occurs v)]
                          [v (var-value st facts (get types v) tenv v)]))

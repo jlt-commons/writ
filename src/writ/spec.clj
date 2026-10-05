@@ -3700,8 +3700,9 @@
       (and (symbol? t) (contains? refs t))
       (let [r (get refs t)
             g (guard (:base r) x refs spec-ns)
-            p (list (symbol (str spec-ns) (str (:pred-name r))) x)]
-        (if g (list 'and g p) p))
+            ;; a refinement that only names its base guards nothing of its own
+            p (when-not (true? (:pred r)) (list (symbol (str spec-ns) (str (:pred-name r))) x))]
+        (cond (and g p) (list 'and g p) g g :else p))
       (and (seq? t) (= 'Tuple (first t)))
       (let [gs (vec (keep-indexed (fn [i ct] (guard ct (list 'nth x i) refs spec-ns)) (rest t)))]
         (when (seq gs) (if (next gs) (cons 'and gs) (first gs))))
@@ -4242,7 +4243,39 @@
                           (let [form (qualify rq (set (second rq)) (set (keys (ns-publics (the-ns dt))))
                                               (set (keys (ns-interns (the-ns dep)))) dt dep)]
                             {:test (nth rq 2)
+                             :form form
                              :f (let [g (binding [*ns* (the-ns dep)] (eval form))] #(apply g %))}))}])))
+
+(declare call-graph arg-var)
+
+(defn- component-laws
+  "A law per signed fn of the target that calls, itself or through the
+  target's own fns, a component's fn with a :requires: that it never
+  throws, the :requires broken among the ways to throw.  Tested, a broken
+  :requires fails where the call is made; proved, every call meets it."
+  [e]
+  (let [cs (::components e)
+        guarded (set (keep (fn [[q c]] (when (:requires c) q)) cs))
+        target (:target e)]
+    (when (seq guarded)
+      (let [g (try (call-graph target) (catch Throwable _ {}))
+            reach (fn [f] (loop [todo [f], seen #{}]
+                            (if-let [x (first todo)]
+                              (if (contains? seen x)
+                                (recur (rest todo) seen)
+                                (recur (concat (rest todo) (get g x)) (conj seen x)))
+                              seen)))]
+        (vec (for [[f {:keys [params]}] (sort-by (comp str key) (:anns e))
+                   :let [hit (sort-by str (filter guarded (reach f)))]
+                   :when (seq hit)
+                   :let [avs (reduce (fn [acc [i t]] (conj acc (arg-var t i (set acc)))) [] (map-indexed vector params))]]
+               {:name (symbol (str f ":keeps-requires"))
+                :oid (str "requires." f)
+                :prop (list 'forall (vec (interleave avs params)) (list 'vector? [(apply list f avs)]))
+                :explain (str "`" f "` calls " (str/join ", " (map #(str "`" % "`") hit))
+                              ", and must meet each one's :requires")
+                :total true
+                :guard-law true}))))))
 
 (defn- entry
   ([spec-ns target] (entry spec-ns target nil))
@@ -4880,7 +4913,13 @@
                                        [(symbol (str a) (str f)) (symbol (str lib) (str f))]))
                             (into {} (for [[r q] refers :when (project? (symbol (namespace q)))] [r q]))
                             (assumed-names names assumed))]
-              (recur (concat (rest todo) deps) (conj seen n) (conj out [n forms ref-map]))))))
+              ;; an assumed fn has no definition here, whatever its source
+              ;; says: a component is read through its spec, not its code
+              (recur (concat (rest todo) deps) (conj seen n)
+                     (conj out [n (vec (remove #(and (seq? %) (contains? '#{defn defn-} (first %))
+                                                     (contains? assumed (symbol (str n) (str (second %)))))
+                                               forms))
+                                ref-map]))))))
       out))))
 
 (defn- hint-candidates
@@ -5050,6 +5089,13 @@
                           ;; refinement in both is the same base type
                           :lemmas (mapv #(update % :prop erase-law refs spec-ns) lemmas)
                           :rets (into {} (for [[f sig] sigs] [f (:ret sig)]))
+                          ;; what an assumed fn returns is taken at its word: a
+                          ;; component's by the spec that checks it
+                          :trusted-rets (into {} (for [[f sig] assumed-sigs] [f (:ret sig)]))
+                          :component-requires (into {} (for [[q c] (::components opts)
+                                                             :let [form (get-in c [:requires :form])]
+                                                             :when form]
+                                                         [q {:params (vec (second form)) :body (nth form 2)}]))
                           :guards (set (for [[_ r] refs] (symbol (str spec-ns) (str (:pred-name r)))))
                           ;; a law a test refuted is tried only to catch a
                           ;; prover that would prove it: briefly
@@ -6067,6 +6113,85 @@
       (finally
         (when made? (remove-ns target))))))
 
+;; --- which ways the code's tests went -------------------------------------------
+
+(def ^:private coverage
+  "[target id] -> the outcomes the test with that id had, while a check of
+  the target ran its laws."
+  (atom {}))
+
+(defn -cov
+  "Note that test id of target came out v, and give v back."
+  [target id v]
+  (swap! coverage update [target id] (fnil conj #{}) (boolean v))
+  v)
+
+(defn- probe-tests
+  "form, its macros expanded, with each if's test noted by -cov: [form'
+  tests], tests id -> the test as written.  A test on a local that an
+  `and` or `or` bound shows the expression bound."
+  [form target ids]
+  (let [tests (atom {})
+        ;; a local a macro bound, and:ed or or:ed or cased, shown as what it holds
+        shown (fn [t denv] (walk/postwalk #(if (and (symbol? %) (contains? denv %)) (get denv %) %) t))
+        constant? #(or (keyword? %) (true? %) (number? %) (string? %))
+        walk (fn walk [f denv]
+               (cond
+                 (and (seq? f) (= 'quote (first f))) f
+                 (and (seq? f) (contains? '#{let* loop*} (first f)) (vector? (second f)))
+                 (let [[op bs & body] f
+                       [bs' denv'] (reduce (fn [[out d] [b init]]
+                                             [(conj out b (walk init d))
+                                              (if (and (symbol? b) (re-find #"__" (name b)))
+                                                (assoc d b (shown init d))
+                                                d)])
+                                           [[] denv] (partition 2 bs))]
+                   (apply list op bs' (map #(walk % denv') body)))
+                 (and (seq? f) (= 'if (first f)) (<= 3 (count f) 4))
+                 (let [[_ t a b] f]
+                   (if (constant? t)
+                     (apply list 'if t (map #(walk % denv) (drop 2 f)))
+                     (let [id (swap! ids inc)]
+                       (swap! tests assoc id (shown t denv))
+                       (apply list 'if (list `-cov (list 'quote target) id (walk t denv))
+                              (map #(walk % denv) (drop 2 f))))))
+                 (seq? f) (apply list (map #(walk % denv) f))
+                 (vector? f) (mapv #(walk % denv) f)
+                 (map? f) (into {} (map (fn [[k v]] [(walk k denv) (walk v denv)])) f)
+                 :else f))]
+    [(walk form {}) @tests]))
+
+(defn- install-probes!
+  "Each defn of target replaced by itself with its tests noted: the vars
+  and their fns as they were, and id -> {:fn :test}; nil when the source
+  cannot be read so."
+  [target]
+  (try
+    (let [ids (atom 0)
+          tns (the-ns target)
+          made (vec (for [f (book/read-forms (source-url target))
+                          :when (and (seq? f) (contains? '#{defn defn-} (first f)))
+                          :let [{:keys [name params body]} (defn-parts f)
+                                v (ns-resolve tns name)]
+                          :when (and (var? v) (fn? @v) (vector? params))
+                          :let [expanded (binding [*ns* tns] (walk/macroexpand-all (cons 'do body)))
+                                [probed tests] (probe-tests expanded target ids)
+                                g (binding [*ns* tns] (eval (list 'fn params probed)))]]
+                      [v @v g (into {} (for [[id t] tests] [id {:fn name :test t}]))]))]
+      (doseq [[v _ g] made] (alter-var-root v (constantly g)))
+      {:restore (mapv (fn [[v f]] [v f]) made)
+       :tests (apply merge {} (map #(nth % 3) made))})
+    (catch Throwable _ nil)))
+
+(defn- one-sided-tests
+  "The tests of the code the laws took one way only, as notes."
+  [target tests]
+  (let [seen @coverage]
+    (vec (for [[id {:keys [fn test]}] (sort-by key tests)
+               :let [outs (get seen [target id])]
+               :when (= 1 (count outs))]
+           (str "`" fn "`: " (pr-str test) " was never " (if (contains? outs true) "false" "true"))))))
+
 (defn- unwritten?
   "Does target have no namespace loaded and no source to load it from?"
   [target]
@@ -6094,7 +6219,25 @@
      (let [target (or (:target opts) (:target (get @registry spec-ns)))]
        (if (unwritten? target)
          (vet spec-ns opts)
-         (check* spec-ns opts))))))
+         ;; the code's tests noted while its laws run: a test that only ever
+         ;; went one way is a case no law tries
+         (let [_ (require target)
+               probes (when-not (false? (:coverage opts))
+                        (swap! coverage #(into {} (remove (fn [[[t] _]] (= t target))) %))
+                        (install-probes! target))]
+           (try
+             (let [r (check* spec-ns opts)
+                   notes (when (and probes (seq (:laws r)) (not (:no-code r)))
+                           (one-sided-tests target (:tests probes)))]
+               (cond-> r
+                 (seq notes)
+                 (-> (assoc :one-way-tests notes)
+                     (update :message str
+                             "\n\n  tests of the code no law took both ways; each is a case the laws never"
+                             " try. If it can happen, say what the code does then:\n"
+                             (str/join "\n" (map #(str "    " %) (take 12 notes)))))))
+             (finally
+               (doseq [[v f] (:restore probes)] (alter-var-root v (constantly f)))))))))))
 
 (defn- check*
   [spec-ns opts]
@@ -6129,6 +6272,7 @@
              data-tenv (tenv-of data)
              laws (-> (vec laws)
                       (into (ensures-laws e))
+                      (into (component-laws e))
                       (into (mapcat #(graph-obligations % refs (:invariants e)) (:graphs e))))
              publics (set (keys (ns-publics (the-ns target))))
              interns (set (keys (ns-interns (the-ns spec-ns))))
@@ -6204,6 +6348,7 @@
              results (mapv #(cond-> % (contains? lemma-names (:law %)) (assoc :lemma true)) results)
              imports (imports-of spec-ns e opts)
              results (-> (timed :prover #(prove-laws results (assoc opts ::hints (:hints proof-e) ::proof-ns (:ns proof-e)
+                                                   ::components (::components e)
                                                    ::imports (:lemmas imports)
                                                    ;; what held is given to the prover
                                                    ::assumed {:sigs (into {} (for [{f :fn sig :sig st :status} assumed

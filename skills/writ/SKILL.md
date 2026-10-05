@@ -323,7 +323,11 @@ prove the component once, then use it as a trusted piece.
   true for any implementation that meets its spec.
 - Put a protocol the component imposes in its `:requires`
   (`(ann charge [Session Nat -> Nat] {:requires (fn [s _] (authed? s))})`):
-  that is what a caller is held to.
+  that is what a caller is held to. Each signed fn of this target that
+  calls such a fn, itself or through its own helpers, gets the law
+  `f:keeps-requires`: it never throws, a broken `:requires` among the
+  throws. Tested, a call that breaks it fails; proved, every call meets
+  it, from what the component's proved laws say.
 - Imported laws are not laws of this spec and judge no stand-in: the
   workflow's spec must still say what it means. Specs may not use each
   other in a cycle.
@@ -716,6 +720,14 @@ as a block of its own, after a blank line. A note such as "was never
 false" or "not a step of any graph" is about the spec: when you own only
 the implementation, pass it on to the spec's owner rather than change
 code for it.
+
+While the laws run, each test in the code (an `if`, and the `and`, `or`,
+`cond`, `when` and `case` that expand to one) notes which way it went. A
+test no law took both ways is listed: `` `place-order`: (priced? items
+prices) was never false``. Each is a case the laws never try: if it can
+happen, add a law that says what the code does then (often an input the
+law built to meet a hypothesis leaves it out); if it cannot, the branch is
+dead. `{:coverage false}` skips it.
 
 `:static` fails first. A static failure is a single `Writ:` message, and no
 law runs until it is fixed. After that, each law has a `:status`:

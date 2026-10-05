@@ -364,8 +364,15 @@
                                    ;; (= (+ a b) (total ...)) rewrites the call
                                    (if (< (calls a) (calls b)) [b a] [a b]))
                                  [(n gl) [:lit true]])]
-                   :when (not (or (symbol? l) (= :lin (head l))))]
-               {:name name :vars (set (vals ren)) :types types :hyp hyp :lhs l :rhs r}))))
+                   :when (not (or (symbol? l) (= :lin (head l))))
+                   rule (cons {:name name :vars (set (vals ren)) :types types :hyp hyp :lhs l :rhs r}
+                              ;; (not P) says P is false where P is a boolean: a test
+                              ;; on P meets P, not its negation
+                              (when (and (= [:lit true] r) (= :call (head l)) (= 'not (second l))
+                                         (= 3 (count l)) (not (symbol? (nth l 2))))
+                                [{:name name :vars (set (vals ren)) :types types :hyp hyp
+                                  :lhs (nth l 2) :rhs [:lit false] :bool-only true}]))]
+               rule))))
     (catch clojure.lang.ExceptionInfo _ nil)))
 
 

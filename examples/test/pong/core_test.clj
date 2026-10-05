@@ -31,9 +31,9 @@
   (let [r (check 'pong.broken.tunnel)]
     (is (not (:ok r)))
     (is (str/includes? (:message r) "law `the-left-paddle-stops-the-ball` fails for"))
-    (testing "no test finds it; the solver does, with a ball two cells from the paddle"
-      (is (str/includes? (:message r) "b  = [3 6 -2 2]"))
-      (is (str/includes? (:message r) "(advance b ly ry) => [1 8 -2 2]"))
+    (testing "no test finds it; the solver does, with a ball three cells out moving three"
+      (is (str/includes? (:message r) "b  = [3 6 -3 2]"))
+      (is (str/includes? (:message r) "(advance b ly ry) => [0 8 -3 2]"))
       (is (str/includes? (:message r) "found by the solver")))))
 
 (deftest a-phase-step-forgets-is-caught-before-anything-runs

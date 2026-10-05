@@ -217,6 +217,14 @@
             e (when c (prove-goal o nth-goal (conj hyps nth-hyp) (dec depth)))]
         (when (and c e) {:by :extensional :on i :count c :elements e})))))
 
+(defn- unrolls?
+  "Does normal term n hold a range a new fact may unroll?  Then it
+  normalises under the case's facts to something other than the parent's
+  form normalised again, and the checker reads the case from the start:
+  the case is read from the start here too."
+  [n]
+  (boolean (some #(and (= :call (head %)) (= 'range (second %))) (t/subterms n))))
+
 (defn- prove-goal
   "Prove boolean term g under hyps.  In order: a data value's tag is split
   into its constructors; integer arithmetic through and through goes to
@@ -228,7 +236,7 @@
   builds on."
   ([opts g hyps depth] (prove-goal opts g hyps depth nil))
   ([opts g hyps depth parent]
-   (let [[ctx vacuous n :as here] (if parent
+   (let [[ctx vacuous n :as here] (if (and parent (not (unrolls? (nth parent 2))))
                                     (sc/case-context-after opts parent hyps)
                                     (sc/case-context opts g hyps))
          split (delay (split-candidate n ctx))
@@ -691,7 +699,7 @@
   Returns {:proved true :trace :summary :lemmas} or {:proved false :reason
   :stuck}, and :attempts, what each strategy tried did: {:name :outcome
   :fuel :ms}, the outcome :proved, :failed, :fuel or :rejected."
-  [{:keys [prop defs tenv target own fuel lemmas rets total hint lemma sigs contracts replay prover guards sym-budget refutes? counterexample-only] :as args}]
+  [{:keys [prop defs tenv target own fuel lemmas rets trusted-rets component-requires total hint lemma sigs contracts replay prover guards sym-budget refutes? counterexample-only] :as args}]
   (try
     (let [cfg (merge default-config prover)
           {:keys [bs0 bs g recs defs]} (law-setup args)
@@ -714,7 +722,14 @@
                 :sym-budget sym-budget
                 :unfolded unfolded :fuel (or fuel (:fuel cfg)) :lemmas-used lemmas-used :asked asked
                 :depth (:depth cfg) :enum-limit (:enum-limit cfg) :plausible-samples (:plausible-samples cfg)
-                :rets (or rets {}) :burned burned
+                :rets (or rets {}) :trusted-rets (or trusted-rets {}) :burned burned
+                ;; each component fn's :requires, as a term of its parameters
+                ;; one the prover cannot read stays, with no term: a call of
+                ;; that fn is then outside, never taken to meet it
+                :requires (into {} (for [[q {:keys [params body]}] component-requires
+                                         :let [t (try (tr/lower-term (tr/context own) params body)
+                                                      (catch clojure.lang.ExceptionInfo _ nil))]]
+                                     [q {:params params :term t}]))
                 :lemmas (into (vec (mapcat #(lemma-rules % defs tenv own)
                                            (if-let [use (:use hint)]
                                              (filter #(contains? (set use) (:name %)) lemmas)

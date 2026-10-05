@@ -39,6 +39,12 @@
 
 (defn- nan? [x] (and (float? x) (Double/isNaN x)))
 
+(defn strict
+  "b, once a has run: how the prover keeps that a binding or a statement
+  is evaluated whether or not its value is used."
+  [_ b]
+  b)
+
 (defn same
   "Clojure's =, but with NaN the same as NaN, at any depth: so every value
   is the same as itself, which = does not promise.  Sequentials compare

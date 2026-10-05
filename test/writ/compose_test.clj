@@ -2,6 +2,9 @@
   "A spec built on another: the component taken at its spec."
   (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
+            [clojure.java.io :as io]
+            [writ.book :as book]
+            [writ.prove :as prover]
             [writ.spec :as spec]))
 
 (defn- has? [r s] (str/includes? (:message r) s))
@@ -41,3 +44,41 @@
   (let [r (spec/check 'writ.spec-demo.tags-spec {:seed 7})]
     (is (:ok r) (:message r))
     (is (re-find #"element by element" (str (:proof (law-result r 'tagging-keeps-the-weights)))))))
+
+(deftest a-workflow-is-proved-to-meet-its-components-requires
+  (let [r (spec/check 'writ.spec-demo.shop-spec {:seed 7})
+        l (law-result r 'checkout:keeps-requires)]
+    (is (= :proved (:status l)) (:message r))
+    (is (some #(re-find #"auth-spec" (str %)) (:lemmas (law-result r 'a-wrong-password-pays-nothing)))
+        "proved from the component's law, its code left folded")))
+
+(defn- keeps-requires? [n]
+  (let [forms (book/read-forms (io/resource (str (-> (str n) (str/replace "." "/") (str/replace "-" "_")) ".clj")))
+        sess '{:user String :authed Bool}
+        q #(symbol "writ.spec-demo.auth" %)
+        sigs {(symbol (str n) "checkout") {:params '[(Map String String) String String Nat] :ret 'Nat}
+              (q "login") {:params ['(Map String String) 'String 'String] :ret sess}
+              (q "authed?") {:params [sess] :ret 'Bool}
+              (q "charge") {:params [sess 'Nat] :ret 'Nat}}
+        names (into {} (for [f ["login" "authed?" "charge"] k [(symbol "auth" f) (q f)]] [k (q f)]))
+        [defs own] (prover/definitions [[n forms names]] sigs)]
+    (:proved (prover/prove-law
+               {:prop (list 'forall '[accounts (Map String String)]
+                            (list 'forall '[user String]
+                                  (list 'forall '[password String]
+                                        (list 'forall '[total Nat]
+                                              (list 'vector? [(list (symbol (str n) "checkout") 'accounts 'user 'password 'total)])))))
+                :defs defs :target n :own (merge names own) :sigs sigs :tenv {} :total true
+                :rets (into {} (for [[f s] sigs] [f (:ret s)]))
+                :trusted-rets (into {} (for [f ["login" "authed?" "charge"]] [(q f) (:ret (get sigs (q f)))]))
+                :component-requires {(q "charge") {:params '[s amount] :body (list (q "authed?") 's)}}}))))
+
+(deftest a-call-that-may-break-a-components-requires-is-not-proved
+  (is (keeps-requires? 'writ.spec-demo.shop) "it charges only an authenticated session")
+  (is (not (keeps-requires? 'writ.spec-demo.shop-eager))
+      "it charges before it looks, though it uses the charge only after"))
+
+(deftest a-test-of-the-code-the-laws-take-one-way-is-named
+  (let [r (spec/check 'writ.spec-demo.fee-spec {:seed 1})]
+    (is (some #(re-find #"`fee`: \(> n \(\* 40 40\)\) was never true" %) (:one-way-tests r)) (pr-str (:one-way-tests r)))
+    (is (re-find #"no law took both ways" (:message r)))))

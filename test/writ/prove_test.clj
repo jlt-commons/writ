@@ -720,3 +720,13 @@
     (is (not (:proved (prover/prove-law (:law (law-input 'writ.spec-demo.seqy-spec 'head-and-second-agree-on-nil)))))))
   (testing "an nth of a list that may be nil may be nil"
     (is (not (:proved (prover/prove-law (:law (law-input 'writ.spec-demo.seqy-spec 'always-picks-one))))))))
+
+(deftest a-binding-runs-though-its-value-is-not-used
+  (let [target 'writ.spec-demo.unused
+        [defs own] (prover/definitions [[target (writ.book/read-forms (#'spec/source-url target))]])
+        law {:prop '(forall [v (Vec Nat)] (= 0 (writ.spec-demo.unused/pick v)))
+             :defs defs :own own :target target :tenv {}
+             :rets {'writ.spec-demo.unused/pick 'Nat}}]
+    (is (:proved (prover/prove-law law)) "what it returns does not depend on the binding")
+    (is (not (:proved (prover/prove-law (assoc law :total true))))
+        "but it throws on a short vector, so it is not proved never to throw")))

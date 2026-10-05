@@ -91,6 +91,40 @@
 
 (declare term-of)
 
+(def ^:private taking-apart
+  "Core fns that only take a value apart or measure it: on a value of the
+  type the static check gives it they return, and destructuring is made of
+  them."
+  '#{get nth first second rest next seq key val count})
+
+(defn- always-read?
+  "Does evaluating AST node ast read local b on every path: b itself, a
+  test of an if, an argument of a call, a binding's init, or both branches
+  of an if?  A fn literal's body is not run where it is written."
+  [b ast]
+  (case (:op ast)
+    :ref (= b (:name ast))
+    :if (or (always-read? b (:test ast))
+            (and (always-read? b (:then ast)) (always-read? b (:else ast))))
+    :invoke (or (always-read? b (:fn ast)) (some #(always-read? b %) (:args ast)))
+    :let (or (some (fn [[_ init]] (always-read? b init)) (:bindings ast)) (always-read? b (:body ast)))
+    :do (or (some #(always-read? b %) (:stmts ast)) (always-read? b (:ret ast)))
+    (:vector :set) (boolean (some #(always-read? b %) (:items ast)))
+    false))
+
+(defn- strictly
+  "body, after init has run: (strict init body), or body when init is a
+  value, or a taking apart of one, that cannot throw."
+  [init body]
+  (if (or (symbol? init) (contains? #{:lit :nil :fn :cfn :dfn :sq} (t/head init))
+          (and (= :call (t/head init)) (contains? taking-apart (second init))
+               (or (not= 'nth (second init)) (= 5 (count init)))
+               (every? #(or (symbol? %) (contains? #{:lit :nil} (t/head %))
+                            (and (= :call (t/head %)) (contains? taking-apart (second %))))
+                       (drop 2 init))))
+    body
+    [:call 'writ.prove.term/strict init body]))
+
 (defn- call-head
   "How a call's head is read: [:local term], [:own qualified], [:core sym]."
   [ctx env s]
@@ -227,12 +261,18 @@
           (let [xt (term-of ctx env x)]
             [:if [:call 'seq? xt] [:call 'writ.prove.term/map-of-seq xt] xt])
           [:if (term-of ctx env (:test ast)) (term-of ctx env (:then ast)) (term-of ctx env (:else ast))])
-    :do (term-of ctx env (:ret ast))
-    :let (let [env* (reduce (fn [e [b init]]
-                              (when-not (symbol? b) (outside! (str "the binding form " (pr-str b))))
-                              (assoc e b (term-of ctx e init)))
-                            env (:bindings ast))]
-           (term-of ctx env* (:body ast)))
+    ;; a statement, and a binding, is evaluated before the body, used or not:
+    ;; its throws are the body's.  A binding is read where it is used, and
+    ;; (strict init body) keeps that it ran
+    :do (reduce (fn [body st] (strictly (term-of ctx env st) body))
+                (term-of ctx env (:ret ast)) (reverse (:stmts ast)))
+    :let (let [[env* inits] (reduce (fn [[e is] [b init]]
+                                      (when-not (symbol? b) (outside! (str "the binding form " (pr-str b))))
+                                      (let [t (term-of ctx e init)] [(assoc e b t) (conj is [b t])]))
+                                    [env []] (:bindings ast))]
+           ;; a binding the body reads on every path runs there anyway
+           (reduce (fn [body [b i]] (if (always-read? b (:body ast)) body (strictly i body)))
+                   (term-of ctx env* (:body ast)) (reverse inits)))
     :fn (do (when (:name ast) (outside! "a named local fn"))
             (let [ps (:params ast)]
               (when (or (some #(= '& %) ps) (not (every? symbol? ps)))
