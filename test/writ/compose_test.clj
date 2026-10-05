@@ -128,3 +128,7 @@
       (is (= :proved (:status (law-result r l))) (str l)))
     ;; a case over a closed type always matches: its last test is no note
     (is (not-any? #(re-find #"identical\?" %) (:one-way-tests r)) (pr-str (:one-way-tests r)))))
+
+(deftest two-types-may-share-a-constructor-name
+  (let [r (spec/check 'writ.spec-demo.calc-spec {:seed 7 :adequacy false})]
+    (is (:ok r) (:message r))))

@@ -674,7 +674,9 @@ others. A clause destructures only its constructor's fields, or reads
 them by position, `(second t)` or `(nth t 2)`; a clause of several
 constructors, `(:add :mul) ...`, reads a field where they agree on its
 type. A literal `[:Node ...]` carries exactly the declared fields, of
-fitting types. Read the tag with `case (first t)` only: `first`,
+fitting types. Two types may share a constructor's name when they give
+it different fields -- an expression's `(add Expr Expr)` and an
+instruction's `(add)`: a literal is of the type whose fields it has. Read the tag with `case (first t)` only: `first`,
 `second` or `nth` of a data value outside a clause that fixed its
 constructor is rejected. A case with no default never reaches its
 no-match throw on a value of the type, so its last test is no coverage

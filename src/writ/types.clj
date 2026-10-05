@@ -354,10 +354,11 @@
                               :else x))]
     (mapv sub (:fields (get (:ctors d) c)))))
 
-(defn- ctor-owner
-  "The declared type that has constructor `c`, or nil."
+(defn- ctor-owners
+  "The declared types that have constructor `c`: two types may share a
+  constructor's name, an expression's :add and an instruction's."
   [tenv c]
-  (first (keep (fn [[tn d]] (when (and (map? d) (contains? (:ctors d) c)) tn)) tenv)))
+  (vec (sort-by str (keep (fn [[tn d]] (when (and (map? d) (contains? (:ctors d) c)) tn)) tenv))))
 
 (defn- ctor-list [tenv tname]
   (sort-by str (keys (:ctors (get tenv tname)))))
@@ -573,10 +574,21 @@
                  ts (mapv #(w env %) items)
                  k (when (and *tagged* (= :lit (:op (first items))) (keyword? (:val (first items))))
                      (symbol (name (:val (first items)))))
-                 owner (when k (ctor-owner tenv k))]
-             (if owner
-               (built-type ctx owner k (rest ts))
-               (when (every? #(data? % tenv) ts) data)))
+                 owners (when k (ctor-owners tenv k))
+                 ;; of types that share the name, the one the literal fits:
+                 ;; its field count, then its fields' types
+                 fits (if (next owners)
+                        (filterv #(try (built-type ctx % k (rest ts)) true
+                                       (catch clojure.lang.ExceptionInfo _ false))
+                                 owners)
+                        owners)]
+             (cond
+               (= 1 (count fits)) (built-type ctx (first fits) k (rest ts))
+               (seq fits) (fail! "`" (:nm ctx) "`: " (pr-str (vec (cons (:val (first items)) (map (constantly '_) (rest items)))))
+                                 " could be a value of " (clojure.string/join " or " fits)
+                                 "; give their constructors different fields, or different names")
+               (seq owners) (built-type ctx (first owners) k (rest ts))
+               :else (when (every? #(data? % tenv) ts) data)))
       :set (let [ts (mapv #(w env %) (:items ast))]
              (when (every? #(data? % tenv) ts) data))
       :map (let [ts (mapv #(w env %) (concat (:keys ast) (:vals ast)))
