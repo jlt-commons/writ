@@ -1414,13 +1414,20 @@
   debugging a rewrite that does not terminate."
   nil)
 
+(def ^:dynamic *deadline*
+  "When bound, the clock time (ms) a search must stop by: rewriting past it
+  runs out as it does out of fuel."
+  nil)
+
 (defn- burn!
   ([ctx] (burn! ctx nil))
   ([ctx x]
    (let [left (swap! (:fuel ctx) dec)]
      (some-> (:burned ctx) (swap! inc))
      (when (and *last-terms* x (< left 60)) (swap! *last-terms* conj x))
-     (when (neg? left) (out-of-fuel!)))))
+     (when (neg? left) (out-of-fuel!))
+     (when (and *deadline* (zero? (bit-and left 127)) (> (System/currentTimeMillis) *deadline*))
+       (out-of-fuel!)))))
 
 (declare normalize)
 

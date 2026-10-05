@@ -29,6 +29,7 @@
             [writ.prove.check :as check]
             [writ.prove.smt :as smt]
             [writ.prove.symbolic :as sym]
+            [writ.solve.cdcl :as cdcl]
             [writ.prove.scheme :as sc :refer [split-foralls goal plain cases truthy? falsy?
                                                solve-eq assume-hyp subst-all instance ih-for
                                                useful-ih replace-term lemma-rules]]))
@@ -110,6 +111,9 @@
   strategies are tried in -- :order in general, :loop-order when a
   recursion of the code climbs on a law's integer."
   {:fuel 20000
+   ;; the time one law's search may take, over all its strategies: past it
+   ;; the rest are not tried, and the law is left to its tests
+   :law-ms 30000
    :depth 8
    :enum-limit 16
    :plausible-samples 30
@@ -738,6 +742,8 @@
           ;; an attempt that runs out of fuel fails on its own; the others
           ;; still get their turn
           ran-out (atom false)
+          ;; when this law's search began: its budget runs from here
+          law-start (delay (System/currentTimeMillis))
           ;; what each attempt did, and the goals the failed ones got stuck on
           attempts (atom [])
           stuck (atom [])
@@ -747,7 +753,9 @@
                           b0 @burned
                           seen (atom [])
                           why (atom [])
-                          [r outcome] (binding [*stuck* seen *case* [] sym/*why* why]
+                          [r outcome] (binding [*stuck* seen *case* [] sym/*why* why
+                                                rw/*deadline* (when-let [b (:law-ms cfg)] (+ @law-start b))
+                                                cdcl/*deadline* (when-let [b (:law-ms cfg)] (+ @law-start b))]
                                         (try (let [r (f)] [r (if r :proved :failed)])
                                              (catch clojure.lang.ExceptionInfo e
                                                (if (:writ.prove.rewrite/fuel (ex-data e))
@@ -816,8 +824,11 @@
           ;; fails, the counterexample, confirmed by running the code there,
           ;; ends the search
           refuted (delay (boolean (and refutes? @cex (refutes? @cex))))
+          budget (:law-ms cfg)
+          out-of-time (atom false)
+          spent? #(and budget (> (- (System/currentTimeMillis) @law-start) budget) (reset! out-of-time true))
           first-proof (fn [ts] (loop [[t & more] ts]
-                                 (when t
+                                 (when (and t (not (spent?)))
                                    (let [r (attempt t)]
                                      (cond (first r) r
                                            @refuted nil
@@ -861,7 +872,9 @@
           checked (when (and trace (or lemma (seq target-used)))
                     (or replayed (check/check-proof (dissoc opts :lemmas-used :unfolded) g trace)))]
       (-> (cond
-            (nil? trace) (cond-> {:proved false :reason (if @ran-out "the search ran out of fuel" "no proof found")
+            (nil? trace) (cond-> {:proved false :reason (cond @out-of-time "the search ran out of time"
+                                                              @ran-out "the search ran out of fuel"
+                                                              :else "no proof found")
                                   :stuck (stuck-report @stuck @attempts)
                                   ;; the terms themselves, for proposing lemmas; not cached
                                   :stuck-raw (vec (take 6 (stuck-ranked @stuck @attempts)))}
