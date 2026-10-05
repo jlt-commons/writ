@@ -402,6 +402,28 @@ only pure members. Members of `System`, `Runtime` and `Thread` and the
 random sources are refused: they are effects, which belong in the shell.
 Prefer the core fn where there is one (`abs`, not `Math/abs`).
 
+## Laws that need an invariant
+
+Some laws hold only because of what the code's results always look like.
+`(= (simplify (simplify e)) (simplify e))` is true because a simplified
+expression has no rule left to apply, and no rewriting finds that. Say
+the invariant, and the law follows:
+
+```clojure
+(defn simplified? [e] ...)        ; no rule of simplify applies anywhere in e
+
+(law simplify-makes-a-normal-form (forall [e Expr] (simplified? (simplify e))))
+(law simplify-leaves-a-normal-form
+  (forall [e Expr] (=> (simplified? e) (= (simplify e) e))))
+(law simplifying-twice-is-simplifying-once
+  (forall [e Expr] (= (simplify (simplify e)) (simplify e))))
+```
+
+The prover proves the two lemmas by induction and the law by citing
+them; put them before it. Write the predicate as the code's cases read
+the data -- a `case` on the tag, the conditions each rule tests -- and
+orient the second lemma so it rewrites the call away, `(= (simplify e) e)`.
+
 ## The proof namespace
 
 When a law holds but isn't proved, add what the prover needs in

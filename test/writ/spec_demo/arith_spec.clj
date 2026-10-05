@@ -37,3 +37,31 @@
 (law simplifying-keeps-the-value
   (forall [e Expr, env (Map Keyword Int)]
     (= (evaluate (simplify e) env) (evaluate e env))))
+
+;; --- simplify is idempotent: two invariant lemmas, then the law ---------------
+
+(defn num-of? [e n] (and (= :num (first e)) (= n (second e))))
+
+(defn simplified?
+  "No rule of simplify applies anywhere in e."
+  [e]
+  (case (first e)
+    :num true
+    :var true
+    :add (let [[_ a b] e]
+           (and (simplified? a) (simplified? b)
+                (not (and (= :num (first a)) (= :num (first b))))
+                (not (num-of? a 0)) (not (num-of? b 0))))
+    :mul (let [[_ a b] e]
+           (and (simplified? a) (simplified? b)
+                (not (and (= :num (first a)) (= :num (first b))))
+                (not (num-of? a 1)) (not (num-of? b 1))
+                (not (num-of? a 0)) (not (num-of? b 0))))
+    :neg (let [[_ a] e]
+           (and (simplified? a) (not= :num (first a)) (not= :neg (first a))))))
+
+(law simplify-makes-a-normal-form (forall [e Expr] (simplified? (simplify e))))
+
+(law simplify-leaves-a-normal-form (forall [e Expr] (=> (simplified? e) (= (simplify e) e))))
+
+(law simplifying-twice-is-simplifying-once (forall [e Expr] (= (simplify (simplify e)) (simplify e))))

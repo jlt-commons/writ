@@ -168,6 +168,14 @@
                  :when (data? v)]
              v))))
 
+(defn- tag-test?
+  "Is condition c a test of a data variable's tag, (= (first v) :k)?"
+  [c]
+  (and (= :call (head c)) (= '= (second c)) (= 4 (count c))
+       (let [[_ _ a b] c]
+         (or (and (= :call (head a)) (= 'first (second a)) (symbol? (nth a 2 nil)) (= :lit (head b)) (keyword? (second b)))
+             (and (= :call (head b)) (= 'first (second b)) (symbol? (nth b 2 nil)) (= :lit (head a)) (keyword? (second a)))))))
+
 (defn- by-data-cases
   "Prove g by splitting data variable v into one case per constructor."
   [opts g hyps depth v]
@@ -282,7 +290,9 @@
        (and (= [:bottom] n) (not (:total opts))) {:by :throws}
        (zero? depth) (solved)
        :else
-       (if-let [v (data-var opts n ctx)]
+       ;; a test of one tag is split on alone: the constructor split would
+       ;; take every hypothesis about the variable into each of its cases
+       (if-let [v (when-not (tag-test? @split) (data-var opts n ctx))]
          (by-data-cases opts g hyps depth v)
          (or ;; each data case, once its tags are known: the code run
              ;; symbolically, one small formula for the solver
@@ -758,7 +768,9 @@
                                          :let [t (try (tr/lower-term (tr/context own) params body)
                                                       (catch clojure.lang.ExceptionInfo _ nil))]]
                                      [q {:params params :term t}]))
-                :lemmas (into (vec (mapcat #(lemma-rules % defs tenv own)
+                ;; a lemma's sides read as the goal's do: with the contracts
+                ;; and the recognizers, so a field it reads is read alike
+                :lemmas (into (vec (mapcat #(lemma-rules % defs tenv own {:lemmas contracts :recognizers recs})
                                            (if-let [use (:use hint)]
                                              (filter #(contains? (set use) (:name %)) lemmas)
                                              lemmas)))

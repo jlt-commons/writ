@@ -344,14 +344,15 @@
   side to its right, anything else rewrites to true, under the law's
   hypotheses.  Its variables are renamed apart and become pattern
   variables; its sides are normalised the way a goal's subterms are."
-  [{:keys [name prop]} defs tenv own]
+  ([lemma defs tenv own] (lemma-rules lemma defs tenv own {}))
+  ([{:keys [name prop]} defs tenv own extra]
   (try
     (let [[bs body] (split-foralls prop)
           ren (into {} (map (fn [[x _]] [x (symbol (str "?" name "%" x))])) bs)
           vars (mapv first bs)
           g (goal (tr/context own) vars body)
           types (into {} (map (fn [[x ty]] [(ren x) (plain ty)])) bs)
-          ctx (rw/context {:defs defs :tenv tenv :types types})
+          ctx (rw/context (merge extra {:defs defs :tenv tenv :types types}))
           n #(rw/normalize ctx (t/subst % ren))
           hyp (when (seq (:hyps g))
                 (t/subst (reduce (fn [a b] [:if a b [:lit false]]) (:hyps g)) ren))]
@@ -373,7 +374,7 @@
                                 [{:name name :vars (set (vals ren)) :types types :hyp hyp
                                   :lhs (nth l 2) :rhs [:lit false] :bool-only true}]))]
                rule))))
-    (catch clojure.lang.ExceptionInfo _ nil)))
+    (catch clojure.lang.ExceptionInfo _ nil))))
 
 
 ;; --- the steps a proof takes ------------------------------------------------------
