@@ -33,3 +33,7 @@
 (law two-negations-cancel (forall [x Expr] (= (simplify [:neg [:neg x]]) (simplify x))))
 
 (law size-add (forall [a Expr, b Expr] (= (size [:add a b]) (+ 1 (size a) (size b)))))
+
+(law simplifying-keeps-the-value
+  (forall [e Expr, env (Map Keyword Int)]
+    (= (evaluate (simplify e) env) (evaluate e env))))

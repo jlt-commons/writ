@@ -536,3 +536,17 @@
     (if (= 'integer? (second g))
       {:name nm :vars (set (vals ren)) :types types :hyp hyp :lhs (n g) :rhs [:lit true]}
       {:name nm :vars (set (vals ren)) :types types :hyp hyp :lhs (n (nth g 2)) :rhs (n (nth g 3))})))
+
+(defn cross-fertilize
+  "Goal g with each induction hypothesis of opts that is an equation, and
+  has no free variables, used right to left: its right side, wherever g
+  holds it, put back as its left.  (evaluate a env) becomes (evaluate
+  (simplify a) env), so both sides of the goal read (simplify a), and a
+  split on its tag unfolds both alike.  Cross-fertilisation, as Boyer and
+  Moore's waterfall has it: equals for equals."
+  [opts g]
+  (reduce (fn [g {:keys [lhs rhs vars hyp]}]
+            (if (and (empty? vars) (nil? hyp) lhs (not= [:lit true] rhs) (not (symbol? rhs)))
+              (replace-term g rhs lhs)
+              g))
+          g (:ih opts)))

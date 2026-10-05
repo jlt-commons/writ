@@ -52,6 +52,9 @@
                 (reject! "the goal does not throw: " (pr-str (t/show @n))))
       :rewriting (when-not (or @vacuous (sc/truthy? @n) (true? (rw/truthiness (first @cc) @n)))
                    (reject! "the goal does not rewrite to true: " (pr-str (t/show @n))))
+      ;; the induction hypotheses taken as facts: they hold in the case
+      :cross (do (when (:crossed opts) (reject! "the hypotheses are taken as facts twice"))
+                 (check-goal (assoc opts :crossed true :ih []) (sc/cross-fertilize opts @n) hyps (:then p)))
       :split (let [c (:on p)]
                (if-let [[x v] (and (= :ieq (head c)) (sc/solve-eq (second c)))]
                  (let [[o g* hs] (sc/subst-all opts g hyps {x v})]

@@ -229,6 +229,29 @@
   [n]
   (boolean (some #(and (= :call (head %)) (= 'range (second %))) (t/subterms n))))
 
+(declare prove-goal)
+
+(defn- by-cross-fertilizing
+  "Prove g with its induction hypotheses used right to left, once a case
+  has left a goal their rewriting does not reach: the goal's (evaluate a
+  env) is put back as (evaluate (simplify a) env), the hypothesis's left
+  side, and the case's splits then unfold it as they unfold the other
+  side.  Cross-fertilisation, as Boyer and Moore's waterfall has it."
+  [opts g hyps depth]
+  (when (and (not (:crossed opts))
+             ;; an equation among the hypotheses to put back, before the
+             ;; case is normalised again to find where
+             (some (fn [{:keys [lhs rhs vars hyp]}]
+                     (and (empty? vars) (nil? hyp) lhs (not= [:lit true] rhs) (not (symbol? rhs))))
+                   (:ih opts)))
+  (let [[_ vacuous n] (sc/case-context opts g hyps)
+        g* (when-not vacuous (sc/cross-fertilize opts n))]
+    (when (and g* (not= n g*))
+      ;; the hypotheses used up: the goal now reads their left sides,
+      ;; which they would rewrite back
+      (when-let [p (prove-goal (assoc opts :crossed true :ih []) g* hyps depth)]
+        {:by :cross :then p})))))
+
 (defn- prove-goal
   "Prove boolean term g under hyps.  In order: a data value's tag is split
   into its constructors; integer arithmetic through and through goes to
@@ -282,7 +305,8 @@
                    ;; two sequences equal, element by element
                    (by-extensionality opts g hyps depth ctx n)
                    (when-let [v (elems-var opts n)] (by-list-cases opts g hyps depth v))
-                   (solved)))))))))
+                   (solved)
+                   (by-cross-fertilizing opts g hyps depth)))))))))
 
 (defn- prove-all
   "Prove every goal (under the hyps) in one context of opts."

@@ -266,7 +266,7 @@
   [ty]
   (and (map? ty) (seq ty) (not (contains? ty :writ/elems)) (every? keyword? (keys ty))))
 
-(declare lemma-rewrite known-literal)
+(declare lemma-rewrite known-literal term-type)
 
 (defn- data-type-of-term
   "The data type term x is known to be a value of: ty, its own type, when
@@ -281,6 +281,18 @@
                                (= [:lit true] (lemma-rewrite ctx [:app nm x]))))
                   rty))
               (get-in ctx [:recognizers :names])))))
+
+(defn- tag-equality
+  "(= (first s) kw) for s a data value: false when kw is none of its
+  type's tags, true when the facts rule out every other, nil otherwise."
+  [ctx a kw]
+  (let [s (nth a 2)]
+    (when-let [dty (data-type-of-term ctx s (term-type ctx s))]
+      (let [tags (map #(keyword (str (key %))) (:ctors (get-in ctx [:tenv dty])))]
+        (cond
+          (not (some #{kw} tags)) [:lit false]
+          (every? #(or (= % kw) (false? (get (:facts ctx) [:call '= a [:lit %]]))) tags) [:lit true]
+          :else nil)))))
 
 (defn- known-tag
   "The constructor tag of x, a value of data type dty: the one the facts
@@ -414,6 +426,19 @@
       x)))
 
 (defn- all-int? [ctx xs] (every? #(int-term? ctx %) xs))
+
+(defn- fixed-int
+  "The integer the facts pin integer atom a to, k*a + c = 0 with k
+  dividing c, or nil."
+  [ctx a]
+  (some (fn [[f v]]
+          (when (and (true? v) (= :ieq (head f)))
+            (when-let [l (lin-of ctx (second f))]
+              (when (= [a] (keys (:m l)))
+                (let [k (get (:m l) a)]
+                  (when (and (not (zero? k)) (zero? (rem (:c l) k)))
+                    (- (quot (:c l) k))))))))
+        (:facts ctx)))
 (defn- all-num-lits? [xs] (every? #(and (t/lit? %) (number? (second %))) xs))
 
 ;; --- deciding conditions ---------------------------------------------------------
@@ -886,14 +911,8 @@
       ;; the tag of a data value is one of its type's constructors': when
       ;; the facts rule out every other, it is this one
       (and (= :call ha) (= 'first (second a)) (= 3 (count a)) (= :lit hb) (keyword? (second b))
-           (data-type-of-term ctx (nth a 2) (term-type ctx (nth a 2))))
-      (let [s (nth a 2)
-            tags (map #(keyword (str (key %)))
-                      (:ctors (get-in ctx [:tenv (data-type-of-term ctx s (term-type ctx s))])))]
-        (cond
-          (not (some #{(second b)} tags)) [:lit false]
-          (every? #(or (= % (second b)) (false? (get (:facts ctx) [:call '= a [:lit %]]))) tags) [:lit true]
-          :else nil))
+           (some? (tag-equality ctx a (second b))))
+      (tag-equality ctx a (second b))
       ;; a data value against a constructor literal, its tag known to be
       ;; that one: field by field, (= s [:num (nth s 1)])
       (and (not= :sq ha) (= :sq hb) (t/elems-list (second b))
@@ -1312,6 +1331,9 @@
                 (let [k (apply * (map second (filter t/int-lit? args)))
                       v (first (remove t/int-lit? args))]
                   (lin->term (if v (lin* k (lin-of ctx v)) {:c k :m {}})))
+                ;; a factor the facts pin, put in: (* n x) where n is 1
+                (and (all-int? ctx args) (some #(fixed-int ctx %) (remove t/int-lit? args)))
+                (into [:call '*] (map #(if-let [v (and (not (t/int-lit? %)) (fixed-int ctx %))] [:lit v] %) args))
                 :else nil)
         (< <= > >=)
         (when (= 2 n)
@@ -1663,6 +1685,9 @@
   (let [el (fn [t] (when (and (seq? t) (contains? '#{List Vec} (first t))) (second t)))]
     (boolean
       (or (= ty (get-in ctx [:types u]))
+          ;; a part its form types: a constructor's field, (nth s 1) an Expr
+          ;; where s is a :neg
+          (and (vector? u) (not (symbol? u)) (= ty (term-type ctx u)))
           ;; a call of a fn whose return type is taken at its word
           (and (= :app (head u)) (= ty (get-in ctx [:trusted-rets (second u)])))
           (and (= :sq (head u)) (symbol? (second u)) (el ty)
@@ -1947,6 +1972,34 @@
                    (contains? '#{< <= > >= =} (second (nth t 2)))))
     false))
 
+(def ^:private boolean-defs
+  "Definition name -> whether it returns only true or false."
+  (atom {}))
+
+(defn- boolean-app?
+  "Is x a call of a definition that returns only true or false: its body
+  an if-tree whose every leaf is a boolean, or a call of such a
+  definition, itself included?  Then a fact of the call is its value,
+  (simplified? s) given true is true, and it is not unfolded to be read
+  again."
+  [ctx x]
+  (and (= :app (head x))
+       (let [nm (second x)
+             body? (fn body? [b seen]
+                     (case (head b)
+                       :if (and (body? (nth b 2) seen) (body? (nth b 3) seen))
+                       :app (or (contains? seen (second b))
+                                (let [d (get-in ctx [:defs (second b)])]
+                                  (and (:params d) (body? (:body d) (conj seen (second b))))))
+                       (boolean-term? b)))
+             cached (get @boolean-defs nm ::none)]
+         (if (not= ::none cached)
+           cached
+           (let [d (get-in ctx [:defs nm])
+                 v (boolean (and (:params d) (body? (:body d) #{nm})))]
+             (swap! boolean-defs assoc nm v)
+             v)))))
+
 (defn- lift-if
   "A call, of a core fn or of a definition, with an if among its
   arguments, as an if of two calls: a call runs its arguments first, so
@@ -1976,7 +2029,7 @@
       (lemma-rewrite ctx x)
       (lift-if x)
       (when (and (contains? (:facts ctx) x) (not (contains? #{:le :ieq} (head x)))
-                 (boolean-term? x) (boolean? (get (:facts ctx) x)))
+                 (or (boolean-term? x) (boolean-app? ctx x)) (boolean? (get (:facts ctx) x)))
         [:lit (get (:facts ctx) x)])
       (apply-patterns (get @indexed (rule-key x)) x)
       (computed ctx x)
