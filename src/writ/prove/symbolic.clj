@@ -84,6 +84,13 @@
 
 ;; --- state: fresh names, definitions and constant codes -------------------------
 
+
+(defn- conj-all
+  "v with xs added at its end, a conj each: into would make a transient of
+  the whole of v, and on jolt that copies it."
+  [v xs]
+  (reduce conj v xs))
+
 (defn- state []
   (atom {:n 0 :defs [] :decls {} :codes {} :memo {} :path [] :throws []}))
 
@@ -730,7 +737,7 @@
                   facts (cond-> []
                           (= 'Nat (plain-type kt)) (conj [:=> present [:<= 0 (first ks)]])
                           index (conj [:=> present (truth (lift st (fn [r] {:bool (equal st (map-lookup st r {:const (code! st index) :ctype :keyword} {:nil true}) x)}) v))]))]
-              (swap! st update :defs into facts)
+              (swap! st update :defs conj-all facts)
               (swap! st #(-> % (assoc-in [:base-reads k] [present v])
                              ;; a key the map is read at: where its quantified
                              ;; facts are instantiated, unless it was read
@@ -969,7 +976,7 @@
             eb (seq-elem st b (fold [:+ (:off sb) i]))
             agree [:or [:not [:and [:<= 0 i] [:< i (:len sa)]]]
                    (truth (lift2 st (fn [p q] {:bool (equal st p q)}) ea eb))]]
-        (swap! st update :defs into [[:=> (conj-f same-len agree) r] [:=> r same-len]])
+        (swap! st update :defs conj-all [[:=> (conj-f same-len agree) r] [:=> r same-len]])
         r)
       :else (unknown! st '= [a b] :bool))))
 
@@ -1086,7 +1093,7 @@
   [st kt]
   (let [facts (atom [])
         w (var-value st facts kt (:tenv @st) 'witness)]
-    (swap! st update :defs into @facts)
+    (swap! st update :defs conj-all @facts)
     w))
 
 (defn- for-all!
@@ -1602,7 +1609,7 @@
   (let [facts (atom [])
         v (var-value st facts 'Any {} 'lookup)]
     ;; its type's facts join the definitions, which the formula assumes
-    (swap! st update :defs into @facts)
+    (swap! st update :defs conj-all @facts)
     v))
 
 (defn- opaque-count

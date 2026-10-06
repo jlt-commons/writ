@@ -301,10 +301,13 @@
     (let [p [:bool [:t (:n @st)] true]]
       (vswap! st update :n inc)
       (let [names (mapv #(name-of! st %) (rest f))]
-        (vswap! st update :clauses into
-                (if (= :and (first f))
-                  (map (fn [g] [(negate p) g]) names)
-                  [(into [(negate p)] names)])))
+        ;; conj, not into: into makes a transient of the whole clause
+        ;; vector, and on jolt that copies it -- every name a copy, the
+        ;; clauses quadratic in the formula
+        (vswap! st update :clauses
+                (fn [cs] (if (= :and (first f))
+                           (reduce (fn [cs g] (conj cs [(negate p) g])) cs names)
+                           (conj cs (into [(negate p)] names))))))
       (vswap! st assoc-in [:names f] p)
       p)))
 

@@ -679,6 +679,10 @@
     (truthiness* ctx c)))
 
 (defn- truthiness* [ctx c]
+  ;; a condition the facts hold as it stands, (if c (not d) true) among them
+  (let [f (get (:facts ctx) c ::none)]
+    (if (boolean? f)
+      f
   (case (head c)
     :nil false
     :lit (not (false? (second c)))
@@ -695,7 +699,7 @@
     :app (if (or (int-term? ctx c) (data-type-of-term ctx c nil))
            true
            (let [d (decide ctx c)] (if (some? d) d (nil-fact ctx c))))
-    (let [d (decide ctx c)] (if (some? d) d (nil-fact ctx c)))))
+    (let [d (decide ctx c)] (if (some? d) d (nil-fact ctx c)))))))
 
 ;; --- equality ------------------------------------------------------------------
 
@@ -876,6 +880,13 @@
                              (let [ty (get-in ctx [:types v])] (and ty (floatless-type? ty)))))
                  (t/vars t)))))
 
+(defn- part-of-literal?
+  "Is variable x an element of literal seq t, or of a literal seq among
+  its elements -- a part of t's value, not merely named in it?"
+  [x t]
+  (when-let [es (and (= :sq (head t)) (t/elems-list (second t)))]
+    (boolean (some #(or (= x %) (part-of-literal? x %)) es))))
+
 (defn- equality [ctx a b]
   (let [ha (head a) hb (head b)]
     (cond
@@ -913,6 +924,11 @@
       (and (= :call ha) (= 'first (second a)) (= 3 (count a)) (= :lit hb) (keyword? (second b))
            (some? (tag-equality ctx a (second b))))
       (tag-equality ctx a (second b))
+      ;; a value is never one of its own proper parts: (= [:add a b] b) is
+      ;; false, every value being finite
+      (or (and (symbol? b) (part-of-literal? b a))
+          (and (symbol? a) (part-of-literal? a b)))
+      [:lit false]
       ;; a data value against a constructor literal, its tag known to be
       ;; that one: field by field, (= s [:num (nth s 1)])
       (and (not= :sq ha) (= :sq hb) (t/elems-list (second b))
@@ -1416,6 +1432,18 @@
                  [:sq (reduce (fn [e v] [:eapp [:elems v] e])
                               [:elems (last args)] (reverse (butlast args)))])
         identity (when (= 1 n) a)
+        ;; (first (rest x)), how a destructuring reads the second place of a
+        ;; variable's data value, vector or list, is (nth x 1 nil): the
+        ;; same value for each of them, a constructor of no fields too
+        first (when (and (= 1 n) (= :call (head a)) (= 'rest (second a)) (= 3 (count a))
+                         (let [x (nth a 2)
+                               ty (term-type ctx x)]
+                           (or (and (seq? ty) (contains? '#{Vec List} (first ty)))
+                               (and (map? ty) (:writ/elems ty))
+                               ;; a data value: a variable of the type, or a call
+                               ;; a proved contract says makes one
+                               (some? (data-type-of-term ctx x ty)))))
+                [:call 'nth (nth a 2) [:lit 1] t/tnil])
         (bit-shift-left bit-shift-right)
         (when (and (= 2 n) (t/int-lit? a) (t/int-lit? b) (<= 0 (second b) 62))
           [:lit ((case f bit-shift-left bit-shift-left bit-shift-right bit-shift-right)
@@ -1629,7 +1657,20 @@
           (burn! ctx)
           (if-not (:recursive? d)
             (do (swap! (:unfolded ctx) conj f) body)
-            (if (settled? ctx body)
+            (if (or (and (settled? ctx body)
+                         ;; not on a part read off another value, (nth s 2): its
+                         ;; parts would be read in turn, a level per split,
+                         ;; without end -- a recursive definition opens on a
+                         ;; constructor, not on a destructor
+                         (not-any? #(and (= :call (head %)) (contains? '#{nth first second rest next} (second %))
+                                         (not (contains? #{:sq :nil} (head (nth % 2 nil)))))
+                                   args))
+                    ;; on a constructor literal its case is decided, and the
+                    ;; calls the branch makes are on the literal's fields:
+                    ;; (simplified? [:add a b]) opens to what it says of a and b
+                    (some #(and (= :sq (head %)) (= :econs (head (second %)))
+                                (= :lit (head (nth (second %) 1))) (keyword? (second (nth (second %) 1))))
+                          args))
               (do (swap! (:unfolded ctx) conj f)
                   (when @open?
                     (swap! (:held ctx) into
@@ -2000,6 +2041,15 @@
              (swap! boolean-defs assoc nm v)
              v)))))
 
+(defn- boolean-valued?
+  "Does x give true or false and nothing else: a boolean term, a call of a
+  boolean definition, or an if of two such?  (if c (not d) true), the
+  shape an implication takes, is one, and a fact of it is its value."
+  [ctx x]
+  (or (boolean-term? x)
+      (boolean-app? ctx x)
+      (and (= :if (head x)) (boolean-valued? ctx (nth x 2)) (boolean-valued? ctx (nth x 3)))))
+
 (defn- lift-if
   "A call, of a core fn or of a definition, with an if among its
   arguments, as an if of two calls: a call runs its arguments first, so
@@ -2029,7 +2079,7 @@
       (lemma-rewrite ctx x)
       (lift-if x)
       (when (and (contains? (:facts ctx) x) (not (contains? #{:le :ieq} (head x)))
-                 (or (boolean-term? x) (boolean-app? ctx x)) (boolean? (get (:facts ctx) x)))
+                 (boolean-valued? ctx x) (boolean? (get (:facts ctx) x)))
         [:lit (get (:facts ctx) x)])
       (apply-patterns (get @indexed (rule-key x)) x)
       (computed ctx x)
