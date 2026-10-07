@@ -38,7 +38,8 @@
   (:require [writ.solve.pre :refer [negate]]
             [writ.solve.simplex :as simplex]
             [writ.solve.lra :as lra]
-            [writ.solve.cert :as cert]))
+            [writ.solve.cert :as cert]
+            [writ.work :as work]))
 
 ;; --- atoms -----------------------------------------------------------------------
 
@@ -179,14 +180,10 @@
     (aset ^objects @(:trail s) n l)
     (vreset! (:tsize s) (inc n))))
 
-(def ^:dynamic *deadline*
-  "When bound, the clock time (ms) a search must stop by: past it, the
-  budget is spent."
-  nil)
-
 (defn- budget! [s]
   (when (or (> (+ @(:conflicts s) @(:decisions s)) (:budget s))
-            (and *deadline* (> (System/currentTimeMillis) *deadline*)))
+            ;; or the law's allowance
+            (work/spend! 1))
     (throw (ex-info (str "the budget of " (:budget s) " decisions is exhausted")
                     {:writ.solve.search/budget true}))))
 

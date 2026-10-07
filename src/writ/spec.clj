@@ -5032,7 +5032,7 @@
    "writ/prove.clj" "writ/prove/term.clj" "writ/prove/rewrite.clj" "writ/prove/translate.clj"
    "writ/prove/scheme.clj" "writ/prove/check.clj" "writ/prove/smt.clj" "writ/prove/symbolic.clj"
    "writ/solve.clj" "writ/solve/pre.clj" "writ/solve/search.clj" "writ/solve/simplex.clj" "writ/solve/lra.clj" "writ/rng.clj"
-   "writ/solve/cdcl.clj" "writ/solve/cert.clj"])
+   "writ/solve/cdcl.clj" "writ/solve/cert.clj" "writ/work.clj"])
 
 (def ^:private writ-version
   "Which writ made a cache: each source by name, length and hash.  A cache
@@ -6177,8 +6177,8 @@
 
 (def ^:private more-trials-default
   "The trials a law the prover could not prove gets beyond its first
-  run, and the most time they may take, per law."
-  {:trials 900 :ms 20000})
+  run.  A count, not a time: a law gets the same trials on any machine."
+  {:trials 900})
 
 (defn- more-trials?
   "Does law r get more trials: it is only tested, or no trial met its
@@ -6193,15 +6193,13 @@
 
 (defn- extra-trials
   "Law r's further trials, a hundred at a time with the seeds after its
-  own, until it has had :trials more or :ms have passed, or its clauses
-  have each been seen both ways often enough.  {:ran :held :coverage},
-  counting those trials alone, or {:failure t :after-trials n} at the
-  first that fails."
+  own, until it has had :trials more, or its clauses have each been seen
+  both ways often enough.  {:ran :held :coverage}, counting those trials
+  alone, or {:failure t :after-trials n} at the first that fails."
   [ctx r opts]
-  (let [{extra :trials ms :ms} (merge more-trials-default
-                                     (when (map? (:more-trials opts)) (:more-trials opts)))
+  (let [{extra :trials} (merge more-trials-default
+                               (when (map? (:more-trials opts)) (:more-trials opts)))
         starved? (= :failed (:status r))
-        t0 (System/currentTimeMillis)
         base (or (:seed r) 0)
         first-run (or (:trials r) (:trials opts) 100)
         atoms (law-atoms-of r)
@@ -6212,7 +6210,7 @@
                                             atoms)))
         held0 (if starved? 0 (- first-run (or (:discarded r) 0)))]
     (loop [k 1, ran 0, held 0, cov {}]
-      (if (or (> (* 100 k) extra) (> (- (System/currentTimeMillis) t0) ms)
+      (if (or (> (* 100 k) extra)
               (covered? (merge-with (partial merge-with +) (or (:coverage r) {}) cov)
                         (+ first-run ran) (+ held0 held)))
         {:ran ran :held held :coverage cov}
@@ -6268,9 +6266,9 @@
 
 (defn- more-trials
   "A law that is only tested runs again, a hundred trials at a time
-  with the seeds after its own, until it has had :trials more or :ms
-  have passed.  So does one whose hypothesis no trial met, where the
-  solver found no input either: a rare hypothesis is met in more trials.
+  with the seeds after its own, until it has had :trials more.  So does
+  one whose hypothesis no trial met, where the solver found no input
+  either: a rare hypothesis is met in more trials.
   Over the results rs, a law's further trials kept in the
   cache by the law, the options, writ and the code they ran.  Kept, they
   are counted in with the law's first trials of this run, and not run

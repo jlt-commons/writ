@@ -18,7 +18,8 @@
             [clojure.test.check :as tc]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
-            [writ.prove.term :as t :refer [head]]))
+            [writ.prove.term :as t :refer [head]]
+            [writ.work :as work]))
 
 ;; --- structural rules --------------------------------------------------------
 ;; ?E ?A ?B ?C are element lists, ?f a fn value, any other ?x a value.
@@ -1587,11 +1588,6 @@
   debugging a rewrite that does not terminate."
   nil)
 
-(def ^:dynamic *deadline*
-  "When bound, the clock time (ms) a search must stop by: rewriting past it
-  runs out as it does out of fuel."
-  nil)
-
 (defn- burn!
   ([ctx] (burn! ctx nil))
   ([ctx x]
@@ -1599,8 +1595,8 @@
      (some-> (:burned ctx) (swap! inc))
      (when (and *last-terms* x (< left 60)) (swap! *last-terms* conj x))
      (when (neg? left) (out-of-fuel!))
-     (when (and *deadline* (zero? (bit-and left 127)) (> (System/currentTimeMillis) *deadline*))
-       (out-of-fuel!)))))
+     ;; the law's allowance spent: rewriting runs out as it does out of fuel
+     (when (work/spend! 1) (out-of-fuel!)))))
 
 (declare normalize)
 

@@ -29,7 +29,7 @@
             [writ.prove.check :as check]
             [writ.prove.smt :as smt]
             [writ.prove.symbolic :as sym]
-            [writ.solve.cdcl :as cdcl]
+            [writ.work :as work]
             [writ.prove.scheme :as sc :refer [split-foralls goal plain cases truthy? falsy?
                                                solve-eq assume-hyp subst-all instance ih-for
                                                useful-ih replace-term lemma-rules]]))
@@ -111,9 +111,10 @@
   strategies are tried in -- :order in general, :loop-order when a
   recursion of the code climbs on a law's integer."
   {:fuel 20000
-   ;; the time one law's search may take, over all its strategies: past it
-   ;; the rest are not tried, and the law is left to its tests
-   :law-ms 30000
+   ;; the steps one law's search may take, over all its strategies: each
+   ;; rewrite, solver decision and node of symbolic evaluation is one.  Past
+   ;; it the rest are not tried, and the law is left to its tests
+   :law-steps 500000
    :depth 8
    :enum-limit 16
    :plausible-samples 30
@@ -778,8 +779,8 @@
           ;; an attempt that runs out of fuel fails on its own; the others
           ;; still get their turn
           ran-out (atom false)
-          ;; when this law's search began: its budget runs from here
-          law-start (delay (System/currentTimeMillis))
+          ;; the steps this law's search may take, over all its strategies
+          left (work/allowance (:law-steps cfg))
           ;; what each attempt did, and the goals the failed ones got stuck on
           attempts (atom [])
           stuck (atom [])
@@ -787,11 +788,11 @@
                     (reset! unfolded #{}) (reset! lemmas-used #{})
                     (let [t0 (System/currentTimeMillis)
                           b0 @burned
+                          s0 (some-> left deref)
                           seen (atom [])
                           why (atom [])
                           [r outcome] (binding [*stuck* seen *case* [] sym/*why* why
-                                                rw/*deadline* (when-let [b (:law-ms cfg)] (+ @law-start b))
-                                                cdcl/*deadline* (when-let [b (:law-ms cfg)] (+ @law-start b))]
+                                                work/*left* left]
                                         (try (let [r (f)] [r (if r :proved :failed)])
                                              (catch clojure.lang.ExceptionInfo e
                                                (if (:writ.prove.rewrite/fuel (ex-data e))
@@ -799,6 +800,7 @@
                                                  (throw e)))))]
                       (swap! attempts conj (cond-> {:name nm :outcome outcome :fuel (- @burned b0)
                                                     :ms (- (System/currentTimeMillis) t0)}
+                                             left (assoc :steps (- s0 @left))
                                              ;; what symbolic evaluation could not read, or
                                              ;; what the solver answered
                                              (and (not r) (seq @why)) (assoc :why (vec (take 4 (distinct @why))))))
@@ -853,16 +855,18 @@
                   :else (in-order (:order cfg)))
           ;; one attempt at a time: the first that proves it ends the search
           ;; the solver's counterexample, of the law's variables, or nil
+          ;; on an allowance of its own: a law whose search spent its
+          ;; steps still reports one
           cex (delay (when (seq bs)
-                       (some->> (first (keep #(sym/counterexample opts (:hyps g) %) (:goals g)))
-                                (recompose bs0))))
+                       (binding [work/*left* (work/allowance (:law-steps cfg))]
+                         (some->> (first (keep #(sym/counterexample opts (:hyps g) %) (:goals g)))
+                                  (recompose bs0)))))
           ;; a law the code refutes has no proof to find: once a strategy
           ;; fails, the counterexample, confirmed by running the code there,
           ;; ends the search
           refuted (delay (boolean (and refutes? @cex (refutes? @cex))))
-          budget (:law-ms cfg)
-          out-of-time (atom false)
-          spent? #(and budget (> (- (System/currentTimeMillis) @law-start) budget) (reset! out-of-time true))
+          out-of-steps (atom false)
+          spent? #(and left (neg? @left) (reset! out-of-steps true))
           first-proof (fn [ts] (loop [[t & more] ts]
                                  (when (and t (not (spent?)))
                                    (let [r (attempt t)]
@@ -910,7 +914,7 @@
           checked (when (and trace (or lemma (seq target-used)))
                     (or replayed (check/check-proof (dissoc opts :lemmas-used :unfolded) g trace)))]
       (-> (cond
-            (nil? trace) (cond-> {:proved false :reason (cond @out-of-time "the search ran out of time"
+            (nil? trace) (cond-> {:proved false :reason (cond @out-of-steps "the search ran out of steps"
                                                               @ran-out "the search ran out of fuel"
                                                               :else "no proof found")
                                   :stuck (stuck-report @stuck @attempts)
