@@ -73,7 +73,8 @@
   the solver's certificate for it."
   (:require [writ.prove.term :as t :refer [head]]
             [writ.kind :as kind]
-            [writ.solve :as solve]))
+            [writ.solve :as solve]
+            [writ.work :as work]))
 
 (def ^:dynamic *why*
   "When bound to an atom, collects why evaluations gave up, for debugging."
@@ -81,6 +82,14 @@
 
 (defn- give-up! [why]
   (throw (ex-info (str "outside symbolic evaluation: " why) {::outside why})))
+
+(defn- step!
+  "Spend a step of the law's allowance, giving up once it is gone, as
+  rewriting and the solver run out.  A walk of a term steps at each node."
+  []
+  (when (work/spend! 1)
+    (throw (ex-info "outside symbolic evaluation: out of steps"
+                    {::outside "out of steps" ::spent true}))))
 
 ;; --- state: fresh names, definitions and constant codes -------------------------
 
@@ -112,6 +121,7 @@
 (defn- define!
   "A fresh variable standing for integer term or formula e."
   [st kind e]
+  (step!)
   (if (or (symbol? e) (integer? e) (boolean? e))
     e
     (let [v (fresh! st kind)]
@@ -1534,6 +1544,7 @@
 (defn- fold
   "An integer term with its literal parts computed: [:+ 1 2] is 3."
   [t]
+  (step!)
   (if (vector? t)
     (let [[op & xs] t
           xs (map #(if (keyword? %) % (fold %)) xs)]
@@ -2511,6 +2522,7 @@
 (defn ev
   "The value of term x under env, symbol -> value."
   [st env x]
+  (step!)
   (cond
     (symbol? x) (or (get env x) (give-up! (str "the unbound `" x "`")))
     :else

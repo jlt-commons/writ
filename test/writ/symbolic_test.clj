@@ -7,6 +7,7 @@
             [writ.prove :as prover]
             [writ.prove.symbolic :as sym]
             [writ.spec :as spec]
+            [writ.work :as work]
             [clojure.string :as str]))
 
 (require 'writ.spec-demo.shapes 'writ.spec-demo.signal 'writ.spec-demo.court 'writ.spec-demo.ledger-off)
@@ -268,3 +269,12 @@
         t0 (System/currentTimeMillis)]
     (is (sym/prove opts [] [:call '<= [:call 'count rests] [:call 'count 'as]]))
     (is (< (- (System/currentTimeMillis) t0) 10000))))
+
+(deftest an-evaluation-out-of-steps-gives-up
+  ;; evaluation spends the law's allowance as rewriting and the solver do,
+  ;; and gives up once it is gone: the same goal, wherever it is run
+  (let [opts {:types '{as (Vec Int)} :defs {} :tenv {}}
+        g [:call '<= [:call 'count [:call 'rest [:call 'rest 'as]]] [:call 'count 'as]]]
+    (is (sym/prove opts [] g))
+    (is (nil? (binding [work/*left* (work/allowance 20)] (sym/prove opts [] g))))
+    (is (sym/prove opts [] g) "a later evaluation has its own allowance")))

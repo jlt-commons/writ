@@ -14,7 +14,8 @@
   it, and replaces the split: backjumping, and a smaller proof."
   (:require [writ.solve.pre :refer [negate]]
             [writ.solve.simplex :as simplex]
-            [writ.solve.cert :as cert]))
+            [writ.solve.cert :as cert]
+            [writ.work :as work]))
 
 (def max-cuts
   "The most Gomory cuts on one branch before branch-and-bound takes over."
@@ -22,7 +23,7 @@
 
 (defn- budget! [st]
   (vswap! st update :decisions inc)
-  (when (> (:decisions @st) (:budget @st))
+  (when (or (> (:decisions @st) (:budget @st)) (work/spend! 1))
     (throw (ex-info (str "the budget of " (:budget @st) " decisions is exhausted") {::budget true}))))
 
 (defn- clause-state

@@ -5032,7 +5032,7 @@
    "writ/prove.clj" "writ/prove/term.clj" "writ/prove/rewrite.clj" "writ/prove/translate.clj"
    "writ/prove/scheme.clj" "writ/prove/check.clj" "writ/prove/smt.clj" "writ/prove/symbolic.clj"
    "writ/solve.clj" "writ/solve/pre.clj" "writ/solve/search.clj" "writ/solve/simplex.clj" "writ/solve/lra.clj" "writ/rng.clj"
-   "writ/solve/cdcl.clj" "writ/solve/cert.clj"])
+   "writ/solve/cdcl.clj" "writ/solve/cert.clj" "writ/work.clj"])
 
 (def ^:private writ-version
   "Which writ made a cache: each source by name, length and hash.  A cache

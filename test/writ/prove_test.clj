@@ -751,3 +751,18 @@
     (is (not (strict? '(let [x (inc a)] {:k x}))))
     (is (strict? '(let [x (inc a)] (if (pos? a) x 0)))
         "read on one branch only, it is kept")))
+
+(deftest a-search-out-of-steps-stops-at-the-same-place
+  ;; a law's search is bounded by steps, not time: with too few it stops,
+  ;; and two runs of it take the same steps
+  (let [target 'writ.spec-demo.numbered
+        [defs own] (prover/definitions [[target (writ.book/read-forms (#'spec/source-url target))]])
+        law {:prop '(forall [xs (Vec Nat)] (forall [i Nat] (=> (< i (count xs)) (= i (:i (nth (writ.spec-demo.numbered/number-items xs) i))))))
+             :defs defs :own own :target target :tenv {}
+             :rets {'writ.spec-demo.numbered/number-items '(Vec {:i Nat :x Nat})}}
+        short (prover/prove-law (assoc law :prover {:law-steps 50}))]
+    (is (:proved (prover/prove-law law)))
+    (is (not (:proved short)))
+    (is (= "the search ran out of steps" (:reason short)))
+    (is (= (map :steps (:attempts (prover/prove-law law)))
+           (map :steps (:attempts (prover/prove-law law)))))))
