@@ -319,12 +319,14 @@
                   (nth (:fields info) (dec k) nil)))
               (:ctors (get-in ctx [:tenv dty])))))))
 
+(declare index-inside?)
+
 (defn- term-type
   "The type of term t when its form says it: a variable's own, a list of
   a tail's elements, an element nth takes from a vector or a tail (nth
   throws, rather than give anything else; a (List T) may be nil, and nth
-  of nil is nil), a part of a Tuple, whose length is fixed, and a
-  record's value at one of its keys.  nil otherwise; never from a fn's
+  of nil is nil, unless the facts put the index inside it), a part of a
+  Tuple, whose length is fixed, and a record's value at one of its keys.  nil otherwise; never from a fn's
   signature."
   [ctx t]
   (let [list-el (fn [ty] (cond (and (seq? ty) (= 'Vec (first ty))) (second ty)
@@ -347,6 +349,9 @@
           (and (= 'get f) (= 4 (count t)) (record-type? ty) (= :lit (head i)) (contains? ty (second i)))
           (get ty (second i))
           (and (= 'nth f) (= 4 (count t)) (list-el ty)) (list-el ty)
+          ;; a list the index is inside holds an element there: it is not nil
+          (and (= 'nth f) (= 4 (count t)) (seq? ty) (= 'List (first ty)) (index-inside? ctx x i))
+          (second ty)
           (and k (not= 'get f)) (data-field-type ctx x k ty)
           :else nil)))))
 
@@ -608,6 +613,22 @@
   [ctx a b]
   (let [la (lin-of ctx a) lb (lin-of ctx b)]
     (and la lb (true? (decide-le ctx (lin->term (lin+ lb (lin* -1 la))))))))
+
+(def ^:private ^:dynamic *index-check*
+  "True while index-inside? decides a bound: the terms it reads are not
+  typed by another such check, which would nest a decision per term."
+  false)
+
+(defn- index-inside?
+  "Do the facts put index i inside x: 0 <= i < (count x)?"
+  [ctx x i]
+  (and (not *index-check*)
+       (binding [*index-check* true]
+         (let [li (lin-of ctx i)
+               lc (lin-of ctx [:call 'count x])]
+           (boolean (and li lc
+                         (true? (decide-le ctx (lin->term li)))
+                         (true? (decide-le ctx (lin->term (lin+ lc (lin* -1 (lin+ li {:c 1 :m {}}))))))))))))
 
 (defn- bounded-by-fact
   "true when a fact bounds the comparison c, (< a x) or (<= a x) where x
@@ -1638,18 +1659,16 @@
          :else false))
      true)))
 
-(defn- decided-base?
-  "Does body, a recursive definition f's with its arguments in, reach a
-  branch with no call of f by the guards the facts decide alone?  Opening
-  it then takes one step and ends, whatever its arguments are."
-  [ctx f body]
-  (loop [b body]
-    (if (= :if (head b))
-      (let [tr (truthiness ctx (normalize ctx (nth b 1)))]
-        (cond (true? tr) (recur (nth b 2))
-              (false? tr) (recur (nth b 3))
-              :else false))
-      (not-any? #(and (= :app (head %)) (= f (second %))) (t/subterms b)))))
+(defn- moving-places
+  "The places of recursive definition d, f's, that a call of itself in its
+  body passes something other than the parameter there."
+  [d f]
+  (let [ps (vec (:params d))]
+    (set (for [y (t/subterms (:body d))
+               :when (and (= :app (head y)) (= f (second y)) (= (count ps) (count (drop 2 y))))
+               [j a] (map-indexed vector (drop 2 y))
+               :when (not= a (nth ps j))]
+           j))))
 
 (defn- unfold
   "The body of definition call x, when it should be unfolded.  A recursive
@@ -1674,19 +1693,26 @@
                          ;; not on a part read off another value, (nth s 2): its
                          ;; parts would be read in turn, a level per split,
                          ;; without end -- a recursive definition opens on a
-                         ;; constructor, not on a destructor.  Unless the
-                         ;; guards the facts decide lead to a branch that
-                         ;; calls f no more: (clause-of nil (nth m i)) is [:Miss]
-                         (or (decided-base? ctx f body)
-                         (not-any? #(and (= :call (head %)) (contains? '#{nth first second rest next} (second %))
-                                         (not (contains? #{:sq :nil} (head (nth % 2 nil)))))
-                                   args)))
+                         ;; constructor, not on a destructor.  Only a place
+                         ;; the recursion moves counts: an argument passed on
+                         ;; as it is, the id of (index-of (rest ids) id) or
+                         ;; the message of (clause-of (next ps) msg), is never
+                         ;; taken apart a level per call
+                         (not-any? (fn [[j a]]
+                                     (and (contains? (moving-places d f) j)
+                                          (= :call (head a)) (contains? '#{nth first second rest next} (second a))
+                                          (not (contains? #{:sq :nil} (head (nth a 2 nil))))))
+                                   (map-indexed vector args)))
                     ;; on a constructor literal its case is decided, and the
                     ;; calls the branch makes are on the literal's fields:
-                    ;; (simplified? [:add a b]) opens to what it says of a and b
-                    (some #(and (= :sq (head %)) (= :econs (head (second %)))
-                                (= :lit (head (nth (second %) 1))) (keyword? (second (nth (second %) 1))))
-                          args))
+                    ;; (simplified? [:add a b]) opens to what it says of a and b.
+                    ;; Not beside a part of another value: (capture [:Cons ..]
+                    ;; (nth msgs i)) would open on the message's shape, a
+                    ;; split per level, where folded it is one condition
+                    (and (some #(and (= :sq (head %)) (= :econs (head (second %)))
+                                     (= :lit (head (nth (second %) 1))) (keyword? (second (nth (second %) 1))))
+                               args)
+                         (every? #(or (symbol? %) (contains? #{:lit :nil :sq} (head %))) args)))
               (do (swap! (:unfolded ctx) conj f)
                   (when @open?
                     (swap! (:held ctx) into
