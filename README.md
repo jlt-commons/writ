@@ -1250,7 +1250,7 @@ Options: `:target` checks a different implementation against the same spec,
 replays a run (default random, reported per law), and `:max-size` is the
 largest generated size (default 50). A law the prover does not prove gets
 up to 900 more trials after its first 100, a hundred at a time with the
-seeds after its own, within 20 seconds; `:more-trials {:trials n :ms t}`
+seeds after its own; `:more-trials {:trials n}`
 changes that and `:more-trials false` turns it off. `:adequacy false` skips the third
 stage, for example while a spec is still being written, and
 `:prove false` skips the prover. `:require` sets the evidence every law

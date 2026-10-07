@@ -57,6 +57,14 @@
     (is (= :tested (:status l)))
     (is (< 100 (:trials l)))))
 
+(deftest the-extra-trials-are-counted-not-timed
+  ;; how many a law gets is the same on any machine: no clock cuts them short
+  (let [trials #(:trials (law-result (spec/check 'writ.spec-demo.span-count-spec
+                                                 (merge {:seed 1 :cache false :adequacy false} %))
+                                     'overlap-is-a-shared-unit))]
+    (is (= (trials {:more-trials {:trials 300}})
+           (trials {:more-trials {:trials 300 :ms 0}})))))
+
 (deftest a-failure-in-the-extra-trials-replays-from-its-seed
   (let [miss? #(= :tested (:status (law-result (spec/check 'writ.spec-demo.span-count-spec
                                                              {:seed % :target 'writ.spec-demo.span-naive
