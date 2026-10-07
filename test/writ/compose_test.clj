@@ -168,3 +168,11 @@
   (let [r (spec/check 'writ.spec-demo.alarms-spec {:seed 7 :adequacy false})]
     (is (:ok r) (:message r))
     (is (= :proved (:status (law-result r 'cancelling-what-is-not-there-changes-nothing))) (:message r))))
+
+(deftest a-recursion-down-a-vector-of-unknown-length-stops
+  ;; tuple-binders on a (Vec Symbol) of unknown length: unfolded on, each
+  ;; level's alternatives merged into the next and ran the heap out in
+  ;; minutes; it stops as a recursion on a value of unknown shape does
+  (let [r (spec/check 'writ.spec-demo.binders-spec {:seed 7 :adequacy false :cache false})]
+    (is (:ok r) (:message r))
+    (is (< (:prover (:timings r)) 30000) (pr-str (:timings r)))))
