@@ -2272,6 +2272,12 @@
 
 (defn- opaque-in? [g] (boolean (some #{:opaque} (tree-seq coll? seq g))))
 
+(defn- unknown-length-in?
+  "Does shape g hold a vector or a map of unknown length?  A recursion on
+  one walks down it as one on a value of unknown shape does."
+  [g]
+  (boolean (some #(and (vector? %) (contains? #{:seqv :amap} (first %))) (tree-seq coll? seq g))))
+
 (declare app-body ev)
 
 (defn- component-call
@@ -2335,9 +2341,12 @@
                      (cond
                        (or (>= depth max-unfold-depth) (>= unfolds max-unfolds))
                        (str "the recursion of `" f "`, unfolded as far as it may be")
-                       ;; a call on values of unknown shape that has the shape of a
-                       ;; call around it walks into more of the same: it never ends
-                       (and (opaque-in? g) (some #{[f g]} calls))
+                       ;; a call on values of unknown shape, or of unknown length,
+                       ;; that has the shape of a call around it walks into more of
+                       ;; the same: it never ends.  Unfolded on, each level's
+                       ;; alternatives merge into the next, and the value grows
+                       ;; past any memory before max-unfolds is reached
+                       (and (or (opaque-in? g) (unknown-length-in? g)) (some #{[f g]} calls))
                        (str "the recursion of `" f "` over a value of unknown shape")
                        :else (do (swap! st assoc :unfolds (inc unfolds)) nil))))]
       (do (swap! st update :used (fnil conj #{}) f)
