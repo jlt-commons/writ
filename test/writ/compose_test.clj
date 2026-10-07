@@ -147,3 +147,17 @@
     (doseq [l '[nothing-matches a-take-is-a-clause-taking-a-message
                 a-scan-that-takes-nothing-stops-at-the-end]]
       (is (= :proved (:status (law-result r l))) (str l)))))
+
+(deftest a-place-read-from-a-list-it-is-inside-is-typed
+  ;; (nth cs-t (- i 1)) under (<= 1 i) (<= i (count cs-t)) is an element,
+  ;; and index-of, which passes its id on as it is, opens on it
+  (let [r (spec/check 'writ.spec-demo.roster-spec {:seed 7 :adequacy false})]
+    (is (:ok r) (:message r))
+    (is (= :proved (:status (law-result r 'a-child-present-has-an-index))) (:message r))))
+
+(deftest a-literal-pattern-against-a-mailbox-message-stays-folded
+  ;; (capture p-a (nth msgs i)) is split on as one condition: opened on the
+  ;; literal, it takes the message apart a split per level
+  (let [r (spec/check 'writ.spec-demo.receive-spec {:seed 7 :adequacy false})]
+    (is (:ok r) (:message r))
+    (is (= :proved (:status (law-result r 'scan-is-the-manual))) (:message r))))
