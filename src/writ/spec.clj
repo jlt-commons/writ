@@ -7062,7 +7062,10 @@
                                                               :lemmas (vec (for [{a :assumption p :prop st :status} assumed
                                                                                  :when (and a (= :held st))]
                                                                              {:name a :prop p}))})
-                                     target spec-ns (merge (:tenv imports) data-tenv) anns refs ctx))
+                                     ;; a refined field is read as its base type: the
+                                     ;; prover knows no refinement by name
+                                     target spec-ns (merge (:tenv imports) (tenv-of (mapv #(erase-data % refs) data)))
+                                     anns refs ctx))
                          ;; a law the prover could not prove rests on its
                          ;; tests alone, so it gets more of them
                          ((fn [rs] (timed :more-trials
