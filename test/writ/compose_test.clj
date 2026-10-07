@@ -161,3 +161,10 @@
   (let [r (spec/check 'writ.spec-demo.receive-spec {:seed 7 :adequacy false})]
     (is (:ok r) (:message r))
     (is (= :proved (:status (law-result r 'scan-is-the-manual))) (:message r))))
+
+(deftest a-refined-field-is-read-as-its-base-type
+  ;; the prover knows no refinement by name: a field of one, unread, kept
+  ;; (= t-h t-h) from closing an induction step
+  (let [r (spec/check 'writ.spec-demo.alarms-spec {:seed 7 :adequacy false})]
+    (is (:ok r) (:message r))
+    (is (= :proved (:status (law-result r 'cancelling-what-is-not-there-changes-nothing))) (:message r))))
