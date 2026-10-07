@@ -137,3 +137,13 @@
 (deftest two-types-may-share-a-constructor-name
   (let [r (spec/check 'writ.spec-demo.calc-spec {:seed 7 :adequacy false})]
     (is (:ok r) (:message r))))
+
+(deftest a-scan-opens-its-clauses-a-step-at-a-time
+  ;; clause-of on an empty clause list opens though its message is (nth msgs
+  ;; i), and a binding a case reads first needs no strict marker: otherwise
+  ;; each induction step unrolls the scan until the fuel runs out
+  (let [r (spec/check 'writ.spec-demo.mailbox-spec {:seed 7 :adequacy false})]
+    (is (:ok r) (:message r))
+    (doseq [l '[nothing-matches a-take-is-a-clause-taking-a-message
+                a-scan-that-takes-nothing-stops-at-the-end]]
+      (is (= :proved (:status (law-result r l))) (str l)))))
