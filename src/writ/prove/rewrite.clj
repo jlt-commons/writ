@@ -1638,6 +1638,19 @@
          :else false))
      true)))
 
+(defn- decided-base?
+  "Does body, a recursive definition f's with its arguments in, reach a
+  branch with no call of f by the guards the facts decide alone?  Opening
+  it then takes one step and ends, whatever its arguments are."
+  [ctx f body]
+  (loop [b body]
+    (if (= :if (head b))
+      (let [tr (truthiness ctx (normalize ctx (nth b 1)))]
+        (cond (true? tr) (recur (nth b 2))
+              (false? tr) (recur (nth b 3))
+              :else false))
+      (not-any? #(and (= :app (head %)) (= f (second %))) (t/subterms b)))))
+
 (defn- unfold
   "The body of definition call x, when it should be unfolded.  A recursive
   definition whose first guard is open is unfolded one level: each call
@@ -1661,10 +1674,13 @@
                          ;; not on a part read off another value, (nth s 2): its
                          ;; parts would be read in turn, a level per split,
                          ;; without end -- a recursive definition opens on a
-                         ;; constructor, not on a destructor
+                         ;; constructor, not on a destructor.  Unless the
+                         ;; guards the facts decide lead to a branch that
+                         ;; calls f no more: (clause-of nil (nth m i)) is [:Miss]
+                         (or (decided-base? ctx f body)
                          (not-any? #(and (= :call (head %)) (contains? '#{nth first second rest next} (second %))
                                          (not (contains? #{:sq :nil} (head (nth % 2 nil)))))
-                                   args))
+                                   args)))
                     ;; on a constructor literal its case is decided, and the
                     ;; calls the branch makes are on the literal's fields:
                     ;; (simplified? [:add a b]) opens to what it says of a and b

@@ -109,7 +109,13 @@
     :invoke (or (always-read? b (:fn ast)) (some #(always-read? b %) (:args ast)))
     :let (or (some (fn [[_ init]] (always-read? b init)) (:bindings ast)) (always-read? b (:body ast)))
     :do (or (some #(always-read? b %) (:stmts ast)) (always-read? b (:ret ast)))
-    (:vector :set) (boolean (some #(always-read? b %) (:items ast)))
+    (:vec :vector :set) (boolean (some #(always-read? b %) (:items ast)))
+    :map (boolean (some #(always-read? b %) (concat (:keys ast) (:vals ast))))
+    ;; a case runs its scrutinee first, or reads b in every clause
+    :case (or (always-read? b (:scrut ast))
+              (and (some? (:default ast)) (always-read? b (:default ast))
+                   (every? #(always-read? b (:body %)) (:clauses ast))))
+    :recur (boolean (some #(always-read? b %) (:args ast)))
     false))
 
 (defn- strictly

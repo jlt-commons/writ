@@ -741,3 +741,13 @@
     (is (:proved (prove '(=> (< i (count xs)) (= i (:i (nth (writ.spec-demo.numbered/number-items xs) i)))))))
     (is (:proved (prove '(=> (< i (count xs)) (= (nth xs i) (:x (nth (writ.spec-demo.numbered/number-items xs) i)))))))
     (is (not (:proved (prove '(=> (< i (count xs)) (= (inc i) (:i (nth (writ.spec-demo.numbered/number-items xs) i))))))))))
+
+(deftest a-binding-read-on-every-path-is-not-marked
+  ;; (strict init body) keeps a binding that may go unread; one the body
+  ;; reads first -- a case's scrutinee, an element of a literal -- runs there
+  (let [strict? #(boolean (some #{'writ.prove.term/strict} (flatten (lowered '[a] %))))]
+    (is (not (strict? '(let [x (inc a)] (case x 1 :one :other)))))
+    (is (not (strict? '(let [x (inc a)] [x 1]))))
+    (is (not (strict? '(let [x (inc a)] {:k x}))))
+    (is (strict? '(let [x (inc a)] (if (pos? a) x 0)))
+        "read on one branch only, it is kept")))
