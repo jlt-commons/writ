@@ -923,6 +923,18 @@
 (defn- seq-first [st s]
   (let [[in v] (seq-nth st s 0)] (merge-values st in v {:nil true})))
 
+(defn- term-name!
+  "A variable for integer term e, the same one each time e is named: a
+  term that names another twice, named, stays small when it is built on."
+  [st e]
+  (let [e (fold e)]
+    (if (or (symbol? e) (integer? e))
+      e
+      (or (get-in @st [:term-names e])
+          (let [v (define! st :int e)]
+            (swap! st assoc-in [:term-names e] v)
+            v)))))
+
 (defn- seq-rest
   "s without its first element, a seq."
   [st s]
@@ -931,7 +943,10 @@
         ;; the same term however often it is taken
         some? [:> len 0]]
     (if (empty? sfx)
-      {:seqv (assoc (:seqv s) :off (fold [:+ off [:ite some? 1 0]]) :len (fold [:ite some? [:- len 1] 0]) :kind :seq)}
+      ;; the length is named: it reads len twice, and a rest of the rest
+      ;; would read that twice again
+      {:seqv (assoc (:seqv s) :off (term-name! st [:+ off [:ite some? 1 0]])
+                    :len (term-name! st [:ite some? [:- len 1] 0]) :kind :seq)}
       (union-of st [[some? {:seqv (assoc (:seqv s) :off (fold [:+ off 1]) :len (fold [:- len 1]) :kind :seq)}]
                     [[:not some?] {:seqv (assoc (:seqv s) :len 0 :sfx (vec (rest sfx)) :kind :seq)}]]))))
 

@@ -259,3 +259,12 @@
       (is (nil? (sym/formula (dissoc opts :rets) [] [:call '<= [:lit 0] [:app q 'f]]))))
     (testing "nor where a throw must be ruled out"
       (is (nil? (sym/formula (assoc opts :total true) [] [:call '<= [:lit 0] [:app q 'f]]))))))
+
+(deftest the-rest-of-a-rest-stays-small
+  ;; each rest names the length it leaves once, so forty of them make a
+  ;; term forty steps long, not one that doubles at each
+  (let [opts {:types '{as (Vec Int)} :defs {} :tenv {}}
+        rests (nth (iterate (fn [t] [:call 'rest t]) 'as) 40)
+        t0 (System/currentTimeMillis)]
+    (is (sym/prove opts [] [:call '<= [:call 'count rests] [:call 'count 'as]]))
+    (is (< (- (System/currentTimeMillis) t0) 10000))))
