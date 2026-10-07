@@ -1881,8 +1881,15 @@
                   :seed seed :max-size max-size)]
         (if (:pass? res)
           {:law name :status :failed :counterexample {} :seed (:seed res)
-           :detail [[(list 'exists (vec (apply concat ebs)) '...)
-                     (str "no witness among " (:num-tests res) " generated values")]]}
+           :detail (cond-> [[(list 'exists (vec (apply concat ebs)) '...)
+                             (str "no witness among " (:num-tests res) " generated values")]]
+                     ;; one the spec gave and the law did not take: say so,
+                     ;; or a wrong one looks like none at all
+                     witness (conj [(list 'exists (vec (apply concat ebs)) '...)
+                                    (str "the witness the graph gives, " (pr-str witness) ", is not one"
+                                         (when (not= (count xs) (count witness))
+                                           (str ": it has " (count witness) " values for "
+                                                (count xs) " variables")))]))}
           {:law name :status :witnessed :seed (:seed res)
            :witness (zipmap xs (get-in res [:shrunk :smallest]))}))
 
