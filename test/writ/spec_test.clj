@@ -483,7 +483,12 @@
       (is (str/includes? (:message r) "no generated msg does"))))
   (testing "and is taken by the witness the graph gives"
     (let [r (spec/check 'writ.spec-demo.tagged-with-spec {:seed 42 :prove false :adequacy false})]
-      (is (:ok r) (:message r)))))
+      (is (:ok r) (:message r))))
+  (testing "one that is not a witness is reported, not passed over"
+    (let [r (spec/check 'writ.spec-demo.tagged-bad-witness-spec {:seed 42 :prove false :adequacy false})]
+      (is (not (:ok r)))
+      (is (str/includes? (:message r) "the witness the graph gives, [[\"ab\" 1] \"ab\"], is not one")
+          (:message r)))))
 
 (deftest mermaid-draws-the-call-graph
   (let [m (spec/mermaid 'writ.spec-demo.pipeline)]
