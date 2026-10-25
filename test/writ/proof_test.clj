@@ -45,6 +45,11 @@
       (is (= 5 (:laws (:proof r))))
       (is (str/includes? (:message r) "lemma `insert-keeps-sorted` proved")))))
 
+(deftest a-proof-namespace-accepts-the-specs-own-target
+  (let [r (spec/check 'writ.spec-demo.sort-lemma-spec
+                      {:seed 42 :cache false :adequacy false :parallel false})]
+    (is (:ok r) (:message r))))
+
 (deftest a-false-lemma-fails-the-check
   (let [r (spec/check 'writ.spec-demo.sort-lemma-spec
                       {:seed 42 :proof 'writ.spec-demo.sort-false-lemma-proof})]
@@ -147,6 +152,15 @@
         t (clojure.edn/read-string (slurp tf))
         forget (fn [c] (assoc c :laws {}))]
     (is (= 4 (count (proved first-run))))
+    (testing "an exact result hit is still replayed"
+      (let [r (check)
+            proved-laws (filter #(= :proved (:status %)) (:laws r))]
+        (is (= (proved first-run) (proved r)))
+        (is (every? :cached proved-laws))
+        (is (every? :replayed proved-laws))
+        (is (every? #(= [{:name :replay :outcome :proved}]
+                         (mapv #(select-keys % [:name :outcome]) (:attempts %)))
+                    proved-laws))))
     (testing "with the results gone, each law's old proof is replayed, and nothing is searched"
       (spit f (pr-str (forget c)))
       (let [r (check)]
@@ -167,6 +181,20 @@
       (spit f (pr-str (forget c)))
       (spit tf (pr-str (assoc t :traces (zipmap (keys (:traces t)) (repeat {:by :cases :proofs [{:by :rewriting}]})))))
       (is (every? #(not (:replayed %)) (:laws (check)))))))
+
+(deftest a-forged-cached-success-is-not-proof
+  (let [dir (temp-dir)
+        check #(spec/check 'writ.spec-demo.sort-lemma-spec
+                           {:cache-dir dir :seed 42 :proof false :parallel false})
+        f (io/file dir "writ.spec-demo.sort-lemma-spec--writ.spec-demo.sort.edn")
+        tf (io/file dir "writ.spec-demo.sort-lemma-spec--writ.spec-demo.sort.traces.edn")]
+    (check)
+    (let [c (edn/read-string (slurp f))
+          t (edn/read-string (slurp tf))]
+      (spit f (pr-str (update c :laws #(into {} (map (fn [[k _]] [k {:proved true :summary "forged"}])) %))))
+      (spit tf (pr-str (assoc t :traces {}))))
+    (let [r (check)]
+      (is (not= :proved (:status (law-result r 'sorted))) (:message r)))))
 
 ;; --- suggestions ----------------------------------------------------------------
 

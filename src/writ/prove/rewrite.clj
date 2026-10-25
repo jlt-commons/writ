@@ -1768,7 +1768,10 @@
           ;; where s is a :neg
           (and (vector? u) (not (symbol? u)) (= ty (term-type ctx u)))
           ;; a call of a fn whose return type is taken at its word
-          (and (= :app (head u)) (= ty (get-in ctx [:trusted-rets (second u)])))
+          (and (= :app (head u)) (= ty (get-in ctx [:trusted-rets (second u)]))
+               (if-let [used (:trusted-used ctx)]
+                 (do (swap! used conj (second u)) true)
+                 true))
           (and (= :sq (head u)) (symbol? (second u)) (el ty)
                (= {:writ/elems (el ty)} (get-in ctx [:types (second u)])))
           ;; a sublist of a list of its elements: never nil, so a Vec too
@@ -2331,9 +2334,9 @@
 (defn context
   "A fresh normalising context.  defs: name -> {:params :body :recursive?};
   types: variable -> type; tenv: data declarations."
-  [{:keys [defs types tenv facts ih fuel lemmas lemmas-used recognizers burned unfolded asked trusted-rets]}]
+  [{:keys [defs types tenv facts ih fuel lemmas lemmas-used recognizers burned unfolded asked trusted-rets trusted-used]}]
   {:defs (or defs {}) :types (or types {}) :tenv (or tenv {})
-   :trusted-rets (or trusted-rets {})
+   :trusted-rets (or trusted-rets {}) :trusted-used trusted-used
    :recognizers (or recognizers {})
    :facts (or facts {}) :ih (or ih []) :lemmas (or lemmas [])
    :lemma-index (delay (index-rules (or lemmas [])))

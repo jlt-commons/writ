@@ -2315,6 +2315,8 @@
     (when-not (and term (= (count params) (count vs)))
       (give-up! (str "the :requires of `" f "`, which the prover cannot read")))
     (record-throw! st [:not (truth (ev st (zipmap params vs) term))]))
+  (when-let [used (:trusted-used @st)]
+    (swap! used conj f))
   (let [ret (get-in @st [:trusted-rets f])
         ts (map flat vs)
         base (if (every? some? ts)
@@ -2573,12 +2575,13 @@
   "{:formula :decls} saying that under hyps, goal g is truthy, for every
   value of the typed variables -- and, when opts has :total, that its
   evaluation never throws; nil when some part is outside."
-  [{:keys [types defs tenv total lenient rets trusted-rets requires]} hyps g]
+  [{:keys [types defs tenv total lenient rets trusted-rets trusted-used requires]} hyps g]
   (try
     (let [st (state)
           facts (atom [])
           _ (swap! st assoc :defs-of defs :tenv tenv :total total :rets (or rets {})
-                   :trusted-rets (or trusted-rets {}) :requires (or requires {}))
+                   :trusted-rets (or trusted-rets {}) :trusted-used trusted-used
+                   :requires (or requires {}))
           occurs (reduce into (t/vars g) (map t/vars hyps))
           env (into {} (for [v (sort-by str (keys types)) :when (contains? occurs v)]
                          [v (var-value st facts (get types v) tenv v)]))
