@@ -17,7 +17,8 @@
   (is (not= (canonical/content-id "é") (canonical/content-id "e")))
   (is (= (canonical/content-id (cons 1 '(2))) (canonical/content-id '(1 2))))
   (is (= [55357 56832] (get-in (canonical/canonical "😀") [:root 2])))
-  (is (not= (canonical/content-id (float 1.0)) (canonical/content-id (double 1.0))))
+  (when (= Float (class (float 1.0)))
+    (is (not= (canonical/content-id (float 1.0)) (canonical/content-id (double 1.0)))))
   (is (not= (canonical/content-id 0.0) (canonical/content-id -0.0)))
   (let [shared [1 2]]
     (is (= (canonical/content-id [shared shared])

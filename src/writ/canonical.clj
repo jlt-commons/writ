@@ -28,8 +28,8 @@
     (char? value) (tagged :char (int value))
     (ratio? value) (tagged :ratio [(str (numerator value)) (str (denominator value))])
     (integer? value) (tagged :integer (str value))
-    (instance? Float value) (tagged :float32 (Float/floatToIntBits value))
-    (instance? Double value) (tagged :float64 (Double/doubleToLongBits value))
+    (= Float (class value)) (tagged :float32 (Float/floatToIntBits value))
+    (= Double (class value)) (tagged :float64 (Double/doubleToLongBits value))
     :else (throw (ex-info "Unsupported value in canonical proof encoding"
                           {:value value :class (some-> value class str)}))))
 
