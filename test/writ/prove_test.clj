@@ -435,10 +435,10 @@
   (require 'writ.spec-demo.tree)
   (let [[defs] (prover/definitions [['writ.spec-demo.tree
                                      (writ.book/read-forms (clojure.java.io/resource "writ/spec_demo/tree.clj"))]])
-        rules (prover/prove-contracts {:defs defs :tenv tree-tenv
-                                       :sigs '{writ.spec-demo.tree/insert {:params [Nat Tree] :ret Tree}
-                                               writ.spec-demo.tree/to-list {:params [Tree] :ret (List Nat)}
-                                               writ.spec-demo.tree/size {:params [Tree] :ret Nat}}})]
+        rules (:rules (prover/prove-contracts {:defs defs :tenv tree-tenv
+                                                :sigs '{writ.spec-demo.tree/insert {:params [Nat Tree] :ret Tree}
+                                                        writ.spec-demo.tree/to-list {:params [Tree] :ret (List Nat)}
+                                                        writ.spec-demo.tree/size {:params [Tree] :ret Nat}}}))]
     (is (= '#{insert%contract to-list%contract size%contract size%nonneg%contract}
            (set (map :name rules))))))
 
@@ -449,11 +449,11 @@
                 (defn total [xs] (if (seq xs) (+ (first xs) (total (rest xs))) 0))
                 (defn half-str [s] (str s))]
         [defs] (prover/definitions [['c.nums forms]])
-        rules (prover/prove-contracts {:defs defs :tenv {}
-                                       :sigs '{c.nums/twice {:params [Int] :ret Int}
-                                               c.nums/down {:params [Nat] :ret Nat}
-                                               c.nums/total {:params [(List Nat)] :ret Nat}
-                                               c.nums/half-str {:params [Int] :ret Int}}})
+        rules (:rules (prover/prove-contracts {:defs defs :tenv {}
+                                                :sigs '{c.nums/twice {:params [Int] :ret Int}
+                                                        c.nums/down {:params [Nat] :ret Nat}
+                                                        c.nums/total {:params [(List Nat)] :ret Nat}
+                                                        c.nums/half-str {:params [Int] :ret Int}}}))
         names (set (map :name rules))]
     (testing "an Int return is an integer"
       (is (contains? names 'twice%contract)))

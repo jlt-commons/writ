@@ -738,12 +738,13 @@
   Returns {:proved true :trace :summary :lemmas} or {:proved false :reason
   :stuck}, and :attempts, what each strategy tried did: {:name :outcome
   :fuel :ms}, the outcome :proved, :failed, :fuel or :rejected."
-  [{:keys [prop defs tenv target own fuel lemmas rets trusted-rets component-requires total hint lemma sigs contracts replay prover guards sym-budget refutes? counterexample-only] :as args}]
+  [{:keys [prop defs tenv target spec-ns own fuel lemmas rets trusted-rets component-requires total hint lemma sigs contracts replay replay-only prover guards sym-budget refutes? counterexample-only assumption-contracts assumption-lemmas] :as args}]
   (try
     (let [cfg (merge default-config prover)
           {:keys [bs0 bs g recs defs]} (law-setup args)
           unfolded (atom #{})
           lemmas-used (atom #{})
+          trusted-used (atom #{})
           ;; what a lemma added later would need to change the search: the
           ;; terms lemmas were tried on, and whether the rules were read
           ;; for a loop to climb, and named none
@@ -759,7 +760,8 @@
                 ;; same goal whole ask the solver once
                 :sym-memo (atom {})
                 :sym-budget sym-budget
-                :unfolded unfolded :fuel (or fuel (:fuel cfg)) :lemmas-used lemmas-used :asked asked
+                :unfolded unfolded :fuel (or fuel (:fuel cfg)) :lemmas-used lemmas-used
+                :trusted-used trusted-used :asked asked
                 :depth (:depth cfg) :enum-limit (:enum-limit cfg) :plausible-samples (:plausible-samples cfg)
                 :rets (or rets {}) :trusted-rets (or trusted-rets {}) :burned burned
                 ;; each component fn's :requires, as a term of its parameters
@@ -785,7 +787,7 @@
           attempts (atom [])
           stuck (atom [])
           attempt (fn [[nm f]]
-                    (reset! unfolded #{}) (reset! lemmas-used #{})
+                    (reset! unfolded #{}) (reset! lemmas-used #{}) (reset! trusted-used #{})
                     (let [t0 (System/currentTimeMillis)
                           b0 @burned
                           s0 (some-> left deref)
@@ -844,6 +846,7 @@
                   :climbing climbing :structural structural :induction induction}
           in-order (fn [ks] (mapcat groups ks))
           tries (cond
+                  replay-only []
                   ;; that nothing throws is known only from running the code
                   ;; symbolically, where every throw is noted
                   total symbolic
@@ -857,7 +860,7 @@
           ;; the solver's counterexample, of the law's variables, or nil
           ;; on an allowance of its own: a law whose search spent its
           ;; steps still reports one
-          cex (delay (when (seq bs)
+          cex (delay (when (and (not replay-only) (seq bs))
                        (binding [work/*left* (work/allowance (:law-steps cfg))]
                          (some->> (first (keep #(sym/counterexample opts (:hyps g) %) (:goals g)))
                                   (recompose bs0)))))
@@ -887,10 +890,10 @@
                          c)))
           [trace used] (cond
                          replayed [replay (:unfolded replayed)]
-                         counterexample-only [nil #{}]
+                         (or counterexample-only replay-only) [nil #{}]
                          :else (or (first-proof tries) [nil #{}]))
           ;; a fold into an accumulator: prove it adds, then try again with that
-          [trace used] (if (or trace counterexample-only @refuted)
+          [trace used] (if (or trace counterexample-only replay-only @refuted)
                          [trace used]
                          (or (first
                                (for [cand (accumulators opts (fuelled
@@ -926,12 +929,18 @@
             (not (:ok checked)) (do (swap! attempts #(conj (pop %) (assoc (peek %) :outcome :rejected)))
                                     {:proved false
                                      :reason (str "the proof checker rejected the proof: " (:reason checked))})
-            :else (let [cited (sort (remove #(or (contains? synthetic-lemmas %) (contract? %)) @lemmas-used))]
+            :else (let [cited (sort (remove #(or (contains? synthetic-lemmas %) (contract? %)) @lemmas-used))
+                        assumptions (-> (set (map #(str "assume." %)
+                                                  (keep (or assumption-contracts {}) @lemmas-used)))
+                                        (into (map #(str "assume." spec-ns "/" %)
+                                                   (filter (or assumption-lemmas #{}) @lemmas-used)))
+                                        (into (map #(str "assume." %) @trusted-used)))]
                     {:proved true :trace trace
                      :summary (str (summary trace)
                                    (when total ", and it never throws")
                                    (when (seq cited) (str ", citing " (str/join ", " cited))))
-                     :lemmas (vec cited)}))
+                     :lemmas (vec cited)
+                     :assumptions-used (vec (sort assumptions))}))
           (cond-> replayed (assoc :replayed true))
           (assoc :attempts @attempts)))
     (catch clojure.lang.ExceptionInfo e
@@ -1038,14 +1047,17 @@
   Callees go first, so a fn may lean on the contracts of the fns it
   calls; one that fails is tried again only once a fn its code reaches
   has a new contract.  Each proof is replayed by the checker.
-  Returns the proved contracts as lemma rules."
-  [{:keys [defs tenv sigs fuel]}]
+  Returns {:rules :traces :replay-errors}, with only contracts whose proof
+  was replayed in this run. Supplied traces are candidates; :replay-only
+  rejects a supplied trace that fails and never searches. Callers compare
+  the expected and actual contract sets to detect missing evidence."
+  [{:keys [defs tenv sigs fuel traces replay-only]}]
   (let [recs (sc/recognizers tenv (types-of [] [] sigs))
         defs (merge defs (:defs recs))
         goal (fn [f ps types nm check & [after]]
                (let [call (into [:app f] ps)
                      pat (into [:app f] (map #(symbol (str "?" %)) ps))]
-                 [[f nm] {:types types :ps ps :after after
+                 [[f nm] {:key [f nm] :types types :ps ps :after after
                           :g {:hyps [] :goals [(t/subst check {'%x call})]}
                           :rule {:name (symbol (str (name f) nm))
                                  :vars (set (map #(symbol (str "?" %)) ps))
@@ -1070,25 +1082,37 @@
                                             [:call '<= [:lit 0] '%x] [f "%contract"])))
                               :else [])]
                       g))
-        attempt (fn [rules {:keys [types ps g]}]
+        attempt (fn [rules {:keys [key types ps g]}]
                   (let [opts {:defs defs :tenv tenv :types types :recognizers recs
                               :unfolded (atom #{}) :lemmas-used (atom #{}) :fuel (or fuel 20000)
                               :lemmas rules :rets {}}
-                        ;; a bound the code climbs to goes first: rewriting
-                        ;; would unroll the loop a split at a time, the goal
-                        ;; doubling at each test it cannot decide.  Each
-                        ;; attempt on its own fuel, so one that runs out
-                        ;; leaves the next its turn
-                        trace (or (first (for [p ps
-                                               :when (contains? '#{Nat Int} (plain (types p)))
-                                               e (or (fuelled #(climbing-bounds opts (:goals g) p)) [])
-                                               :let [r (fuelled #(by-climbing opts g p (types p) e))]
-                                               :when r]
-                                           r))
-                                  (fuelled #(some->> (prove-all opts g) (hash-map :by :cases :proofs)))
-                                  (first (keep (fn [p] (fuelled #(by-induction opts g p (types p)))) ps)))]
-                    (when (and trace (:ok (check/check-proof (dissoc opts :lemmas-used :unfolded) g trace)))
-                      trace)))
+                        checked (fn [trace]
+                                  (when trace
+                                    (try
+                                      (when (:ok (check/check-proof (dissoc opts :lemmas-used :unfolded) g trace))
+                                        trace)
+                                      (catch Throwable _ nil))))
+                        supplied (get traces key)
+                        trace (or (checked supplied)
+                                  (when-not replay-only
+                                    ;; a bound the code climbs to goes first: rewriting
+                                    ;; would unroll the loop a split at a time, the goal
+                                    ;; doubling at each test it cannot decide.  Each
+                                    ;; attempt on its own fuel, so one that runs out
+                                    ;; leaves the next its turn
+                                    (checked
+                                     (or (first (for [p ps
+                                                      :when (contains? '#{Nat Int} (plain (types p)))
+                                                      e (or (fuelled #(climbing-bounds opts (:goals g) p)) [])
+                                                      :let [r (fuelled #(by-climbing opts g p (types p) e))]
+                                                      :when r]
+                                                  r))
+                                         (fuelled #(some->> (prove-all opts g) (hash-map :by :cases :proofs)))
+                                         (first (keep (fn [p] (fuelled #(by-induction opts g p (types p)))) ps))))))]
+                    (cond
+                      trace {:trace trace}
+                      (and replay-only supplied) {:error {:contract key :reason :rejected}}
+                      :else nil)))
         ;; the fns each fn's code calls, itself and transitively
         callees (fn [f] (set (keep #(when (= :app (head %)) (second %))
                                    (some-> (get defs f) :body t/subterms))))
@@ -1105,25 +1129,28 @@
         usable (fn [f proved] (set (filter (fn [[g]] (contains? (reach f) g)) proved)))]
     ;; a goal that failed is tried again only once a fn its code reaches
     ;; has a new contract: nothing else changes what it can prove
-    (loop [rules [] proved #{} tried {} todo order]
-      (let [[rules proved tried]
-            (reduce (fn [[rules proved tried] [f :as k]]
+    (loop [rules [] proved #{} tried {} proofs {} errors [] todo order]
+      (let [[rules proved tried proofs errors]
+            (reduce (fn [[rules proved tried proofs errors] [f :as k]]
                       (let [x (get goals k)
                             have (usable f proved)]
                         (if (or (and (:after x) (not (contains? proved (:after x))))
                                 (= have (get tried k)))
-                          [rules proved tried]
-                          (if (attempt rules x)
-                            [(conj rules (:rule x)) (conj proved k) tried]
-                            [rules proved (assoc tried k have)]))))
-                    [rules proved tried] todo)
+                          [rules proved tried proofs errors]
+                          (let [{:keys [trace error]} (attempt rules x)]
+                            (cond
+                              trace [(conj rules (:rule x)) (conj proved k) tried
+                                     (assoc proofs k trace) errors]
+                              error [rules proved (assoc tried k have) proofs (conj errors error)]
+                              :else [rules proved (assoc tried k have) proofs errors])))))
+                    [rules proved tried proofs errors] todo)
             left (vec (remove proved todo))]
         (if (or (= (count left) (count todo))
                 (not-any? (fn [[f :as k]]
                             (not= (get tried k) (usable f proved)))
                           left))
-          rules
-          (recur rules proved tried left))))))
+          {:rules rules :traces proofs :replay-errors errors}
+          (recur rules proved tried proofs errors left))))))
 
 (defn contract-rules
   "The contracts of fns whose signatures are taken as given, not proved:
