@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add observable lemma-reuse diagnostics, measured held-out reuse evaluation, and a pinned trusted-base inventory, then ship opt-in shared proof bundles only if they pass the approved size and replay-overhead gate.
+**Goal:** Add observable lemma-reuse diagnostics, measured held-out reuse evaluation, and a pinned trusted-base inventory, then make shared schema-2 proof bundles the sole new export format if they pass the approved size and replay-overhead gate.
 
 **Architecture:** Preserve Writ's existing proof and bundle semantics. Extend the suggestion-only reuse path and existing bench entry points, pin trusted sources with tested hashes, and decode any shared bundle back to the existing schema-1 artifact before replay.
 
@@ -16,7 +16,7 @@
 - Use Beads for task tracking under epic `writ-ajr`; write failing focused tests before implementation.
 - Add no dependencies and do not adopt Rainbow's kernel, binary bundles, lifecycle system, or mathematical corpus.
 - Ordinary proving and lemma eligibility remain unchanged; ranked reuse stays suggestion-only and candidates still require checked proofs.
-- Schema-1 reading and default writing remain compatible; schema 2 ships only at least 50% total byte reduction, less than 10% per-bundle verification slowdown, and identical successful replay.
+- Schema-1 verification remains compatible; if accepted, schema 2 becomes the sole new export format after demonstrating at least 50% total byte reduction, less than 10% per-bundle verification slowdown, and identical successful replay.
 - Do not claim benchmark timing as correctness evidence. All proof and tamper tests must pass independently of benchmarks.
 
 ## Review Focus
@@ -24,7 +24,7 @@
 - A malformed shared node graph can contain forward references, cycles, unknown tags, or duplicate roots: reject it before replay (Task 4 malformed-input tests).
 - Disabling retrieval must not disable other suggestion strategies or reset their budget differently (Task 2 fallback tests).
 - One unnormalizable lemma must not hide other lemmas or make diagnostics nondeterministic (Task 1 mixed-index tests).
-- Adding schema 2 must not change default `:bundle` output or schema-1 verification (Task 4 compatibility tests).
+- Adding schema 2 must preserve schema-1 verification while making all new exports schema 2, with no parallel output option (Task 4 compatibility tests).
 - A trusted-source edit must fail the manifest test, while the documentation must not present the hash as a soundness proof (Task 3 drift test and documentation review).
 
 ---
@@ -151,21 +151,21 @@ Link the inventory from `README.md`'s proof-checking discussion and explain the 
 **Interfaces:**
 - Candidate: `(bundle/share schema-1-artifact)` returns a schema-2 shared EDN envelope; `(bundle/unshared envelope)` reconstructs the exact schema-1 artifact.
 - Candidate: `(bundle/verify path-or-map)` dispatches schema 1 or decoded schema 2, then uses the same replay-only verifier.
-- If accepted: `spec/check` keeps `:bundle "path"` plain and accepts `:bundle-format :shared` for schema 2.
+- If accepted: `spec/check :bundle` writes schema 2 by default, with no format option; schema 1 remains verification-only.
 - Measurement: `(writ.bundle-bench/measure specs iterations)` reports per-spec bytes, median read/decode/verify milliseconds, replay status, and gate totals.
 
 - [ ] **Step 1: Write candidate codec and compatibility tests**
 
-Test structural sharing of repeated terms, exact round trips for every supported literal and collection type, independent replay, dependencies, and recomputed-ID tampering. Add malformed cases for unknown tags, forward/out-of-range references, cycles, duplicate roots, and malformed nodes. Assert plain export remains schema 1.
+Test structural sharing of repeated terms, exact round trips for every supported literal and collection type, independent replay, dependencies, and recomputed-ID tampering. Add malformed cases for unknown tags, forward/out-of-range references, cycles, duplicate roots, and malformed nodes. During candidate measurement, assert the existing plain export remains schema 1.
 
 - [ ] **Step 2: Run the candidate tests and verify failure**
 
 Run: `jolt -M:test --run writ.bundle-test`
-Expected: FAIL because shared encoding and format selection do not exist.
+Expected: FAIL because shared encoding does not exist.
 
-- [ ] **Step 3: Implement the candidate shared codec without changing the default**
+- [ ] **Step 3: Implement the candidate shared codec without changing the default yet**
 
-Encode distinct canonical nodes once in a positional table with children restricted to earlier positions. Decode to the original schema-1 artifact and route it through existing verification; reject malformed graphs before replay. Keep `:bundle` output plain. Add the real-export measurement runner for `sort-proved-spec`, `tree-spec`, `index-spec`, `cells-spec`, and composed `shop-spec`, with fixed seeds, cache off, serial verification, warm-up, and at least five measured iterations.
+Encode distinct canonical nodes once in a positional table with children restricted to earlier positions. Decode to the original schema-1 artifact and route it through existing verification; reject malformed graphs before replay. Keep `:bundle` output plain during measurement. Add the real-export measurement runner for `sort-proved-spec`, `tree-spec`, `index-spec`, `cells-spec`, and composed `shop-spec`, with fixed seeds, cache off, serial verification, warm-up, and at least five measured iterations.
 
 - [ ] **Step 4: Run codec tests and measure the gate**
 
@@ -177,13 +177,13 @@ Expected: every plain and decoded-shared bundle replays successfully. Record per
 
 Decision: proceed only if total shared bytes are at most 50% of plain bytes and every shared end-to-end verification median is less than 110% of its plain median. If not, remove the candidate codec, runner, and candidate-only tests; keep the measurements and document the rejected schema 2, then commit the negative result with `bench: measure shared proof bundle encoding` and skip the remaining steps.
 
-- [ ] **Step 5: If accepted, expose opt-in schema 2 and complete compatibility tests**
+- [ ] **Step 5: If accepted, make schema 2 the sole new export and complete compatibility tests**
 
-Add `:bundle-format :shared`, public conversion helpers, and schema-dispatching verification while retaining plain defaults. Run `jolt -M:test --run writ.bundle-test writ.assumption-profile-test`; expect PASS. Document the format, conversion, measured result, and compatibility guarantee in `README.md`.
+Change `:bundle` to write schema 2, add public conversion helpers and schema-dispatching verification, and retain schema-1 verification without adding an output option. Update the earlier export assertions to require schema 2. Run `jolt -M:test --run writ.bundle-test writ.assumption-profile-test`; expect PASS. Document the default format, conversion, measured result, and compatibility guarantee in `README.md`.
 
 - [ ] **Step 6: Commit the accepted result**
 
-Commit the codec, measurement runner/results, tests, spec option, and documentation with `feat: add opt-in shared proof bundles`.
+Commit the codec, measurement runner/results, tests, default export change, and documentation with `feat: make shared proof bundles the default`.
 
 ### Task 5: Full Verification, Beads, and Pull Request
 

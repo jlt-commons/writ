@@ -10,7 +10,7 @@ The Rainbow comparison found four applicable proof-engineering practices that do
 2. Add an equal-workload, equal-budget benchmark for ranked lemma reuse on tuning and held-out spec corpora, including actual lemma citations and quarantine counts.
 3. Publish a precise trusted-base inventory and a test that makes changes to trusted files deliberate.
 4. Measure schema-1 and candidate shared schema-2 bundles from real passing specs. Adopt shared EDN only when total serialized size falls by at least 50% and per-bundle end-to-end verification is less than 10% slower, with identical successful replay.
-5. Preserve schema-1 reading and writing, all existing proof semantics, and the existing default suggestion behavior.
+5. Preserve schema-1 verification for existing artifacts and all existing proof semantics. If schema 2 passes, make it the only format written by new `:bundle` exports.
 
 ## Non-goals and anti-goals
 
@@ -18,16 +18,16 @@ The Rainbow comparison found four applicable proof-engineering practices that do
 - Do not make retrieval, quarantine metadata, content IDs, benchmark results, or cached reports trusted evidence.
 - Do not change which lemmas are eligible, allow additional assumptions, or run ranked reuse during ordinary proving.
 - Do not add dependencies, Z3, a second proof semantics, or automatic quarantine/ranking based on benchmark popularity.
-- Do not remove or replace schema-1 bundles, and do not make schema-2 the default output in this project.
+- Do not remove schema-1 verification or add a persistent plain/shared output option. Schema 2 becomes the sole new export format only after it passes the gate.
 - Do not modify the pre-existing untracked `blog.md` or `.beads.gate.lock`.
 
 ## Constraints
 
-Use jolt, the existing dependencies, Beads, and current test and benchmark conventions. Each implementation change starts with focused failing tests. Retrieval remains suggestion-only and every candidate still requires a checked proof. Bundle decoding is untrusted: malformed references are rejected and decoded evidence passes the existing replay-only verifier. The user approved one conditional epic and the bundle gate above; if the gate fails, remove the experimental encoder and record the negative result rather than shipping it.
+Use jolt, the existing dependencies, Beads, and current test and benchmark conventions. Each implementation change starts with focused failing tests. Retrieval remains suggestion-only and every candidate still requires a checked proof. Bundle decoding is untrusted: malformed references are rejected and decoded evidence passes the existing replay-only verifier. The user approved one conditional epic and the bundle gate above, then chose schema 2 as the default new export format if accepted; if the gate fails, remove the experimental encoder and record the negative result rather than shipping it.
 
 ## Approaches
 
-- **Chosen: one conditional epic with additive, opt-in formats and controls.** Implement diagnostics, benchmarking, and the trusted-base inventory; measure a candidate shared encoding; retain schema 2 only if it passes. This covers the requested investigation without weakening compatibility.
+- **Chosen: one conditional epic with backward-compatible reading and a clean default.** Implement diagnostics, benchmarking, and the trusted-base inventory; measure a candidate shared encoding; if it passes, export only schema 2 while continuing to verify schema 1. This covers the requested investigation without maintaining two output paths.
 - **Split bundle work into a later epic:** narrower initial PR, but rejected because the user explicitly requested the measurement and conditional port in this branch and PR.
 - **Adopt Rainbow's full bundle and reuse machinery:** rejected as incompatible scope and unnecessary trusted-base churn.
 
@@ -59,7 +59,7 @@ The candidate encoding stores each distinct canonical node once in a positional 
 
 Measure UTF-8 bytes on disk and end-to-end read/decode/verify time after a warm-up, using repeated runs and medians on an otherwise comparable serial workload. Record results under `bench/bundle-baseline.edn` and summarize them in the PR. The gate is at least 50% reduction in total bytes across the corpus, less than 10% verification slowdown for each bundle, and identical successful replay. If any part fails, do not ship schema 2.
 
-If accepted, keep `spec/check :bundle` writing schema 1 by default and add `:bundle-format :shared` for opt-in schema 2. `writ.bundle/verify` accepts either schema. Public conversion helpers support plain-to-shared and shared-to-plain round trips. No binary format is added.
+If accepted, `spec/check :bundle` writes schema 2 by default, with no plain/shared format option. `writ.bundle/verify` accepts either schema so existing schema-1 artifacts remain valid, but there is no new schema-1 output path. Public conversion helpers support plain-to-shared and shared-to-plain round trips for compatibility and measurement. No binary format is added.
 
 ## Validation
 
