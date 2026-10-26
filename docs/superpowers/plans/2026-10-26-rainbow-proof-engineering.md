@@ -172,7 +172,7 @@ Encode distinct canonical nodes once in a positional table with children restric
 Run: `jolt -M:test --run writ.bundle-test`
 Expected: candidate tests PASS.
 
-Run: `jolt -cp src:test -m writ.bundle-bench bench/bundle-baseline.edn`
+Run: `jolt -A:bench -m writ.bundle-bench bench/bundle-baseline.edn`
 Expected: every plain and decoded-shared bundle replays successfully. Record per-bundle and total bytes plus median verification times in `bench/bundle-baseline.edn`.
 
 Decision: proceed only if total shared bytes are at most 50% of plain bytes and every shared end-to-end verification median is less than 110% of its plain median. If not, remove the candidate codec, runner, and candidate-only tests; keep the measurements and document the rejected schema 2, then commit the negative result with `bench: measure shared proof bundle encoding` and skip the remaining steps.

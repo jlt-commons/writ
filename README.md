@@ -1299,6 +1299,11 @@ cited lemma that was not verified earlier or named as an assumption. The
 content id detects edits, but is not itself evidence: a changed bundle with a
 recomputed id still has to replay.
 
+A positional shared-EDN encoding was measured on five real exports in
+`bench/bundle-baseline.edn`. It replayed correctly with comparable
+verification time, but grew the corpus from 59,487 to 137,991 bytes instead of
+meeting the 50% reduction gate, so schema 1 remains the only bundle format.
+
 Assumed signatures and laws are listed as assumptions, not upgraded to proofs.
 Closed or witnessed runtime evidence is listed separately as
 `:runtime-evidence`, not as a replayed proof. `:dependencies` and `:sources`
