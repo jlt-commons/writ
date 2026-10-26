@@ -315,6 +315,26 @@
     (is (= 1100 (count (reduce conj lims (range 75)))))
     (is (= 1100 (count (reduce conj tabs (range 74)))))))
 
+(deftest constraint-components-preserve-groups-and-clause-order
+  (let [components @#'writ.solve.cdcl/components
+        p [:bool 'p true]
+        q [:bool 'q true]
+        r [:bool 'r true]
+        s [:bool 's true]
+        t [:bool 't true]
+        parts (components [[p q] [] [r] [q s] [t]])]
+    (is (= 4 (count parts)))
+    (is (= #{[[]] [[r]] [[t]]} (set (take 3 parts))))
+    (is (= [[p q] [q s]] (nth parts 3))))
+  (let [chain (mapv (fn [x y] [[:bool x true] [:bool y false]]) '[a b c d] '[b c d e])]
+    (is (= [chain] (@#'writ.solve.cdcl/components chain))))
+  (let [x-le [:le {'x 1} 3]
+        x-bool [:bool 'x false]
+        xy-le [:le {'x 1 'y -1} 0]
+        empty-part []]
+    (is (= #{[empty-part] [[x-le] [x-bool] [xy-le]]}
+           (set (@#'writ.solve.cdcl/components [[x-le] empty-part [x-bool] [xy-le]]))))))
+
 ;; --- congruence on demand --------------------------------------------------------
 
 (deftest congruence-is-added-only-where-a-model-breaks-it
