@@ -107,7 +107,7 @@
                                   (= :as k) (binding-names v)
                                   (= :or k) []
                                   (and (keyword? k) (contains? #{"keys" "strs" "syms"} (name k)))
-                                  (binding-names v)
+                                  (mapv (fn [s] (symbol (name s))) v)
                                   :else (binding-names k)))
                               bform))
     :else []))
@@ -115,9 +115,22 @@
 (defn transform-free
   "Rebuild form with f applied to each symbol free under bound."
   [form bound f]
-  (letfn [(walk-bindings [bs bound]
+  (letfn [(walk-binding [b bound]
+            (cond
+              (vector? b) (mapv #(walk-binding % bound) b)
+              (map? b) (into (empty b)
+                             (map (fn [[k v]]
+                                    (cond
+                                      (= :or k) [k (into (empty v)
+                                                         (map (fn [[s default]] [s (walk default bound)])) v)]
+                                      (and (keyword? k) (contains? #{"keys" "strs" "syms"} (name k))) [k v]
+                                      (= :as k) [k v]
+                                      :else [(walk-binding k bound) v])))
+                             b)
+              :else b))
+          (walk-bindings [bs bound]
             (reduce (fn [[out bound] [b init]]
-                      [(conj out b (walk init bound))
+                      [(conj out (walk-binding b bound) (walk init bound))
                        (into bound (binding-names b))])
                     [[] bound] (partition 2 bs)))
           (walk [form bound]

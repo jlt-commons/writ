@@ -2260,7 +2260,7 @@
                             :when (and (var? v) (fn? @v))]
                         [nm [v @v (get *target-originals* v @v)]]))]
     (try
-      (doseq [[_ [v _ raw]] vars] (alter-var-root v (constantly (dispatching v raw))))
+      (doseq [[_ [v current]] vars] (alter-var-root v (constantly (dispatching v current))))
       (adequacy* ctx target fns anns props trials seed extra vars)
       (finally
         (doseq [[_ [v current]] vars] (alter-var-root v (constantly current)))))))
@@ -2270,7 +2270,8 @@
   (let [per-fn
         (vec (for [nm fns
              :let [v (ns-resolve (the-ns target) nm)
-                   real (or (nth (get vars nm) 2) @v)
+                   real (or (second (get vars nm)) @v)
+                   baseline (or (nth (get vars nm) 2) real)
                    sig (get anns nm)
                    argn (vec (take (count (:params sig)) (first (:arglists (meta v)))))
                    qnm (symbol (name target) (name nm))
@@ -2284,7 +2285,7 @@
                    judges (fn [imp] (if (= :off-example (:kind imp)) (remove #(::example (meta %)) props) props))
                    survives? (fn [imp]
                                (try
-                                 (let [s ((:make imp) real)
+                                 (let [s ((:make imp) (if (= :mutant (:kind imp)) real baseline))
                                        calls (atom [])
                                        s* (fn [& a]
                                             (let [x (apply s a)]
@@ -2298,7 +2299,7 @@
                                        ;; baseline cannot re-enter the stand-in
                                        differed (and verdict
                                                      (some (fn [[a x]]
-                                                             (not= x (try (apply real a) (catch Throwable _ ::threw))))
+                                                             (not= x (try (apply baseline a) (catch Throwable _ ::threw))))
                                                            @calls))]
                                    (and verdict
                                         ;; one off the laws' pins differs where they do not

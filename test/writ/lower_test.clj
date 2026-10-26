@@ -6,7 +6,8 @@
   (is (= '[a m] (l/binding-names '{:keys [a] :as m :or {a 1}})))
   (is (= '[x y z] (l/binding-names '{x :x [y] :ys {:keys [z]} :nested})))
   (is (= '[a xs all] (l/binding-names '[a & xs :as all])))
-  (is (= '[a b c] (l/binding-names '{:foo/keys [a] :strs [b] :syms [c]}))))
+  (is (= '[a b c] (l/binding-names '{:foo/keys [a] :strs [b] :syms [c]})))
+  (is (= '[x y z] (l/binding-names '{:keys [foo/x] :syms [bar/y] :strs [z]}))))
 
 (deftest transform-free-respects-sequential-bindings
   (let [f (fn [s] (if (= 'x s) 'z s))]
@@ -30,3 +31,11 @@
          (l/subst-var '(let [x x] x) 'x '_0)))
   (is (= '(forall [x Nat] (let [x x] x))
          (l/subst-var '(forall [x Nat] (let [x x] x)) 'x '_0))))
+
+(deftest substitution-handles-namespaced-options-and-defaults
+  (is (= '(let [{:keys [foo/x]} m] x)
+         (l/subst-var '(let [{:keys [foo/x]} m] x) 'x 'z)))
+  (is (= '(let [{:keys [a] :or {a z}} m] a)
+         (l/subst-var '(let [{:keys [a] :or {a x}} m] a) 'x 'z)))
+  (is (= '(let [x z {:keys [a] :or {a x}} m] a)
+         (l/subst-var '(let [x x {:keys [a] :or {a x}} m] a) 'x 'z))))

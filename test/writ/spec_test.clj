@@ -56,6 +56,8 @@
     (is (= 'demo.proof/f (q 'f {'f 'demo.proof/f})))
     (is (= 'demo.target/f (q 'f)))
     (is (= 'demo.spec/helper (q 'helper)))
+    (is (= '(let [{:keys [a] :or {a demo.target/f}} m] a)
+           (q '(let [{:keys [a] :or {a f}} m] a))))
     (create-ns 'demo.target)
     (create-ns 'demo.spec)
     (binding [*ns* (the-ns 'demo.spec)]
