@@ -144,3 +144,9 @@
                :prop (get-in referenced [:args :prop])
                :assumptions-used (:assumptions-used referenced)}]
     (is (:ok (bundle/verify (reidentify (update value :laws #(conj (vec %) alias))))))))
+
+(deftest alpha-equivalence-respects-sequential-and-destructured-bindings
+  (is (proposition/alpha= '(forall [x Nat] (let [x x] x))
+                          '(forall [y Nat] (let [x y] x))))
+  (is (= '(let [{:as x} m] x)
+         (proposition/subst-var '(let [{:as x} m] x) 'x 'z))))

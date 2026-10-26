@@ -96,15 +96,63 @@
            (and (nil? (namespace h)) (not (contains? locals h))))))
 
 (defn binding-names
-  "Every name a binding form introduces: a symbol, `[a b]`, or `{:keys [a b] :as m}`."
+  "Every name a binding form introduces, without markers or option data."
   [bform]
   (cond
+    (= '& bform) []
     (symbol? bform) [bform]
     (vector? bform) (vec (mapcat binding-names bform))
-    (map? bform)    (vec (mapcat binding-names
-                                 (mapcat (fn [[k v]] (if (#{:keys :strs :syms} k) [v] []))
-                                         bform)))
+    (map? bform) (vec (mapcat (fn [[k v]]
+                                (cond
+                                  (= :as k) (binding-names v)
+                                  (= :or k) []
+                                  (and (keyword? k) (contains? #{"keys" "strs" "syms"} (name k)))
+                                  (binding-names v)
+                                  :else (binding-names k)))
+                              bform))
     :else []))
+
+(defn transform-free
+  "Rebuild form with f applied to each symbol free under bound."
+  [form bound f]
+  (letfn [(walk-bindings [bs bound]
+            (reduce (fn [[out bound] [b init]]
+                      [(conj out b (walk init bound))
+                       (into bound (binding-names b))])
+                    [[] bound] (partition 2 bs)))
+          (walk [form bound]
+            (cond
+              (symbol? form) (if (contains? bound form) form (f form))
+              (and (seq? form) (= 'quote (first form))) form
+              (and (seq? form) (contains? '#{let let* loop loop*} (first form))
+                   (vector? (second form)))
+              (let [[bindings bound*] (walk-bindings (second form) bound)]
+                (apply list (first form) bindings (map #(walk % bound*) (drop 2 form))))
+              (and (seq? form) (contains? '#{forall exists} (first form))
+                   (vector? (second form)) (= 2 (count (second form))))
+              (let [[q [x t] & body] form]
+                (apply list q [x (walk t bound)] (map #(walk % (conj bound x)) body)))
+              (and (seq? form) (contains? '#{fn fn*} (first form))
+                   (vector? (second form)))
+              (let [[h params & body] form
+                    bound* (into bound (binding-names params))]
+                (apply list h params (map #(walk % bound*) body)))
+              (and (seq? form) (contains? '#{fn fn*} (first form))
+                   (symbol? (second form)) (vector? (nth form 2 nil)))
+              (let [[h nm params & body] form
+                    bound* (into (conj bound nm) (binding-names params))]
+                (apply list h nm params (map #(walk % bound*) body)))
+              (seq? form) (apply list (map #(walk % bound) form))
+              (vector? form) (mapv #(walk % bound) form)
+              (map? form) (into (empty form) (map (fn [[k v]] [(walk k bound) (walk v bound)])) form)
+              (set? form) (into (empty form) (map #(walk % bound)) form)
+              :else form))]
+    (walk form bound)))
+
+(defn subst-var
+  "Replace free occurrences of x with e, respecting lexical binders."
+  [form x e]
+  (transform-free form #{} (fn [s] (if (= x s) e s))))
 
 (defn valid-binding-symbol?
   "A binding symbol is a simple symbol: no namespace, no dots.  Ported

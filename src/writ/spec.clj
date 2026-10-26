@@ -3094,27 +3094,9 @@
   [a]
   (and (seq? a) (= 'quote (first a)) (symbol? (second a))))
 
-(defn- subst-var
-  "`form` with free occurrences of symbol `x` replaced by `e`.  A binder
-  of `x` in a let, fn, loop or quantifier stops it."
-  [form x e]
-  (letfn [(binds? [bs] (some #{x} (mapcat l/binding-names (take-nth 2 bs))))
-          (walk [f]
-            (cond
-              (= x f) e
-              (and (seq? f) (= 'quote (first f))) f
-              (and (seq? f) (contains? '#{let let* loop loop* forall exists} (first f))
-                   (vector? (second f)) (binds? (second f)))
-              f
-              (and (seq? f) (contains? '#{fn fn*} (first f))
-                   (some #(and (vector? %) (some #{x} (mapcat l/binding-names %))) (take 3 f)))
-              f
-              (seq? f) (apply list (map walk f))
-              (vector? f) (mapv walk f)
-              (map? f) (into {} (map (fn [[k v]] [(walk k) (walk v)])) f)
-              (set? f) (into #{} (map walk) f)
-              :else f))]
-    (walk form)))
+(def ^:private subst-var
+  "`form` with free occurrences of symbol `x` replaced by `e`."
+  l/subst-var)
 
 (defn- arg-var
   "A law's name for argument i, of type t: the type's name in lower case,
