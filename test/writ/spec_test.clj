@@ -41,6 +41,27 @@
     (testing "the spec pins down every fn it signs"
       (is (= [] (:gaps r))))))
 
+(deftest qualification-preserves-local-scope-and-resolution-precedence
+  (let [q (fn q
+            ([form] (q form {}))
+            ([form own]
+             (#'spec/qualify form #{} '#{f insert} '#{f helper}
+                             'demo.target 'demo.spec own)))]
+    (is (= '(let [f 1] (demo.target/insert f))
+           (q '(let [f 1] (insert f)))))
+    (is (= '((fn [insert] (insert 1)) demo.target/f)
+           (q '((fn [insert] (insert 1)) f))))
+    (is (= '(let [insert demo.target/insert] insert)
+           (q '(let [insert insert] insert))))
+    (is (= 'demo.proof/f (q 'f {'f 'demo.proof/f})))
+    (is (= 'demo.target/f (q 'f)))
+    (is (= 'demo.spec/helper (q 'helper)))
+    (create-ns 'demo.target)
+    (create-ns 'demo.spec)
+    (binding [*ns* (the-ns 'demo.spec)]
+      (eval '(alias 't 'demo.target)))
+    (is (= 'demo.target/f (q 't/f)))))
+
 (deftest trials-is-the-number-of-tests
   (let [r (spec/check spec-ns {:trials 300})]
     (is (= 300 (:trials (law-result r 'permutation))))))
