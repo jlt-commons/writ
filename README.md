@@ -1621,6 +1621,12 @@ Several things guard the prover itself:
 - What the spec assumes about code writ does not check is tested on every
   check and named in every report; see [Assumptions](#assumptions).
 
+[The trusted-base inventory](docs/trusted-base.md) names the semantic and
+replay code below these guarantees and the runtime trust outside writ. Its
+`docs/trusted-base.edn` manifest pins the source hashes; changing a listed
+file requires reviewing the semantic effect and updating its hash in the
+same change. The hash makes the change visible; it is not a soundness proof.
+
 The prover covers:
 
 - `seq`, `first`, `rest`, `next`, `second`, `empty?`, `count`, `cons`,
