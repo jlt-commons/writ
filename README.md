@@ -1453,6 +1453,12 @@ matches first, then related shapes, and an entry is eligible only when its
 candidate becomes evidence only through the ordinary proof and replay
 checker. Suggestions try a ranked pool before the full lemma set and put
 only the lemmas the successful proof actually cited in the hint's `:use`.
+A lemma whose proposition cannot be normalized is left out and recorded as
+`:normalization-failed`, never treated as evidence. With suggestions enabled,
+the report's `:reuse` gives the indexed, lookup and candidate counts and these
+`:quarantined` records; the text report names them too. Each suggestion also
+carries its `:reuse-candidates` count. `{:suggest {:reuse false}}` skips only
+the ranked pool, leaving the other suggestion strategies in place.
 
 `{:suggest true}` (or `{:suggest {:budget 40}}`, the attempts it may
 spend on a law) asks the check to find what would prove each law that
