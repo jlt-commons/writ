@@ -2171,6 +2171,13 @@ four small projects (a room calendar, an order lifecycle, a token bucket,
 a library's lending rules) used to try writ out, against
 `bench/trials-baseline.edn`.
 
+`jolt -M:bench --reuse DIR --held-out DIR2` compares suggestion search
+without and with ranked lemma reuse on both corpora. Each arm uses the same
+seed, suggestion budget, prover configuration and workload; only retrieval
+changes. The report includes gained and lost proofs, retrieval candidates,
+lemmas actually cited by checked suggestions, and quarantined lemmas. Keep
+DIR2 out of ranking and configuration tuning so it remains held out.
+
 The prover's knobs are one map, `writ.prove/default-config` (the fuel, how
 deep case splits go, the strategy order, ...), which check's `:prover`
 option overrides. `--tune '[{:depth 6} {:fuel 10000}]' DIR --held-out
