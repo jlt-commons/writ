@@ -1,6 +1,7 @@
 (ns writ.trusted-base-test
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [writ.hash :as hash]))
 
@@ -15,6 +16,9 @@
       (testing path
         (is (.exists (io/file path)))
         (is (= sha256 (hash/sha256 (slurp path))))))))
+
+(deftest trusted-base-documentation-refers-to-the-manifest
+  (is (str/includes? (slurp "docs/trusted-base.md") "docs/trusted-base.edn")))
 
 (deftest changed-trusted-content-does-not-match-its-pinned-hash
   (let [{:keys [path sha256]} (first (:files (edn/read-string (slurp "docs/trusted-base.edn"))))
