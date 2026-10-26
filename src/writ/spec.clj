@@ -2245,6 +2245,10 @@
 
 (declare adequacy*)
 
+(def ^:dynamic *target-originals*
+  "Uninstrumented target fns available while adequacy judges stand-ins."
+  {})
+
 (defn- adequacy
   "Swap each signed public fn for its impostors, and run every law against
   each.  The impostors of every fn are judged at once, each on its own
@@ -2254,19 +2258,19 @@
   (let [vars (into {} (for [nm fns
                             :let [v (ns-resolve (the-ns target) nm)]
                             :when (and (var? v) (fn? @v))]
-                        [nm [v @v]]))]
+                        [nm [v @v (get *target-originals* v @v)]]))]
     (try
-      (doseq [[_ [v real]] vars] (alter-var-root v (constantly (dispatching v real))))
+      (doseq [[_ [v _ raw]] vars] (alter-var-root v (constantly (dispatching v raw))))
       (adequacy* ctx target fns anns props trials seed extra vars)
       (finally
-        (doseq [[_ [v real]] vars] (alter-var-root v (constantly real)))))))
+        (doseq [[_ [v current]] vars] (alter-var-root v (constantly current)))))))
 
 (defn- adequacy*
   [ctx target fns anns props trials seed extra vars]
   (let [per-fn
         (vec (for [nm fns
              :let [v (ns-resolve (the-ns target) nm)
-                   real (or (second (get vars nm)) @v)
+                   real (or (nth (get vars nm) 2) @v)
                    sig (get anns nm)
                    argn (vec (take (count (:params sig)) (first (:arglists (meta v)))))
                    qnm (symbol (name target) (name nm))
@@ -2281,28 +2285,27 @@
                    survives? (fn [imp]
                                (try
                                  (let [s ((:make imp) real)
-                                       ;; a stand-in that answers as the real fn on every
-                                       ;; call the laws make is the real fn, as far as
-                                       ;; they can tell: when the real fn returns its
-                                       ;; argument, so does the pass-through
-                                       differed (atom false)
-                                       called (atom false)
+                                       calls (atom [])
                                        s* (fn [& a]
                                             (let [x (apply s a)]
-                                              (reset! called true)
-                                              (when-not @differed
-                                                (when-not (= x (try (apply real a) (catch Throwable _ ::threw)))
-                                                  (reset! differed true)))
-                                              x))]
-                                   (binding [*stand-ins* {v s*}]
-                                     (and (every? #(holds-sampled? ctx % trials seed) (judges imp))
-                                          (not (and (:args imp)
-                                                    (some #(rejects-at? ctx % qnm (:args imp) 10 seed) (judges imp))))
-                                          ;; one off the laws' pins differs where they do not
-                                          ;; look, and that is the gap it shows
-                                          ;; and one no law calls is a gap of the plainest kind
-                                          (or (some? (:args imp)) (contains? #{:off-pin :off-example} (:kind imp))
-                                              @differed (not @called)))))
+                                              (swap! calls conj [a x])
+                                              x))
+                                       verdict (binding [*stand-ins* {v s*}]
+                                                 (and (every? #(holds-sampled? ctx % trials seed) (judges imp))
+                                                      (not (and (:args imp)
+                                                                (some #(rejects-at? ctx % qnm (:args imp) 10 seed) (judges imp))))))
+                                       ;; compare after restoring ordinary dispatch, so a recursive
+                                       ;; baseline cannot re-enter the stand-in
+                                       differed (and verdict
+                                                     (some (fn [[a x]]
+                                                             (not= x (try (apply real a) (catch Throwable _ ::threw))))
+                                                           @calls))]
+                                   (and verdict
+                                        ;; one off the laws' pins differs where they do not
+                                        ;; look, and that is the gap it shows
+                                        ;; and one no law calls is a gap of the plainest kind
+                                        (or (some? (:args imp)) (contains? #{:off-pin :off-example} (:kind imp))
+                                            differed (empty? @calls))))
                                  (catch Throwable _ false)))
                    off-examples (let [ret (plain (:ret sig))
                                       other (other-value ret (:tenv ctx) seed)]
@@ -6980,12 +6983,13 @@
                                    (swap! ties #(into {} (remove (fn [[[x] _]] (= x t))) %))
                                    (assoc (install-probes! t) :target t)))))]
            (try
-             (let [r (check* spec-ns (assoc opts ::tie-sorts
-                                             (vec (for [{t :target :keys [combos]} probes
-                                                        :when (= t target)
-                                                        [id {:keys [op form] fname :fn}] combos
-                                                        :when (contains? #{:sort-by :pick-by} op)]
-                                                    {:key [t id] :form form :fname fname}))))
+             (let [r (binding [*target-originals* (into {} (mapcat :restore probes))]
+                       (check* spec-ns (assoc opts ::tie-sorts
+                                                (vec (for [{t :target :keys [combos]} probes
+                                                           :when (= t target)
+                                                           [id {:keys [op form] fname :fn}] combos
+                                                           :when (contains? #{:sort-by :pick-by} op)]
+                                                       {:key [t id] :form form :fname fname})))))
                    ;; a component's fns the target's code reaches, through its
                    ;; own helpers: what the spec's builders call is not the code's
                    reached (delay (let [g (merge (try (call-graph target) (catch Throwable _ {}))
