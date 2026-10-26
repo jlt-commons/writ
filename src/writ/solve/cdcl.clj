@@ -477,14 +477,34 @@
   "The clauses split into sets that share no variable, smallest first, each
   in the clauses' order."
   [clauses]
-  (let [find (fn find [m x] (let [p (get m x x)] (if (= p x) x (find m p))))
-        union (fn [m a b] (let [ra (find m a) rb (find m b)] (if (= ra rb) m (assoc m ra rb))))
-        m (reduce (fn [m c]
-                    (let [vs (mapcat vars-of c)]
-                      (if (seq vs) (reduce (fn [m v] (union m (first vs) v)) m vs) m)))
-                  {} clauses)
-        groups (group-by (fn [c] (if-let [v (first (mapcat vars-of c))] (find m v) ::none)) clauses)]
-    (sort-by count (vals groups))))
+  (let [parent (atom {})
+        rank (atom {})
+        find (fn find [x]
+               (let [p (get @parent x x)]
+                 (if (= p x)
+                   x
+                   (let [r (find p)]
+                     (swap! parent assoc x r)
+                     r))))
+        union (fn [a b]
+                (let [ra (find a) rb (find b)]
+                  (when-not (= ra rb)
+                    (let [ra-rank (get @rank ra 0) rb-rank (get @rank rb 0)]
+                      (cond
+                        (< ra-rank rb-rank) (swap! parent assoc ra rb)
+                        (> ra-rank rb-rank) (swap! parent assoc rb ra)
+                        :else (do (swap! parent assoc ra rb)
+                                  (swap! rank update rb (fnil inc 0))))))))]
+    (doseq [c clauses]
+      (when-let [vs (seq (mapcat vars-of c))]
+        (let [root (first vs)]
+          (doseq [v (rest vs)] (union root v)))))
+    (let [groups (group-by (fn [c]
+                             (if-let [v (first (mapcat vars-of c))]
+                               (find v)
+                               ::none))
+                           clauses)]
+      (sort-by count (vals groups)))))
 
 (defn solve
   "Search clauses for a model.  {:sat true :assign #{literal} :values {var

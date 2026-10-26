@@ -1502,28 +1502,21 @@
   ([form bound target-publics spec-interns target spec-ns]
    (qualify form bound target-publics spec-interns target spec-ns {}))
   ([form bound target-publics spec-interns target spec-ns own]
-  (letfn [(walk [f bound]
-            (cond
-              (and (symbol? f) (nil? (namespace f)) (not (contains? bound f)))
-              (cond (contains? own f) (get own f)
-                    (contains? target-publics f) (symbol (name target) (name f))
-                    (contains? spec-interns f) (symbol (name spec-ns) (name f))
-                    :else f)
-              ;; an alias of the spec's, set/intersection, by its namespace's
-              ;; own name, which the prover knows
-              (and (symbol? f) (namespace f))
-              (if-let [a (try (get (ns-aliases (the-ns spec-ns)) (symbol (namespace f))) (catch Throwable _ nil))]
-                (symbol (str (ns-name a)) (name f))
-                f)
-              (and (seq? f) (= 'quote (first f))) f
-              (and (seq? f) (quant? f))
-              (let [[q [x t] body] f] (list q [x t] (walk body (conj bound x))))
-              (seq? f) (apply list (map #(walk % bound) f))
-              (vector? f) (mapv #(walk % bound) f)
-              (map? f) (into {} (map (fn [[k v]] [(walk k bound) (walk v bound)])) f)
-              (set? f) (into #{} (map #(walk % bound)) f)
-              :else f))]
-    (walk form bound))))
+   (l/transform-free
+    form bound
+    (fn [f]
+      (cond
+        (nil? (namespace f))
+        (cond (contains? own f) (get own f)
+              (contains? target-publics f) (symbol (name target) (name f))
+              (contains? spec-interns f) (symbol (name spec-ns) (name f))
+              :else f)
+        ;; an alias of the spec's, set/intersection, by its namespace's
+        ;; own name, which the prover knows
+        :else
+        (if-let [a (try (get (ns-aliases (the-ns spec-ns)) (symbol (namespace f))) (catch Throwable _ nil))]
+          (symbol (str (ns-name a)) (name f))
+          f))))))
 
 (defn- proof-own
   "name -> qualified name for the defns a proof namespace interns."
@@ -2252,6 +2245,10 @@
 
 (declare adequacy*)
 
+(def ^:dynamic *target-originals*
+  "Uninstrumented target fns available while adequacy judges stand-ins."
+  {})
+
 (defn- adequacy
   "Swap each signed public fn for its impostors, and run every law against
   each.  The impostors of every fn are judged at once, each on its own
@@ -2261,12 +2258,12 @@
   (let [vars (into {} (for [nm fns
                             :let [v (ns-resolve (the-ns target) nm)]
                             :when (and (var? v) (fn? @v))]
-                        [nm [v @v]]))]
+                        [nm [v @v (get *target-originals* v @v)]]))]
     (try
-      (doseq [[_ [v real]] vars] (alter-var-root v (constantly (dispatching v real))))
+      (doseq [[_ [v current]] vars] (alter-var-root v (constantly (dispatching v current))))
       (adequacy* ctx target fns anns props trials seed extra vars)
       (finally
-        (doseq [[_ [v real]] vars] (alter-var-root v (constantly real)))))))
+        (doseq [[_ [v current]] vars] (alter-var-root v (constantly current)))))))
 
 (defn- adequacy*
   [ctx target fns anns props trials seed extra vars]
@@ -2274,6 +2271,7 @@
         (vec (for [nm fns
              :let [v (ns-resolve (the-ns target) nm)
                    real (or (second (get vars nm)) @v)
+                   baseline (or (nth (get vars nm) 2) real)
                    sig (get anns nm)
                    argn (vec (take (count (:params sig)) (first (:arglists (meta v)))))
                    qnm (symbol (name target) (name nm))
@@ -2287,29 +2285,28 @@
                    judges (fn [imp] (if (= :off-example (:kind imp)) (remove #(::example (meta %)) props) props))
                    survives? (fn [imp]
                                (try
-                                 (let [s ((:make imp) real)
-                                       ;; a stand-in that answers as the real fn on every
-                                       ;; call the laws make is the real fn, as far as
-                                       ;; they can tell: when the real fn returns its
-                                       ;; argument, so does the pass-through
-                                       differed (atom false)
-                                       called (atom false)
+                                 (let [s ((:make imp) (if (= :mutant (:kind imp)) real baseline))
+                                       calls (atom [])
                                        s* (fn [& a]
                                             (let [x (apply s a)]
-                                              (reset! called true)
-                                              (when-not @differed
-                                                (when-not (= x (try (apply real a) (catch Throwable _ ::threw)))
-                                                  (reset! differed true)))
-                                              x))]
-                                   (binding [*stand-ins* {v s*}]
-                                     (and (every? #(holds-sampled? ctx % trials seed) (judges imp))
-                                          (not (and (:args imp)
-                                                    (some #(rejects-at? ctx % qnm (:args imp) 10 seed) (judges imp))))
-                                          ;; one off the laws' pins differs where they do not
-                                          ;; look, and that is the gap it shows
-                                          ;; and one no law calls is a gap of the plainest kind
-                                          (or (some? (:args imp)) (contains? #{:off-pin :off-example} (:kind imp))
-                                              @differed (not @called)))))
+                                              (swap! calls conj [a x])
+                                              x))
+                                       verdict (binding [*stand-ins* {v s*}]
+                                                 (and (every? #(holds-sampled? ctx % trials seed) (judges imp))
+                                                      (not (and (:args imp)
+                                                                (some #(rejects-at? ctx % qnm (:args imp) 10 seed) (judges imp))))))
+                                       ;; compare after restoring ordinary dispatch, so a recursive
+                                       ;; baseline cannot re-enter the stand-in
+                                       differed (and verdict
+                                                     (some (fn [[a x]]
+                                                             (not= x (try (apply baseline a) (catch Throwable _ ::threw))))
+                                                           @calls))]
+                                   (and verdict
+                                        ;; one off the laws' pins differs where they do not
+                                        ;; look, and that is the gap it shows
+                                        ;; and one no law calls is a gap of the plainest kind
+                                        (or (some? (:args imp)) (contains? #{:off-pin :off-example} (:kind imp))
+                                            differed (empty? @calls))))
                                  (catch Throwable _ false)))
                    off-examples (let [ret (plain (:ret sig))
                                       other (other-value ret (:tenv ctx) seed)]
@@ -3094,27 +3091,9 @@
   [a]
   (and (seq? a) (= 'quote (first a)) (symbol? (second a))))
 
-(defn- subst-var
-  "`form` with free occurrences of symbol `x` replaced by `e`.  A binder
-  of `x` in a let, fn, loop or quantifier stops it."
-  [form x e]
-  (letfn [(binds? [bs] (some #{x} (mapcat l/binding-names (take-nth 2 bs))))
-          (walk [f]
-            (cond
-              (= x f) e
-              (and (seq? f) (= 'quote (first f))) f
-              (and (seq? f) (contains? '#{let let* loop loop* forall exists} (first f))
-                   (vector? (second f)) (binds? (second f)))
-              f
-              (and (seq? f) (contains? '#{fn fn*} (first f))
-                   (some #(and (vector? %) (some #{x} (mapcat l/binding-names %))) (take 3 f)))
-              f
-              (seq? f) (apply list (map walk f))
-              (vector? f) (mapv walk f)
-              (map? f) (into {} (map (fn [[k v]] [(walk k) (walk v)])) f)
-              (set? f) (into #{} (map walk) f)
-              :else f))]
-    (walk form)))
+(def ^:private subst-var
+  "`form` with free occurrences of symbol `x` replaced by `e`."
+  l/subst-var)
 
 (defn- arg-var
   "A law's name for argument i, of type t: the type's name in lower case,
@@ -7005,12 +6984,13 @@
                                    (swap! ties #(into {} (remove (fn [[[x] _]] (= x t))) %))
                                    (assoc (install-probes! t) :target t)))))]
            (try
-             (let [r (check* spec-ns (assoc opts ::tie-sorts
-                                             (vec (for [{t :target :keys [combos]} probes
-                                                        :when (= t target)
-                                                        [id {:keys [op form] fname :fn}] combos
-                                                        :when (contains? #{:sort-by :pick-by} op)]
-                                                    {:key [t id] :form form :fname fname}))))
+             (let [r (binding [*target-originals* (into {} (mapcat :restore probes))]
+                       (check* spec-ns (assoc opts ::tie-sorts
+                                                (vec (for [{t :target :keys [combos]} probes
+                                                           :when (= t target)
+                                                           [id {:keys [op form] fname :fn}] combos
+                                                           :when (contains? #{:sort-by :pick-by} op)]
+                                                       {:key [t id] :form form :fname fname})))))
                    ;; a component's fns the target's code reaches, through its
                    ;; own helpers: what the spec's builders call is not the code's
                    reached (delay (let [g (merge (try (call-graph target) (catch Throwable _ {}))

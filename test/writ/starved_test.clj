@@ -4,7 +4,8 @@
   failing, or passing, on what the draws happened to be."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
-            [writ.spec :as spec]))
+            [writ.spec :as spec]
+            [writ.spec-demo.sort :as sort]))
 
 (defn- law-result [report nm]
   (first (filter #(= nm (:law %)) (:laws report))))
@@ -237,11 +238,22 @@
 ;; --- a law that tells no stand-in apart -------------------------------------------
 
 (deftest a-law-that-rejects-no-stand-in-is-named
-  (let [r (spec/check 'writ.spec-demo.typey-spec {:seed 1})]
-    (is (has? r "law `isort-gives-a-seq` tells none of"))
-    (is (has? r "law `isort-gives-nats` tells none of"))
-    (is (not (has? r "law `sorting:unsorted:isort` tells none of")) "a graph's own laws are not named"))
-  (is (not (has? (spec/check 'writ.spec-demo.sort-spec {:seed 42}) "tells none of"))))
+  (doseq [parallel [true false]]
+    (let [r (spec/check 'writ.spec-demo.typey-spec {:seed 1 :parallel parallel})]
+      (is (has? r "law `isort-gives-a-seq` tells none of"))
+      (is (has? r "law `isort-gives-nats` tells none of"))
+      (is (not (has? r "law `sorting:unsorted:isort` tells none of")) "a graph's own laws are not named")))
+  (is (not (has? (spec/check 'writ.spec-demo.sort-spec {:seed 42}) "tells none of")))
+  (let [v #'sort/insert
+        real @v
+        imp (nth (spec/impostors 'insert {:params ['Nat '(List Nat)] :ret '(List Nat)}
+                                 ['nat 'xs] (spec/type-env 'writ.spec-demo.typey-spec) 1)
+                 6)
+        stand-in ((:make imp) real)
+        dispatch (#'spec/dispatching v real)]
+    (binding [spec/*stand-ins* {v stand-in}]
+      (is (= '(2 1 2 3) (dispatch 1 '(2 3))))
+      (is (= '(1 2 3) (binding [spec/*stand-ins* {}] (dispatch 1 '(2 3))))))))
 
 ;; --- examples beside the laws -----------------------------------------------------
 
