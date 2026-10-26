@@ -4755,11 +4755,16 @@
 (defn format-report
   "The report as text for an agent or a person: what failed and why."
   [{:keys [ok target spec static laws gaps unspecified rejected calls flows machines proof graphs graph-missing
-           lemmas off-graph uses problems questions silent baseline-problems]
+           lemmas off-graph uses problems questions silent baseline-problems reuse]
     contras ::contradictions assumed ::assumed
     ambiguous ::ambiguous explain ::explain}]
   (str "writ.spec: " spec " against " target (if ok ": ok" ": FAILED")
        (when (seq baseline-problems) (str "\n\n" (str/join "\n" baseline-problems) "\n"))
+       (when reuse
+         (str "\n  lemma reuse: " (:indexed reuse) " indexed, " (:candidates reuse)
+              " candidates across " (:lookups reuse) " lookups"
+              (apply str (for [{:keys [name message]} (:quarantined reuse)]
+                           (str "\n  quarantined `" name "`: " message)))))
        (when (and proof (pos? (:laws proof)))
          (str "\n  " (:proved proof) " of " (:laws proof) " laws proved"
               (when (and (:general proof) (pos? (:proved proof)))
@@ -5281,16 +5286,20 @@
   lemma comes from the goals the search got stuck on; it is offered only
   once it has passed its tests, been proved itself, and proved the law.
   Nothing is added to the spec: the proof namespace stays the record."
-  [r lemmas attempt** ctx rets hint {:keys [budget reuse-context] :or {budget 40}}]
+  [r lemmas attempt** ctx rets hint
+   {:keys [budget reuse-context reuse-index reuse] :or {budget 40 reuse true}}]
   (let [vs (mapv first (first (leading-foralls (:prop r))))
         tries (atom 0)
         spent? #(>= @tries budget)
         prove #(do (swap! tries inc) (attempt** %1 %2 nil %3))
         by-name (into {} (map (juxt :name identity)) lemmas)
-        ranked (when reuse-context
-                 (mapv :name (reuse/candidates (reuse/index lemmas reuse-context) (:prop r)
-                                               {:allowed-assumptions
-                                                (set (mapcat :assumptions-used lemmas))})))
+        reuse-index (when reuse
+                      (or reuse-index (when reuse-context (reuse/index lemmas reuse-context))))
+        candidates (when reuse-index
+                     (reuse/candidates reuse-index (:prop r)
+                                       {:allowed-assumptions
+                                        (set (mapcat :assumptions-used lemmas))}))
+        ranked (mapv :name candidates)
         ranked-pool (vec (keep by-name ranked))
         try-hints (fn [pool]
                     (first (for [h (hint-candidates vs hint)
@@ -5305,7 +5314,8 @@
       (let [[h pr] by-hint
             h (cond-> (dissoc h :use)
                 (seq (:lemmas pr)) (assoc :use (vec (:lemmas pr))))]
-        {:hint (list 'hint (:law r) h)})
+        {:hint (list 'hint (:law r) h)
+         :reuse-candidates (count ranked)})
       (let [raw (:stuck-raw (attempt** r lemmas nil))
             cands (take 8 (prover/lemma-candidates raw rets))
             named (symbol (str (:law r) "-needs"))
@@ -5321,8 +5331,10 @@
                           :when (:proved (prove r (conj lemmas {:name named :prop prop}) nil))]
                       form))]
         (if found
-          {:lemma (list 'lemma named found)}
-          {:none (if (spent?) (str "none found within " budget " attempts") "none found")})))))
+          {:lemma (list 'lemma named found)
+           :reuse-candidates (count ranked)}
+          {:none (if (spent?) (str "none found within " budget " attempts") "none found")
+           :reuse-candidates (count ranked)})))))
 
 (def ^:private ^:dynamic *using*
   "The specs being checked for a spec that uses them, to refuse a cycle."
@@ -5741,21 +5753,30 @@
                                                (try (turn-clauses %) (catch Throwable _ nil))))
                                          %)
                                     rs2))]
-                    (let [final (if (:suggest opts)
+                    (let [suggest-options (if (map? (:suggest opts)) (:suggest opts) {})
+                          reuse-context {:defs (first @defs) :tenv tenv
+                                         :own (merge (second @defs) (nth @libs+refers 2))}
+                          reuse-index (when (and (:suggest opts)
+                                                 (not (false? (:reuse suggest-options))))
+                                        (reuse/index lemmas2 reuse-context))
+                          final (if (:suggest opts)
                                   (mapv #(if (and (= :tested (:status %)) (:unproved %)
                                                   (not (str/starts-with? (str (:unproved %)) "outside")))
                                            (let [sg (suggest-proof % lemmas2 attempt** ctx
                                                                    (into {} (for [[nm sig] anns]
                                                                               [(symbol (str target) (str nm)) (plain (:ret sig))]))
                                                                    (get (::hints opts) (:law %))
-                                                                   (assoc (if (map? (:suggest opts)) (:suggest opts) {})
-                                                                          :reuse-context
-                                                                          {:defs (first @defs) :tenv tenv
-                                                                           :own (merge (second @defs) (nth @libs+refers 2))}))]
+                                                                   (assoc suggest-options :reuse-index reuse-index))]
                                              (cond-> % sg (assoc :suggestion sg)))
                                            %)
                                         rs2)
-                                  rs2)]
+                                  rs2)
+                          suggestions (keep :suggestion final)
+                          reuse-summary (when (:suggest opts)
+                                          {:indexed (count (:entries reuse-index))
+                                           :lookups (count suggestions)
+                                           :candidates (reduce + 0 (map :reuse-candidates suggestions))
+                                           :quarantined (vec (:quarantined reuse-index))})]
                       (let [context-keys [:defs :tenv :own :sigs :contracts :rets
                                           :trusted-rets :component-requires :guards :target
                                           :spec-ns :assumption-contracts :assumption-lemmas]
@@ -5768,6 +5789,7 @@
                                            entry))
                                        @evidence)]
                         {:results final
+                         :reuse reuse-summary
                          :evidence {:context context
                                     :contracts @contracts
                                     :laws laws
@@ -7335,6 +7357,7 @@
                                     (not-any? :blocking (:questions e))
                                     (every? #(= :held (:status %)) assumed)
                                     (not graphless)))
+                 r (cond-> r (:reuse proof-run) (assoc :reuse (:reuse proof-run)))
                  r (assoc r :obligations (obligation-status (obligations* e) r))
                  r (assoc r ::record (record-of e spec-ns laws r level))
                  r (assoc r ::proof-evidence

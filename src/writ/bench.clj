@@ -17,6 +17,7 @@
       jolt -M:bench --baseline bench/baseline.edn DIR
       jolt -M:bench --tune '[{:depth 6} {:fuel 10000}]' DIR --held-out DIR2
                                                    compare configs of the prover
+      jolt -M:bench --reuse DIR --held-out DIR2    compare ranked lemma reuse
       jolt -M:bench --jobs 1 DIR                   one spec at a time (the default
                                                    is one a processor)"
   (:refer-clojure :exclude [compare])
@@ -31,14 +32,15 @@
   [s l]
   (let [as (:attempts l)
         win (first (filter #(= :proved (:outcome %)) as))]
-    {:spec s :law (:law l) :status (:status l)
-     :proved? (= :proved (:status l))
-     :winner (some-> win attempt-name)
-     :by (let [n (:name win)] (if (vector? n) (first n) n))
-     :fuel (reduce + 0 (keep :fuel as))
-     :ms (reduce + 0 (keep :ms as))
-     :test-ms (or (:test-ms l) 0)
-     :attempts (mapv #(select-keys % [:name :outcome :fuel :ms]) as)}))
+    (cond-> {:spec s :law (:law l) :status (:status l)
+             :proved? (= :proved (:status l))
+             :winner (some-> win attempt-name)
+             :by (let [n (:name win)] (if (vector? n) (first n) n))
+             :fuel (reduce + 0 (keep :fuel as))
+             :ms (reduce + 0 (keep :ms as))
+             :test-ms (or (:test-ms l) 0)
+             :attempts (mapv #(select-keys % [:name :outcome :fuel :ms]) as)}
+      (:suggestion l) (assoc :suggestion (:suggestion l)))))
 
 (defn- spec-rows
   "The rows of one spec's check: opts over :seed 1, :adequacy false, and
@@ -46,8 +48,10 @@
   [s opts]
   (let [r (spec/check s (merge {:seed 1 :adequacy false} opts {:cache false :explain true}))]
     (vec (for [l (concat (:lemmas r) (:laws r))
-               :when (seq (:attempts l))]
-           (row s (cond-> l (:lemma l) (assoc :law (:lemma l))))))))
+               :when (seq (:attempts l))
+               :let [result (row s (cond-> l (:lemma l) (assoc :law (:lemma l))))]]
+           (cond-> result
+             (:reuse r) (assoc :reuse (assoc (:reuse r) :spec s)))))))
 
 (defn- touched
   "The namespaces a check of spec s may rebind fns of, or whose fns it
@@ -171,6 +175,64 @@
      :new (vec (sort (remove #(contains? b %) (keys c))))
      :gone (vec (sort (remove #(contains? c %) (keys b))))}))
 
+(defn- reuse-metrics
+  [rows]
+  (let [reports (into {} (for [r rows :when (:reuse r)]
+                           [(get-in r [:reuse :spec]) (:reuse r)]))
+        citations (frequencies
+                   (mapcat (fn [r]
+                             (when-let [hint (get-in r [:suggestion :hint])]
+                               (:use (nth hint 2))))
+                           rows))]
+    {:candidates (reduce + 0 (map :candidates (vals reports)))
+     :lookups (reduce + 0 (map :lookups (vals reports)))
+     :citations (into (sorted-map) citations)
+     :quarantined (vec (distinct (mapcat :quarantined (vals reports))))}))
+
+(defn- reuse-arm
+  [specs opts reuse?]
+  (let [options (assoc opts :suggest (assoc (if (map? (:suggest opts)) (:suggest opts) {})
+                                            :reuse reuse?))
+        rows (run specs options)]
+    {:rows rows :summary (summary rows) :options options :metrics (reuse-metrics rows)}))
+
+(defn- reuse-corpus
+  [specs opts]
+  (let [baseline (reuse-arm specs opts false)
+        reused (reuse-arm specs opts true)
+        keys-of (fn [arm] (set (map (juxt :spec :law) (:rows arm))))]
+    {:baseline baseline
+     :reuse reused
+     :compare (compare (:rows baseline) (:rows reused))
+     :same-workload? (= (keys-of baseline) (keys-of reused))}))
+
+(defn reuse-comparison
+  "Compare suggestion search without and with ranked reuse on identical
+  tuning and held-out workloads.  Only the nested :reuse option differs."
+  ([tune-specs held-out-specs] (reuse-comparison tune-specs held-out-specs {}))
+  ([tune-specs held-out-specs opts]
+   {:tune (reuse-corpus tune-specs opts)
+    :held-out (reuse-corpus held-out-specs opts)}))
+
+(defn reuse-report
+  "A reuse comparison as text, including actual checked-proof citations."
+  [result]
+  (str/join
+   "\n\n"
+   (for [k [:tune :held-out]
+         :let [{:keys [baseline reuse compare same-workload?]} (get result k)
+               b (get-in baseline [:metrics :candidates])
+               r (get-in reuse [:metrics :candidates])
+               citations (get-in reuse [:metrics :citations])
+               quarantined (get-in reuse [:metrics :quarantined])]]
+     (str (name k) ": " (count (:gained compare)) " gained, " (count (:lost compare)) " lost"
+          "; candidates " b " -> " r
+          "; same workload " (boolean same-workload?)
+          "\n  citations " (pr-str citations)
+          "\n  quarantined " (pr-str (mapv :name quarantined))
+          (when (seq (:lost compare))
+            (str "\n  lost: " (str/join ", " (map (fn [[s l]] (str s "/" l)) (:lost compare)))))))))
+
 (defn table
   "The rows as text, one line a law, and the summary under them."
   [rows]
@@ -256,10 +318,16 @@
                           (= "--save" (first as)) (recur (drop 2 as) (assoc fl :save (second as)) ns)
                           (= "--baseline" (first as)) (recur (drop 2 as) (assoc fl :baseline (second as)) ns)
                           (= "--tune" (first as)) (recur (drop 2 as) (assoc fl :tune (read-string (second as))) ns)
+                          (= "--reuse" (first as)) (recur (rest as) (assoc fl :reuse true) ns)
                           (= "--held-out" (first as)) (recur (rest as) (assoc fl :held-out (count ns)) ns)
                           (= "--jobs" (first as)) (recur (drop 2 as) (assoc fl :jobs (parse-long (second as))) ns)
                           :else (recur (rest as) fl (conj ns (first as)))))
         specs-of (fn [names] (mapcat #(if (str/includes? % "/") (specs-in %) [(symbol %)]) names))]
+    (when (:reuse flags)
+      (let [n (or (:held-out flags) (count names))]
+        (println (reuse-report (reuse-comparison (specs-of (take n names)) (specs-of (drop n names))
+                                                 (select-keys flags [:jobs])))))
+      (System/exit 0))
     (when-let [configs (:tune flags)]
       (let [n (or (:held-out flags) (count names))]
         (println (tune-report (tune configs (specs-of (take n names)) (specs-of (drop n names))

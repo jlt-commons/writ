@@ -1299,6 +1299,11 @@ cited lemma that was not verified earlier or named as an assumption. The
 content id detects edits, but is not itself evidence: a changed bundle with a
 recomputed id still has to replay.
 
+A positional shared-EDN encoding was measured on five real exports in
+`bench/bundle-baseline.edn`. It replayed correctly with comparable
+verification time, but grew the corpus from 59,487 to 137,991 bytes instead of
+meeting the 50% reduction gate, so schema 1 remains the only bundle format.
+
 Assumed signatures and laws are listed as assumptions, not upgraded to proofs.
 Closed or witnessed runtime evidence is listed separately as
 `:runtime-evidence`, not as a replayed proof. `:dependencies` and `:sources`
@@ -1453,6 +1458,12 @@ matches first, then related shapes, and an entry is eligible only when its
 candidate becomes evidence only through the ordinary proof and replay
 checker. Suggestions try a ranked pool before the full lemma set and put
 only the lemmas the successful proof actually cited in the hint's `:use`.
+A lemma whose proposition cannot be normalized is left out and recorded as
+`:normalization-failed`, never treated as evidence. With suggestions enabled,
+the report's `:reuse` gives the indexed, lookup and candidate counts and these
+`:quarantined` records; the text report names them too. Each suggestion also
+carries its `:reuse-candidates` count. `{:suggest {:reuse false}}` skips only
+the ranked pool, leaving the other suggestion strategies in place.
 
 `{:suggest true}` (or `{:suggest {:budget 40}}`, the attempts it may
 spend on a law) asks the check to find what would prove each law that
@@ -1614,6 +1625,12 @@ Several things guard the prover itself:
   writ bug.
 - What the spec assumes about code writ does not check is tested on every
   check and named in every report; see [Assumptions](#assumptions).
+
+[The trusted-base inventory](docs/trusted-base.md) names the semantic and
+replay code below these guarantees and the runtime trust outside writ. Its
+`docs/trusted-base.edn` manifest pins the source hashes; changing a listed
+file requires reviewing the semantic effect and updating its hash in the
+same change. The hash makes the change visible; it is not a soundness proof.
 
 The prover covers:
 
@@ -2164,6 +2181,13 @@ never writes the proof cache. `./bin/bench-trials` runs it over `bench/trials`, 
 four small projects (a room calendar, an order lifecycle, a token bucket,
 a library's lending rules) used to try writ out, against
 `bench/trials-baseline.edn`.
+
+`jolt -M:bench --reuse DIR --held-out DIR2` compares suggestion search
+without and with ranked lemma reuse on both corpora. Each arm uses the same
+seed, suggestion budget, prover configuration and workload; only retrieval
+changes. The report includes gained and lost proofs, retrieval candidates,
+lemmas actually cited by checked suggestions, and quarantined lemmas. Keep
+DIR2 out of ranking and configuration tuning so it remains held out.
 
 The prover's knobs are one map, `writ.prove/default-config` (the fuel, how
 deep case splits go, the strategy order, ...), which check's `:prover`

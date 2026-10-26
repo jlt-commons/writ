@@ -1,6 +1,7 @@
 #!/bin/sh
 # Benchmark the prover over the demo specs; extra arguments go to writ.bench,
-# for example --baseline bench/baseline.edn or --save bench/baseline.edn.
+# for example --baseline bench/baseline.edn, --save bench/baseline.edn,
+# or --reuse DIR --held-out DIR2 for an equal-budget retrieval comparison.
 set -e
 cd "$(dirname "$0")/.."
 exec jolt -M:bench "$@" test/writ/spec_demo

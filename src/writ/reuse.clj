@@ -7,30 +7,34 @@
             [writ.prove.translate :as tr]))
 
 (defn- normalized [prop {:keys [defs tenv own]}]
-  (try
-    (let [[bs body] (sc/split-foralls prop)
-          ren (into {} (map-indexed (fn [i [x _]] [x (symbol (str "?reuse" i))]) bs))
-          vars (mapv first bs)
-          goal (sc/goal (tr/context (or own {})) vars body)
-          types (into {} (map (fn [[x ty]] [(ren x) ty]) bs))
-          ctx (rw/context {:defs (or defs {}) :tenv (or tenv {}) :types types})
-          normalize #(rw/normalize ctx (t/subst % ren))]
-      {:bindings (mapv second bs)
-       :hyps (mapv normalize (:hyps goal))
-       :goals (mapv normalize (:goals goal))})
-    (catch Throwable _ nil)))
+  (let [[bs body] (sc/split-foralls prop)
+        ren (into {} (map-indexed (fn [i [x _]] [x (symbol (str "?reuse" i))]) bs))
+        vars (mapv first bs)
+        goal (sc/goal (tr/context (or own {})) vars body)
+        types (into {} (map (fn [[x ty]] [(ren x) ty]) bs))
+        ctx (rw/context {:defs (or defs {}) :tenv (or tenv {}) :types types})
+        normalize #(rw/normalize ctx (t/subst % ren))]
+    {:bindings (mapv second bs)
+     :hyps (mapv normalize (:hyps goal))
+     :goals (mapv normalize (:goals goal))}))
 
 (defn index [lemmas context]
-  (let [entries (into []
-                      (keep (fn [lemma]
-                              (when-not (contains? #{:tested :unproved :failed :vacuous}
-                                                   (:status lemma))
-                                (when-let [normalized (normalized (:prop lemma) context)]
-                                  (assoc lemma :reuse/normalized normalized
-                                         :assumptions-used (vec (:assumptions-used lemma)))))))
-                      lemmas)]
+  (let [classified (mapv (fn [lemma]
+                           (when-not (contains? #{:tested :unproved :failed :vacuous}
+                                                (:status lemma))
+                             (try
+                               {:entry (assoc lemma :reuse/normalized (normalized (:prop lemma) context)
+                                              :assumptions-used (vec (:assumptions-used lemma)))}
+                               (catch Throwable e
+                                 {:quarantined {:name (:name lemma)
+                                                :reason :normalization-failed
+                                                :message (or (ex-message e) (str (class e)))}}))))
+                         lemmas)
+        entries (keep :entry classified)
+        quarantined (keep :quarantined classified)]
     {:context context
-     :entries (vec (sort-by #(str (:name %)) entries))}))
+     :entries (vec (sort-by #(str (:name %)) entries))
+     :quarantined (vec (sort-by #(str (:name %)) quarantined))}))
 
 (defn- dependencies [normalized]
   (into #{}
@@ -44,7 +48,7 @@
   ([index prop] (candidates index prop {}))
   ([index prop {:keys [allowed-assumptions limit] :or {limit 16}}]
    (let [allowed (or allowed-assumptions #{})
-         target (normalized prop (:context index))
+         target (try (normalized prop (:context index)) (catch Throwable _ nil))
          target-deps (dependencies target)
          eligible (fn [entry]
                     (every? allowed (:assumptions-used entry)))
