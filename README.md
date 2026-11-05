@@ -2070,9 +2070,10 @@ These rules apply to the plain implementation.
   Parameters before the shrinking one pass through unchanged, so an
   accumulator goes after the collection it walks, in the parameters or
   the `loop` bindings. `rest` only shrinks a collection writ knows is
-  finite, which is one reason to sign the fn. The loops that `doseq` and
-  similar macros expand to are checked the same way, and the error names
-  the collection they walk.
+  finite, which is one reason to sign the fn. `doseq` is checked as a
+  `first`/`next` walk of its collection and `dotimes` as a count up to a
+  Nat bound, and the error names the collection they walk. Other macros'
+  loops are checked as they expand.
 - **Arity and calls.** Every call matches its fn's arity, including
   `clojure.core` fns, and nothing that is not a fn is called.
 - **Types.** Arguments fit the signed parameter types, and the body fits

@@ -488,6 +488,17 @@
                         `(do ~inner ~step)
                         (reverse mods)))))))))
 
+(defn- dotimes-loop
+  "(dotimes [i n] body) as a count up to n read once.  The counter is a
+  temporary and i a copy of it, so i keeps the quantity it was written with."
+  [i n body]
+  (let [c (gensym) bound (gensym)]
+    `(let [~bound ~n]
+       (loop [~c 0]
+         (when (< ~c ~bound)
+           (let [~i ~c] ~@body)
+           (recur (inc ~c)))))))
+
 (defn lower [form]
   (cond
     (symbol? form) {:op :ref :name form}
@@ -532,6 +543,10 @@
                                                        (doseq-loop bs body))]
                                          (lower (list 'do f nil))
                                          (lower (macroexpand-1 form))))
+        (dotimes clojure.core/dotimes) (let [[_ bs & body] form]
+                                         (if (and (vector? bs) (= 2 (count bs)) (symbol? (first bs)))
+                                           (lower (dotimes-loop (first bs) (second bs) body))
+                                           (lower (macroexpand-1 form))))
         (unquote clojure.core/unquote)
         (throw (ex-info "Writ: Unsupported special form: unquote"
                         {:writ/error true}))

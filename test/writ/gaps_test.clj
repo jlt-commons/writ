@@ -732,6 +732,38 @@
     (is (some? (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
                            (doseq [x xs :nope 1] (inc x)) nil))))))
 
+;; An error names what the programmer wrote, never a macro's own binder.
+(deftest macro-loops-are-reported-in-the-code's-own-words
+  (testing "dotimes counts up to its bound, so it runs out"
+    (doseq [form ['(defn f {:writ/descend true} [^:many ^Nat n] (dotimes [i n] (inc i)) nil)
+                  '(defn f {:writ/descend true} [] (dotimes [i 3] (inc i)) nil)
+                  '(defn f {:writ/descend true} [^:many ^Nat n] (dotimes [^:many i n] (+ i i)) nil)]]
+      (testing (pr-str (last form))
+        (is (nil? (err-msg form))))))
+  (testing "a bound writ cannot read as a Nat is still rejected"
+    (is (re-find #"does not descend"
+                 (err-msg '(defn f {:writ/descend true} [n] (dotimes [i n] (inc i)) nil))))
+    (is (re-find #"does not descend"
+                 (err-msg '(defn f {:writ/descend true} [] (dotimes [i -1] (inc i)) nil)))))
+  (testing "the counter must still climb under its bound"
+    (is (re-find #"does not descend"
+                 (err-msg '(defn f {:writ/descend true} [^:many ^Nat n]
+                             (let [m n] (loop [^:many c 0] (if (< c m) (recur c) nil))))))))
+  (testing "its counter is the programmer's, and keeps their quantity"
+    (is (re-find #"`i` in `f` is used more than once"
+                 (err-msg '(defn f {:writ/descend true} [^:many ^Nat n] (dotimes [i n] (+ i i)) nil)))))
+  (testing "a for with :while is rejected without naming the macro's binders"
+    (let [m (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                        (for [^:many x xs :while (pos? x)] (inc x))))]
+      (is (re-find #"a macro in `f`" m))
+      (is (re-find #"take-while" m))
+      (is (not (re-find #"__\d" m)))))
+  (testing "a doseq over an expression names no temporary"
+    (let [m (err-msg '(defn f {:writ/descend true} [] (doseq [x (range)] (inc x)) nil))]
+      (is (re-find #"does not descend" m))
+      (is (re-find #"finite" m))
+      (is (not (re-find #"G__" m))))))
+
 ;; --- G29: the ordering rule covers value references, not just calls ---------
 
 (deftest value-references-respect-book-order
