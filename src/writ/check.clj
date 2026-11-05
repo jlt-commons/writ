@@ -154,8 +154,12 @@
         (let [d (get declared n)
               observed (get obs n q/q0)]
           (when-not (required? observed d)
-            (fail! "`" (display n) "` in `" nm "` is used " (count-str observed)
-                   " but is declared " (ann/qname d))))))))
+            (if (re-find #"__\d+$" (name (display n)))
+              (fail! "a macro in `" nm "` uses a binder it made " (count-str observed)
+                     ", which writ cannot check; write it without the macro, as "
+                     "(for [x (take-while p xs)] ...) for a `for` with `:while`")
+              (fail! "`" (display n) "` in `" nm "` is used " (count-str observed)
+                     " but is declared " (ann/qname d)))))))))
 
 (declare named-fns)
 
@@ -676,9 +680,13 @@
         (doseq [need (sort-by pr-str (:needs (nth os idx)))]
           (when-not (proven? need c facts info)
             (let [shown (get (:sources info) c c)]
-              (fail! what " does not descend: argument "
-                     (inc idx) " shrinks `" (display shown) "` without a guard; "
-                     (need-text need shown)))))))))
+              (if (gensym? shown)
+                (fail! what " does not descend: it walks an expression writ does not "
+                       "know is finite; walk a name with a type such as (List T), "
+                       "a lazy seq may never run out")
+                (fail! what " does not descend: argument "
+                       (inc idx) " shrinks `" (display shown) "` without a guard; "
+                       (need-text need shown))))))))))
 
 (defn- term-info
   "What origin tracing needs about a body: let binders -> init, loop binder
@@ -731,6 +739,11 @@
         (case (:op n)
           :let (doseq [[b init] (:bindings n)]
                  (swap! binds assoc b init)
+                 ;; a let can't rebind, so a copy of a Nat stays one
+                 (when (or (= 'Nat (ty/binder-type b tenv))
+                           (let [v (lit-val init)] (and (integer? v) (>= v 0)))
+                           (and (ref? init) (contains? @nat (qname-of (:name init)))))
+                   (swap! nat conj b))
                  ;; (let [lots (sort-by :expires (vals m))] (loop [lots lots] ...))
                  (when (copy-of init @finite)
                    (swap! finite conj (qname-of b))))

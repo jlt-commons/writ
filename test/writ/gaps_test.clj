@@ -699,6 +699,71 @@
       (is (some? m))
       (is (re-find #"must be in tail position" m)))))
 
+;; writ reads what a doseq means, a first/next walk, and not how the host's macro
+;; happens to expand: jolt 0.8.24 walks a chunked seq by block, whose recurs
+;; would not descend.
+(deftest doseq-is-checked-as-a-walk-of-its-collection
+  (testing "over a signed collection it descends"
+    (doseq [form ['(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                     (doseq [x xs] (inc x)) nil)
+                  '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                     (doseq [^:many x xs :when (pos? x)] (inc x)) nil)
+                  '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                     (doseq [x xs :let [^:many y (inc x)] :while (pos? y)] (inc y)) nil)
+                  '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs
+                                                 ^:many ^{:writ/type (List Nat)} ys]
+                     (doseq [x xs y ys] (+ x y)) nil)]]
+      (testing (pr-str (last form))
+        (is (nil? (err-msg form))))))
+  (testing "over an unsigned one it names the collection"
+    (let [m (err-msg '(defn f {:writ/descend true} [xs] (doseq [x xs] (inc x)) nil))]
+      (is (re-find #"a macro's loop in `f`, such as a `doseq`" m))
+      (is (re-find #"`xs` must be a finite collection" m))
+      (is (not (re-find #"G__" m)))))
+  (testing "over an endless seq it is still rejected"
+    (is (re-find #"does not descend"
+                 (err-msg '(defn f {:writ/descend true} [] (doseq [x (range)] (inc x)) nil)))))
+  (testing "a binder may destructure, or take the name of a fn the walk uses"
+    (is (nil? (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (List (List Nat))} xs]
+                          (doseq [[a b] xs] (+ a b)) nil))))
+    (is (nil? (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                          (doseq [next xs] (inc next)) nil)))))
+  (testing "a bad modifier still fails as it does at compile time"
+    (is (some? (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                           (doseq [x xs :nope 1] (inc x)) nil))))))
+
+;; An error names what the programmer wrote, never a macro's own binder.
+(deftest macro-loops-are-reported-in-the-code's-own-words
+  (testing "dotimes counts up to its bound, so it runs out"
+    (doseq [form ['(defn f {:writ/descend true} [^:many ^Nat n] (dotimes [i n] (inc i)) nil)
+                  '(defn f {:writ/descend true} [] (dotimes [i 3] (inc i)) nil)
+                  '(defn f {:writ/descend true} [^:many ^Nat n] (dotimes [^:many i n] (+ i i)) nil)]]
+      (testing (pr-str (last form))
+        (is (nil? (err-msg form))))))
+  (testing "a bound writ cannot read as a Nat is still rejected"
+    (is (re-find #"does not descend"
+                 (err-msg '(defn f {:writ/descend true} [n] (dotimes [i n] (inc i)) nil))))
+    (is (re-find #"does not descend"
+                 (err-msg '(defn f {:writ/descend true} [] (dotimes [i -1] (inc i)) nil)))))
+  (testing "the counter must still climb under its bound"
+    (is (re-find #"does not descend"
+                 (err-msg '(defn f {:writ/descend true} [^:many ^Nat n]
+                             (let [m n] (loop [^:many c 0] (if (< c m) (recur c) nil))))))))
+  (testing "its counter is the programmer's, and keeps their quantity"
+    (is (re-find #"`i` in `f` is used more than once"
+                 (err-msg '(defn f {:writ/descend true} [^:many ^Nat n] (dotimes [i n] (+ i i)) nil)))))
+  (testing "a for with :while is rejected without naming the macro's binders"
+    (let [m (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                        (for [^:many x xs :while (pos? x)] (inc x))))]
+      (is (re-find #"a macro in `f`" m))
+      (is (re-find #"take-while" m))
+      (is (not (re-find #"__\d" m)))))
+  (testing "a doseq over an expression names no temporary"
+    (let [m (err-msg '(defn f {:writ/descend true} [] (doseq [x (range)] (inc x)) nil))]
+      (is (re-find #"does not descend" m))
+      (is (re-find #"finite" m))
+      (is (not (re-find #"G__" m))))))
+
 ;; --- G29: the ordering rule covers value references, not just calls ---------
 
 (deftest value-references-respect-book-order
