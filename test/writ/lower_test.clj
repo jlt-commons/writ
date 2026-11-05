@@ -39,3 +39,23 @@
          (l/subst-var '(let [{:keys [a] :or {a x}} m] a) 'x 'z)))
   (is (= '(let [x z {:keys [a] :or {a x}} m] a)
          (l/subst-var '(let [x x {:keys [a] :or {a x}} m] a) 'x 'z))))
+
+(defn- calls
+  "Every symbol in a lowered form, to see what the checker is asked to read."
+  [form]
+  (set (filter symbol? (tree-seq coll? seq form))))
+
+(deftest doseq-lowers-to-the-first-next-loop-it-means
+  (let [names (fn [form] (set (map name (calls (l/lower form)))))]
+    (testing "no host's chunk primitives reach the checker"
+      (is (not-any? #(re-find #"chunk" %) (names '(doseq [x xs] (inc x)))))
+      (is (not-any? #(re-find #"chunk" %) (names '(clojure.core/doseq [x xs] (inc x))))))
+    (testing "it walks with next"
+      (is (contains? (names '(doseq [x xs] (inc x))) "next")))
+    (testing "every group and modifier is read"
+      (let [ns (names '(doseq [x xs :let [y (inc x)] :when (pos? y) :while (odd? y) z zs]
+                         (+ y z)))]
+        (is (every? ns ["xs" "zs" "inc" "pos?" "odd?" "+"]))
+        (is (not-any? #(re-find #"chunk" %) ns))))
+    (testing "a local named doseq is a call"
+      (is (= :invoke (:op (binding [l/*locals* '#{doseq}] (l/lower '(doseq 1)))))))))

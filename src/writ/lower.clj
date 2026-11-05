@@ -463,6 +463,31 @@
                               inner (reverse mods)))
                 coll))))))
 
+(defn- doseq-loop
+  "(doseq [x xs ...] body) as the first/next walk it means, whatever walk the
+  host's macro expands to: jolt reads a chunked seq by block, through recurs
+  that do not descend and with the body written out twice.  nil for a shape
+  it does not read, so doseq is macroexpanded as usual and the macro reports
+  what is wrong with it."
+  [bindings body]
+  (let [[b coll & more] bindings
+        [mods rest-bs] (split-with (fn [[k]] (keyword? k)) (partition 2 more))
+        rest-bs (apply concat rest-bs)
+        s (gensym)
+        step `(recur (next ~s))]
+    (when-not (some (fn [[k]] (not (contains? #{:let :when :while} k))) mods)
+      (when-let [inner (if (seq rest-bs) (doseq-loop rest-bs body) `(do ~@body nil))]
+        `(loop [~s (seq ~coll)]
+           (when ~s
+             (let [~b (first ~s)]
+               ~(reduce (fn [e [k v]]
+                          (case k
+                            :let (list `let v e)
+                            :when (list 'if v e step)
+                            :while (list 'if v e nil)))
+                        `(do ~inner ~step)
+                        (reverse mods)))))))))
+
 (defn lower [form]
   (cond
     (symbol? form) {:op :ref :name form}
@@ -501,6 +526,11 @@
                                        (if-let [f (and (vector? bs) (even? (count bs)) (= 3 (count form))
                                                        (for-seq bs body))]
                                          (lower f)
+                                         (lower (macroexpand-1 form))))
+        (doseq clojure.core/doseq)   (let [[_ bs & body] form]
+                                       (if-let [f (and (vector? bs) (seq bs) (even? (count bs))
+                                                       (doseq-loop bs body))]
+                                         (lower (list 'do f nil))
                                          (lower (macroexpand-1 form))))
         (unquote clojure.core/unquote)
         (throw (ex-info "Writ: Unsupported special form: unquote"

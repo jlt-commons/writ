@@ -699,6 +699,31 @@
       (is (some? m))
       (is (re-find #"must be in tail position" m)))))
 
+;; writ reads what a doseq means, a first/next walk, and not how the host's macro
+;; happens to expand: jolt 0.8.24 walks a chunked seq by block, whose recurs
+;; would not descend.
+(deftest doseq-is-checked-as-a-walk-of-its-collection
+  (testing "over a signed collection it descends"
+    (doseq [form ['(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                     (doseq [x xs] (inc x)) nil)
+                  '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                     (doseq [^:many x xs :when (pos? x)] (inc x)) nil)
+                  '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                     (doseq [x xs :let [^:many y (inc x)] :while (pos? y)] (inc y)) nil)
+                  '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs
+                                                 ^:many ^{:writ/type (List Nat)} ys]
+                     (doseq [x xs y ys] (+ x y)) nil)]]
+      (testing (pr-str (last form))
+        (is (nil? (err-msg form))))))
+  (testing "over an unsigned one it names the collection"
+    (let [m (err-msg '(defn f {:writ/descend true} [xs] (doseq [x xs] (inc x)) nil))]
+      (is (re-find #"a macro's loop in `f`, such as a `doseq`" m))
+      (is (re-find #"`xs` must be a finite collection" m))
+      (is (not (re-find #"G__" m)))))
+  (testing "a bad modifier still fails as it does at compile time"
+    (is (some? (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                           (doseq [x xs :nope 1] (inc x)) nil))))))
+
 ;; --- G29: the ordering rule covers value references, not just calls ---------
 
 (deftest value-references-respect-book-order
