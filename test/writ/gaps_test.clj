@@ -720,6 +720,14 @@
       (is (re-find #"a macro's loop in `f`, such as a `doseq`" m))
       (is (re-find #"`xs` must be a finite collection" m))
       (is (not (re-find #"G__" m)))))
+  (testing "over an endless seq it is still rejected"
+    (is (re-find #"does not descend"
+                 (err-msg '(defn f {:writ/descend true} [] (doseq [x (range)] (inc x)) nil)))))
+  (testing "a binder may destructure, or take the name of a fn the walk uses"
+    (is (nil? (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (List (List Nat))} xs]
+                          (doseq [[a b] xs] (+ a b)) nil))))
+    (is (nil? (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
+                          (doseq [next xs] (inc next)) nil)))))
   (testing "a bad modifier still fails as it does at compile time"
     (is (some? (err-msg '(defn f {:writ/descend true} [^:many ^{:writ/type (List Nat)} xs]
                            (doseq [x xs :nope 1] (inc x)) nil))))))

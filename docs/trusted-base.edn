@@ -23,7 +23,7 @@
   {:path "src/writ/law.clj"
    :sha256 "c488492722ea45740b602c6055ddb1a06f528d6b65eeb0c3d8a578b5379e5d8b"}
   {:path "src/writ/lower.clj"
-   :sha256 "3ee7ee9a6849ed546ade4ec8bcfa67869c71355d18532afa24c7e0e8a5095e22"}
+   :sha256 "d38e17dd488864e9f9c5c5b4f68a58997213690077575a35d69b73754bf08ae3"}
   {:path "src/writ/match.clj"
    :sha256 "3c98fe23649c46f4cce8e7a97f2c9728b5608f5f4af048d723a738ce79676148"}
   {:path "src/writ/norm.clj"
