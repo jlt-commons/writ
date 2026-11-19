@@ -1456,12 +1456,12 @@
                               (= '& (get params (inc ri)))
                               (> (count params) (+ ri 2))))
                  (fail! "`" nm "`: a rest parameter must be followed by "
-                        "exactly one rest name"))
+                        "exactly one rest name"))))
          _ (when (vector? params)
              (doseq [p (remove #{'&} params)]
                (when (and (symbol? p) (not (l/valid-binding-symbol? p)))
                  (fail! "Bad binding form: `" p "`; a parameter "
-                        "must be a simple symbol"))))))
+                        "must be a simple symbol"))))
          body (rest tail)
          _ (when (and (= ':- (first body)) (nil? (second body)))
              (fail! "`:-` in `" nm "` must be followed by a return type"))
