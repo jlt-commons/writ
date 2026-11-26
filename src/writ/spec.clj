@@ -2958,10 +2958,10 @@
               (recur (vec nexts) (into seen (map #(nth (peek %) 2) frontier)))))))))
 
 (defn- reachable [edges from]
-  (loop [todo [from], seen #{from}]
-    (if-let [s (first todo)]
+  (loop [todo (conj clojure.lang.PersistentQueue/EMPTY from), seen #{from}]
+    (if-let [s (peek todo)]
       (let [ts (remove seen (map #(nth % 2) (filter #(= s (first %)) edges)))]
-        (recur (into (vec (rest todo)) ts) (into seen ts)))
+        (recur (into (pop todo) ts) (into seen ts)))
       seen)))
 
 (defn- find-cycle
@@ -3965,8 +3965,8 @@
   it names, and the same for the spec's own fns it calls, so a generator
   can favour the values a predicate singles out."
   [form spec-ns bodies]
-  (loop [todo [form], seen #{}, out #{}]
-    (if-let [f (first todo)]
+  (loop [todo (conj clojure.lang.PersistentQueue/EMPTY form), seen #{}, out #{}]
+    (if-let [f (peek todo)]
       (let [xs (tree-seq coll? seq f)
             called (for [x xs :when (and (symbol? x) (contains? bodies (symbol (name x)))
                                          (not (contains? seen (symbol (name x)))))]
@@ -3978,7 +3978,7 @@
                          :when (or (number? c) (keyword? c) (string? c))]
                      c)
             lits (concat consts (filter #(or (number? %) (keyword? %) (string? %)) xs))]
-        (recur (into (vec (rest todo)) (map bodies called)) (into seen called) (into out lits)))
+        (recur (into (pop todo) (map bodies called)) (into seen called) (into out lits)))
       out)))
 
 (defn- bias-of
@@ -6423,9 +6423,9 @@
 (defn- reachable-from
   "Every fn of graph g that f reaches through calls."
   [g f]
-  (loop [todo [f], seen #{}]
-    (if-let [x (first todo)]
-      (recur (into (vec (rest todo)) (remove seen (get g x))) (into seen (get g x)))
+  (loop [todo (conj clojure.lang.PersistentQueue/EMPTY f), seen #{}]
+    (if-let [x (peek todo)]
+      (recur (into (pop todo) (remove seen (get g x))) (into seen (get g x)))
       seen)))
 
 (declare check*)
