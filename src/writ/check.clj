@@ -79,8 +79,9 @@
 (def ^:private destructure-temp?
   "Compiler-generated binders are not the programmer's: destructure's G__123
   temps and auto-gensyms like if-let's temp__5__auto are read several times
-  by the generated code, so they carry :w, not the default affine."
-  (let [pat (re-pattern "(?:^G__\\d+|__auto)(?:__\\d+)?$")]
+  by the generated code, so they carry :w, not the default affine.  Older Jolt
+  names them temp__5__auto, newer ones temp__5__auto__ as Clojure does."
+  (let [pat (re-pattern "(?:^G__\\d+|__auto(?:__)?)(?:__\\d+)?$")]
     (fn [n] (boolean (and (symbol? n) (re-find pat (name n)))))))
 
 (defn- count-str [qq]

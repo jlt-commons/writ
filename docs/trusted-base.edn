@@ -9,7 +9,7 @@
   {:path "src/writ/canonical.clj"
    :sha256 "6684b25a21325bb61d0f65ac1078d55b6606626ec65a16106604b9e9dc2efb95"}
   {:path "src/writ/check.clj"
-   :sha256 "d5accf256424cb9f5c2da8e3f21f280d1f8384fb5c4778542a2c870ede0db0a1"}
+   :sha256 "dd75eb1188c40fd7fe1822fbc6b4c6eb00c6c9d2ad8cfa90ff3add86f9908630"}
   {:path "src/writ/core.clj"
    :sha256 "24098709cebbb2860f65a60e82246ccf1943f6cbab2ca271e83b569574374ea2"}
   {:path "src/writ/data.clj"
@@ -55,7 +55,7 @@
   {:path "src/writ/solve/pre.clj"
    :sha256 "75453d2933d987affea77a6aa875d18b78e71e5a636afae69264cc0f99dca232"}
   {:path "src/writ/spec.clj"
-   :sha256 "00044ce0a35d66d750c30d4c16f3a83c8d232f442ac142703b322f2489d1fd66"}
+   :sha256 "fa501303dafab2ade15787d19ab41a21b62747b7e6eeeaa12001d0c41169b5c1"}
   {:path "src/writ/types.clj"
    :sha256 "e8e7171e911a90928cd04f53053118a40bad060a5ba4305b18e04b515745aa70"}
   {:path "src/writ/uses.clj"

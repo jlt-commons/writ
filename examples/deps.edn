@@ -2,12 +2,12 @@
  :deps  {writ/writ {:local/root ".."}
          jolt-lang/ring-chez-adapter
          {:git/url "https://github.com/jolt-lang/ring-chez-adapter"
-          :git/tag "v0.7.7"
-          :git/sha "ff99a9d42761482851e40876c880ac4443cc4d96"}
+          :git/tag "v0.11.1"
+          :git/sha "83938a69a098bc92046b3e65e74335947e93bc04"}
          jolt-lang/http-client
          {:git/url "https://github.com/jolt-lang/http-client"
-          :git/tag "v0.0.14"
-          :git/sha "281689c9b6b54f3b09bb0fd3ca05dba4e54c6953"}}
+          :git/tag "v0.1.10"
+          :git/sha "bf1485ebd44b798d96306913ad800e76a9f58957"}}
  ;; raylib loads libraylib when the project starts, so it is only on the
  ;; aliases that open a window. The tests check the pure cores and never
  ;; need it.
